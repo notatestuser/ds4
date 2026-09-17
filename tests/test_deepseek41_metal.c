@@ -1250,7 +1250,169 @@ static int check_tp_attention(void) {
     return 1;
 }
 
+#ifdef __APPLE__
+/* The BF16 epilogues must equal producer + kernel_dsv41_bf16_linear bit for bit
+ * on ordinary random data (the rounding is the same integer op on the same
+ * fp32 value) — for the Q8_0 matvec and the weighted RMS norm (2026-09-17). */
+static int check_fused_bf16(void) {
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const struct { uint32_t in, out; } shapes[] = {{5120, 512}, {5120, 1280}, {2304, 5120}, {5120, 2304}, {1280, 32768}};
+    uint64_t max_bytes = 0, max_in = 0, max_out = 0;
+    for (size_t s = 0; s < sizeof(shapes) / sizeof(*shapes); s++) {
+        const uint64_t b = (uint64_t)shapes[s].out * shapes[s].in / 32 * sizeof(q8_block);
+        if (b > max_bytes) max_bytes = b;
+        if (shapes[s].in > max_in) max_in = shapes[s].in;
+        if (shapes[s].out > max_out) max_out = shapes[s].out;
+    }
+    const uint64_t norm_off = max_bytes, model_bytes = max_bytes + 5120 * 4;
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), model_bytes) == 0);
+    q8_block *w = model;
+    for (uint64_t i = 0; i < max_bytes / sizeof(*w); i++) {
+        w[i].d = (uint16_t)(0x1800u + (uint32_t)(random_value() * 2048));
+        for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 255) - 127);
+    }
+    float *nw = (float *)((uint8_t *)model + norm_off);
+    for (int i = 0; i < 5120; i++) nw[i] = random_value() * 2 - 1;
+    float *xh = malloc(max_in * 4);
+    CHECK(xh);
+    for (uint64_t i = 0; i < max_in; i++) xh[i] = random_value() * 2 - 1;
+    ds4_gpu_tensor *xt = upload(xh, max_in * 4), *a = upload(NULL, max_out * 4), *b = upload(NULL, max_out * 4);
+    ds4_gpu_tensor *c = upload(NULL, max_out * 4);
+    CHECK(xt && a && b && c && ds4_gpu_set_model_map(model, model_bytes));
+    unsetenv("DS4_METAL_DISABLE_PRE_M5_V41_BF16_EPILOGUE");
+    /* The Q8_0 matvec is the one producer whose fold is chosen at run time
+     * (ds4_gpu_matmul_q8_0_tensor_bf16 -> g_pre_m5_bf16_epilogue).  Off pre-M5
+     * Apple silicon that wrapper's fallback IS matvec + kernel_dsv41_bf16_linear,
+     * i.e. exactly what the reference side below computes, so the comparison
+     * would compare a value with itself: say so and skip rather than report a
+     * tautology as a proof.  The other producers dispatch their fused pipeline
+     * unconditionally and are checked on every device. */
+    const int fused_matvec = ds4_gpu_device_is_pre_m5_apple_silicon() != 0;
+    if (!fused_matvec)
+        fprintf(stderr, "Q8 matvec + BF16 epilogue: SKIPPED (not pre-M5 Apple silicon, so the wrapper "
+                        "takes the separate-rounding fallback and the comparison would be a tautology)\n");
+    for (size_t s = 0; fused_matvec && s < sizeof(shapes) / sizeof(*shapes); s++) {
+        const uint32_t in = shapes[s].in, outn = shapes[s].out;
+        ds4_gpu_tensor *xv = ds4_gpu_tensor_view(xt, 0, (uint64_t)in * 4);
+        ds4_gpu_tensor *av = ds4_gpu_tensor_view(a, 0, (uint64_t)outn * 4);
+        ds4_gpu_tensor *bv = ds4_gpu_tensor_view(b, 0, (uint64_t)outn * 4);
+        ds4_gpu_tensor *cv = ds4_gpu_tensor_view(c, 0, (uint64_t)outn * 4);
+        CHECK(xv && av && bv && cv);
+        CHECK(ds4_gpu_tensor_fill_f32(av, NAN, outn) && ds4_gpu_tensor_fill_f32(bv, NAN, outn) &&
+              ds4_gpu_tensor_fill_f32(cv, NAN, outn));
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_matmul_q8_0_tensor(av, model, model_bytes, 0, in, outn, xv, 1));
+        CHECK(ds4_gpu_dsv41_quantize(av, outn, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_matmul_q8_0_tensor_bf16(bv, model, model_bytes, 0, in, outn, xv, 1));
+        CHECK(ds4_gpu_end_commands());
+        /* ds4_gpu_begin_commands() snapshots the rollback env, so set it before
+         * this one: the documented escape hatch must route the same wrapper
+         * through producer + rounding kernel and land on the very same bits. */
+        CHECK(setenv("DS4_METAL_DISABLE_PRE_M5_V41_BF16_EPILOGUE", "1", 1) == 0);
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_matmul_q8_0_tensor_bf16(cv, model, model_bytes, 0, in, outn, xv, 1));
+        CHECK(ds4_gpu_end_commands());
+        unsetenv("DS4_METAL_DISABLE_PRE_M5_V41_BF16_EPILOGUE");
+        const float *pa = ds4_gpu_tensor_contents(av), *pb = ds4_gpu_tensor_contents(bv);
+        const float *pc = ds4_gpu_tensor_contents(cv);
+        for (uint32_t r = 0; r < outn; r++) {
+            if (memcmp(&pa[r], &pb[r], 4))
+                fprintf(stderr, "fused bf16 matvec in=%u out=%u row=%u separate=%.9g fused=%.9g\n", in, outn, r, pa[r], pb[r]);
+            CHECK(!memcmp(&pa[r], &pb[r], 4));
+            if (memcmp(&pb[r], &pc[r], 4))
+                fprintf(stderr, "bf16 rollback matvec in=%u out=%u row=%u fused=%.9g disabled=%.9g\n", in, outn, r, pb[r], pc[r]);
+            CHECK(!memcmp(&pb[r], &pc[r], 4));
+        }
+        fprintf(stderr, "Q8 matvec + BF16 epilogue %5u x %6u: bit-identical (fused, and with the rollback env set)\n", in, outn);
+        ds4_gpu_tensor_free(xv); ds4_gpu_tensor_free(av); ds4_gpu_tensor_free(bv); ds4_gpu_tensor_free(cv);
+    }
+    {
+        ds4_gpu_tensor *xv = ds4_gpu_tensor_view(xt, 0, 5120 * 4);
+        ds4_gpu_tensor *av = ds4_gpu_tensor_view(a, 0, 5120 * 4), *bv = ds4_gpu_tensor_view(b, 0, 5120 * 4);
+        CHECK(xv && av && bv);
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_rms_norm_weight_tensor(av, xv, model, model_bytes, norm_off, 5120, 1e-6f));
+        CHECK(ds4_gpu_dsv41_quantize(av, 5120, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_rms_norm_weight_bf16_tensor(bv, xv, model, model_bytes, norm_off, 5120, 1e-6f));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(av), ds4_gpu_tensor_contents(bv), 5120 * 4));
+        fprintf(stderr, "weighted RMS norm + BF16 epilogue 5120: bit-identical\n");
+        ds4_gpu_tensor_free(xv); ds4_gpu_tensor_free(av); ds4_gpu_tensor_free(bv);
+    }
+    {   /* elementwise producers: SwiGLU, add, HC weighted sums, HC expand4; and the attention low projection */
+        enum { E = 5120, H = 4, FF = 2304, GROUPS = 8, RANK = 1024, GDIM = 4096 };
+        float *hbuf = malloc((size_t)GROUPS * GDIM * 4);
+        CHECK(hbuf);
+        for (int i = 0; i < GROUPS * GDIM; i++) hbuf[i] = random_value() * 2 - 1;
+        ds4_gpu_tensor *gate = upload(xh, FF * 4), *up = upload(xh + FF, FF * 4);
+        ds4_gpu_tensor *res = upload(NULL, E * H * 4), *blk = upload(xh, E * 4), *w4 = upload(NULL, 24 * 4);
+        ds4_gpu_tensor *oa = upload(NULL, E * H * 4), *ob = upload(NULL, E * H * 4);
+        ds4_gpu_tensor *heads = upload(hbuf, (size_t)GROUPS * GDIM * 4);
+        ds4_gpu_tensor *la = upload(NULL, GROUPS * RANK * 4), *lb = upload(NULL, GROUPS * RANK * 4);
+        CHECK(gate && up && res && blk && w4 && oa && ob && heads && la && lb);
+        float *pr = ds4_gpu_tensor_contents(res), *pw = ds4_gpu_tensor_contents(w4);
+        for (int i = 0; i < E * H; i++) pr[i] = random_value() * 2 - 1;
+        for (int i = 0; i < 24; i++) pw[i] = random_value() * 2 - 1;
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_swiglu_tensor(oa, gate, up, FF, 7.0f, 1.0f) && ds4_gpu_dsv41_quantize(oa, FF, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_swiglu_bf16_tensor(ob, gate, up, FF, 7.0f, 1.0f));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(oa), ds4_gpu_tensor_contents(ob), FF * 4));
+        fprintf(stderr, "SwiGLU + BF16 epilogue: bit-identical\n");
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_add_tensor(oa, blk, xt, E) && ds4_gpu_dsv41_quantize(oa, E, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_add_bf16_tensor(ob, blk, xt, E));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(oa), ds4_gpu_tensor_contents(ob), E * 4));
+        fprintf(stderr, "add + BF16 epilogue: bit-identical\n");
+        /* The weighted sums infer the token count from the output tensor: one-row views. */
+        ds4_gpu_tensor *oa1 = ds4_gpu_tensor_view(oa, 0, E * 4), *ob1 = ds4_gpu_tensor_view(ob, 0, E * 4);
+        CHECK(oa1 && ob1);
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_hc_weighted_sum_tensor(oa1, res, w4, E, H) && ds4_gpu_dsv41_quantize(oa1, E, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_hc_weighted_sum_bf16_tensor(ob1, res, w4, E, H));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(oa1), ds4_gpu_tensor_contents(ob1), E * 4));
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_hc_weighted_sum_split_tensor(oa1, res, w4, E, H) && ds4_gpu_dsv41_quantize(oa1, E, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_hc_weighted_sum_split_bf16_tensor(ob1, res, w4, E, H));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(oa1), ds4_gpu_tensor_contents(ob1), E * 4));
+        ds4_gpu_tensor_free(oa1); ds4_gpu_tensor_free(ob1);
+        fprintf(stderr, "HC weighted sums + BF16 epilogue: bit-identical\n");
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_hc_expand_split_tensor(oa, blk, res, w4, E, H) && ds4_gpu_dsv41_quantize(oa, E * H, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_hc_expand_split_bf16_tensor(ob, blk, res, w4, E, H));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(oa), ds4_gpu_tensor_contents(ob), E * H * 4));
+        fprintf(stderr, "HC expand4 + BF16 epilogue: bit-identical\n");
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_attention_output_low_q8_tensor(la, model, model_bytes, 0, GDIM, RANK, GROUPS, heads) &&
+              ds4_gpu_dsv41_quantize(la, GROUPS * RANK, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_attention_output_low_q8_bf16_tensor(lb, model, model_bytes, 0, GDIM, RANK, GROUPS, heads));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(la), ds4_gpu_tensor_contents(lb), GROUPS * RANK * 4));
+        fprintf(stderr, "attention low projection + BF16 epilogue: bit-identical\n");
+        ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(res); ds4_gpu_tensor_free(blk);
+        ds4_gpu_tensor_free(w4); ds4_gpu_tensor_free(oa); ds4_gpu_tensor_free(ob); ds4_gpu_tensor_free(heads);
+        ds4_gpu_tensor_free(la); ds4_gpu_tensor_free(lb); free(hbuf);
+    }
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(c); free(xh);
+    fprintf(stderr, "PRE_M5 BF16 epilogues (Q8 matvec%s, weighted norm, elementwise producers, attention low): PASS\n",
+            fused_matvec ? " + rollback" : " SKIPPED");
+    return 1;
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--fused-bf16")) {
+        const int ok = ds4_gpu_init() && check_fused_bf16();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && !strcmp(argv[1], "--embedding")) {
         const int ok = ds4_gpu_init() && check_embedding();
         ds4_gpu_cleanup();

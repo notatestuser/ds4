@@ -205,6 +205,17 @@ kernel void kernel_add2_f32(
     out[i] = a[i] + b[i];
 }
 
+// PRE_M5 V4.1 (2026-09-17): same kernel with the BF16 boundary rounding at the store.
+kernel void kernel_add2_bf16_f32(
+        constant ds4_metal_args_add3 &args,
+        device const float *a,
+        device const float *b,
+        device float *out,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.n) return;
+    out[i] = ds4_bf16_round(a[i] + b[i]);
+}
+
 kernel void kernel_add3_f32(
         constant ds4_metal_args_add3 &args,
         device const float *a,

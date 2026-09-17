@@ -40435,8 +40435,62 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
 
+#ifdef __APPLE__
+/* PRE_M5 (2026-09-17): fold the BF16 boundary rounding into the producing
+ * kernel where one exists (Q8_0 single-token matvec, weighted RMS norm). */
+static bool ds41_bf16_epilogue_enabled(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_BF16_EPILOGUE");
+}
+#endif
+
+/* Producers with the rounding folded in; each falls back to producer + rounding kernel. */
+static bool ds41_swiglu_round(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n) {
+#ifdef __APPLE__
+    if (ds41_bf16_epilogue_enabled() && ds4_gpu_swiglu_bf16_tensor(out, gate, up, n, DS4_SWIGLU_CLAMP_EXP, 1.0f)) return true;
+#endif
+    return ds4_gpu_swiglu_tensor(out, gate, up, n, DS4_SWIGLU_CLAMP_EXP, 1.0f) && ds41_bf16(out, n);
+}
+static bool ds41_add_round(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
+#ifdef __APPLE__
+    if (ds41_bf16_epilogue_enabled() && ds4_gpu_add_bf16_tensor(out, a, b, n)) return true;
+#endif
+    return ds4_gpu_add_tensor(out, a, b, n) && ds41_bf16(out, n);
+}
+static bool ds41_hc_weighted_sum_round(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual, const ds4_gpu_tensor *weights) {
+#ifdef __APPLE__
+    if (ds41_bf16_epilogue_enabled() && ds4_gpu_hc_weighted_sum_bf16_tensor(out, residual, weights, DS4_N_EMBD, DS4_N_HC)) return true;
+#endif
+    return ds4_gpu_hc_weighted_sum_tensor(out, residual, weights, DS4_N_EMBD, DS4_N_HC) && ds41_bf16(out, DS4_N_EMBD);
+}
+static bool ds41_hc_weighted_sum_split_round(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split) {
+#ifdef __APPLE__
+    if (ds41_bf16_epilogue_enabled() && ds4_gpu_hc_weighted_sum_split_bf16_tensor(out, residual, split, DS4_N_EMBD, DS4_N_HC)) return true;
+#endif
+    return ds4_gpu_hc_weighted_sum_split_tensor(out, residual, split, DS4_N_EMBD, DS4_N_HC) && ds41_bf16(out, DS4_N_EMBD);
+}
+static bool ds41_hc_expand_split_round(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block, const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split) {
+#ifdef __APPLE__
+    if (ds41_bf16_epilogue_enabled() && ds4_gpu_hc_expand_split_bf16_tensor(out_hc, block, residual, split, DS4_N_EMBD, DS4_N_HC)) return true;
+#endif
+    return ds4_gpu_hc_expand_split_tensor(out_hc, block, residual, split, DS4_N_EMBD, DS4_N_HC) && ds41_bf16(out_hc, DS4_N_EMBD * DS4_N_HC);
+}
+/* out_b is rounded inside its matvec on one GPU (no TP partial sum follows). */
+static bool ds41_out_b_prerounded(const ds41_gpu_graph *g) {
+#ifdef __APPLE__
+    return g->tp_world == 1 && ds41_bf16_epilogue_enabled();
+#else
+    (void)g; return false;
+#endif
+}
+
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
+#ifdef __APPLE__
+    if (round && weight->type == DS4_TENSOR_Q8_0 && ds41_bf16_epilogue_enabled())
+        return ds4_gpu_matmul_q8_0_tensor_bf16(out, m->map, m->size, weight->abs_offset,
+                                               weight->dim[0], weight->dim[1], in, 1) != 0;
+#endif
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
@@ -40563,6 +40617,11 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
+#ifdef __APPLE__
+    if (ds41_bf16_epilogue_enabled())
+        return ds4_gpu_rms_norm_weight_bf16_tensor(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) != 0;
+#endif
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
         ds41_bf16(out, (uint32_t)weight->dim[0]);
@@ -40606,9 +40665,19 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
     return tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
+#ifdef __APPLE__
+        (ds41_bf16_epilogue_enabled() ?
+            ds4_gpu_attention_output_low_q8_bf16_tensor(g->low, m->map, m->size,
+                l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
+                4096, 1024, groups, g->heads) != 0 :
+            (ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
+                l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
+                4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O)));
+#else
         ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
             l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
             4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O);
+#endif
 }
 
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
@@ -40619,7 +40688,7 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
         metal_graph_matmul_dense_quant_kslice(g->block, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
             (uint64_t)groups * 1024u, DS4_N_EMBD, g->low, 0) :
-        ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
+        ds41_matmul(g->block, m, l->attn_output_b, g->low, ds41_out_b_prerounded(g));
 }
 
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
@@ -40741,7 +40810,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
-           ds41_bf16(g->block, DS4_N_EMBD);
+           (ds41_out_b_prerounded(g) || ds41_bf16(g->block, DS4_N_EMBD));
 }
 
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
@@ -40778,9 +40847,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (shared_here && !shared_queued &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-        !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
+        !ds41_swiglu_round(g->shared_mid, g->shared_gate, g->shared_up, DS4_N_FF_EXP) ||
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
     bool routed_ok;
 #ifndef __APPLE__
@@ -40817,8 +40884,8 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
-    return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
-        ds41_bf16(g->block, DS4_N_EMBD);
+    return shared_owner ? ds41_bf16(g->block, DS4_N_EMBD) :
+        ds41_add_round(g->block, routed, g->shared, DS4_N_EMBD);
 }
 
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
@@ -40829,8 +40896,8 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
     if (!g->valid || !logits || (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands())) return false;
-    bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-              ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
+    bool ok = ds41_hc_weighted_sum_round(g->x, g->residual, g->pre) &&
+              ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1);
     if (!ds4_gpu_end_commands()) ok = false;
@@ -40848,17 +40915,16 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
             return false;
     }
     return ds41_hc_mix(g, m, l, false) &&
-        ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+        ds41_hc_weighted_sum_round(g->x, g->residual, g->pre) &&
+        ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
-    return ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
+    return ds41_hc_expand_split_round(g->after_attn, g->block, g->residual, g->attn_split) &&
         ds41_hc_mix(g, m, l, true) &&
-        ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+        ds41_hc_weighted_sum_split_round(g->x, g->after_attn, g->attn_split) &&
+        ds41_norm(g->norm, g->x, m, l->ffn_norm);
 }
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
@@ -41138,8 +41204,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
+    return ds41_hc_expand_split_round(g->residual, g->block, g->after_attn, g->ffn_split) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
@@ -41185,7 +41250,7 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_decode_island(g, m, l, il, 0) &&
         ds41_attention(g, m, l, il, true) && ds41_decode_island(g, m, l, il, 2) &&
         ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
-        ds41_bf16(g->block, DS4_N_EMBD) &&
+        (ds41_out_b_prerounded(g) || ds41_bf16(g->block, DS4_N_EMBD)) &&
         ds41_decode_island(g, m, l, il, 1) &&
         ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
 }

@@ -75,6 +75,9 @@ kernel void kernel_rms_norm_fuse_impl(
         if (F == 3) {
             y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
         }
+        if (F == 4) {   // weighted norm + V4.1 BF16 boundary rounding (PRE_M5 decode)
+            y[i00] = ds4_bf16_round4((x[i00]*scale)*f0[i00]);
+        }
     }
 }
 
@@ -83,6 +86,7 @@ typedef decltype(kernel_rms_norm_fuse_impl<float4, 1>) kernel_rms_norm_fuse_t;
 // Host-visible RMSNorm variants: plain norm and norm multiplied by weight.
 template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
+template [[host_name("kernel_rms_norm_mul_bf16_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 4>;
 
 kernel void kernel_add_rms_norm_mul_f32_4(
         constant ds4_metal_args_norm & args,

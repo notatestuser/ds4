@@ -235,9 +235,16 @@ tests/test_deepseek41_metal.o: tests/test_deepseek41_metal.c ds4_gpu.h ds4_deeps
 tests/test_deepseek41_metal: tests/test_deepseek41_metal.o $(CORE_OBJS)
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
+.PHONY: test-deepseek41-fused-bf16
+# 2.3's bit-identity proof for the folded BF16 epilogues; a mode of its own
+# because it builds a ~45 MB synthetic Q8_0 weight map.
+test-deepseek41-fused-bf16: tests/test_deepseek41_metal
+	./tests/test_deepseek41_metal --fused-bf16
+
 .PHONY: test-deepseek41-metal
 test-deepseek41-metal: tests/test_deepseek41_metal
 	./tests/test_deepseek41_metal
+	./tests/test_deepseek41_metal --fused-bf16
 
 tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<

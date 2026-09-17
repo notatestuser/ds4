@@ -242,6 +242,25 @@ void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
+/* PRE_M5 V4.1: producers with the BF16 boundary rounding folded in (bit-identical to producer + rounding). */
+int ds4_gpu_matmul_q8_0_tensor_bf16(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                    const ds4_gpu_tensor *x, uint64_t n_tok);
+int ds4_gpu_rms_norm_weight_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map,
+                                        uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps);
+int ds4_gpu_swiglu_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
+                               uint32_t n, float clamp, float weight);
+int ds4_gpu_add_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n);
+int ds4_gpu_hc_weighted_sum_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc,
+                                        const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc);
+int ds4_gpu_hc_weighted_sum_split_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc,
+                                              const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc);
+int ds4_gpu_hc_expand_split_bf16_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
+                                        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+                                        uint32_t n_embd, uint32_t n_hc);
+int ds4_gpu_attention_output_low_q8_bf16_tensor(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+                                                uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+                                                uint32_t n_groups, const ds4_gpu_tensor *heads);
 int ds4_gpu_device_is_m5_apple_silicon(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
 /* Strict test oracle for the fixed decode mul_mv pipeline lookup cache. */
