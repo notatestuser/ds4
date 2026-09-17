@@ -56,6 +56,27 @@ int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
 int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                              uint32_t rows, uint32_t start, uint32_t stride,
                              bool compressed, bool inverse);
+#ifdef __APPLE__
+/* PRE_M5 V4.1 decode fusions; each is bit-identical to the pair it replaces.
+ * rope_pair: the single-row q and kv RoPE in one dispatch (same frequencies, same position).
+ * quantize_store: quantize a row and also store the rounded values at dst + dst_offset,
+ * replacing the sliding-window copy that followed the quantize. */
+int ds4_gpu_dsv41_rope_pair(ds4_gpu_tensor *x0, uint32_t heads0,
+                            ds4_gpu_tensor *x1, uint32_t heads1,
+                            uint32_t width, uint32_t start,
+                            bool compressed, bool inverse);
+int ds4_gpu_dsv41_quantize_store(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
+                                 ds4_v41_activation_format format,
+                                 ds4_gpu_tensor *dst, uint64_t dst_offset);
+/* The 32 released RoPE frequencies for the plain (false) and compressed (true) layers, built
+ * once under precise float control. Exported so the test can prove the host-side table is
+ * unchanged; every RoPE dispatch's theta is built from it. */
+const float *ds4_gpu_dsv41_rope_frequencies(bool compressed);
+/* Test oracle for the three rollback switches, which are read by file-static helpers in ds4.c:
+ * bit 0 pre copy, bit 1 q+kv RoPE, bit 2 quantize + window store; each bit is set when that
+ * fusion is live for this process. */
+int ds4_v41_decode_fusion_gates(void);
+#endif
 int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *kv,
                            const ds4_gpu_tensor *q_weight,

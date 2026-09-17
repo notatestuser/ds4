@@ -407,6 +407,207 @@ static int check_rope_stride(void) {
     return 1;
 }
 
+#ifdef __APPLE__
+/* 3.5(b): q and kv roped in one dispatch must equal the two separate dispatches, byte for byte,
+ * and must touch nothing else. */
+static int check_rope_pair(void) {
+    enum { WIDTH = 512, HEADS = 32, N0 = WIDTH * HEADS, N1 = WIDTH };
+    ds4_gpu_tensor *a0 = upload(NULL, (N0 + 1u) * sizeof(float));
+    ds4_gpu_tensor *b0 = upload(NULL, (N0 + 1u) * sizeof(float));
+    ds4_gpu_tensor *a1 = upload(NULL, (N1 + 1u) * sizeof(float));
+    ds4_gpu_tensor *b1 = upload(NULL, (N1 + 1u) * sizeof(float));
+    CHECK(a0 && b0 && a1 && b1);
+    float *x0 = ds4_gpu_tensor_contents(a0), *y0 = ds4_gpu_tensor_contents(b0);
+    float *x1 = ds4_gpu_tensor_contents(a1), *y1 = ds4_gpu_tensor_contents(b1);
+    const uint32_t starts[] = {0, 1, 127, 2048, 32766, 1048575};
+    for (uint32_t kind = 0; kind < 2; kind++) for (uint32_t inverse = 0; inverse < 2; inverse++) {
+        for (size_t i = 0; i < sizeof(starts) / sizeof(*starts); i++) {
+            for (size_t j = 0; j < N0; j++) x0[j] = y0[j] = bf16(random_value());
+            for (size_t j = 0; j < N1; j++) x1[j] = y1[j] = bf16(random_value());
+            x0[N0] = y0[N0] = 12345;
+            x1[N1] = y1[N1] = 54321;
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_rope_pair(a0, HEADS, a1, 1, WIDTH, starts[i], kind, inverse));
+            CHECK(ds4_gpu_dsv41_rope(b0, WIDTH, HEADS, 1, starts[i], kind, inverse));
+            CHECK(ds4_gpu_dsv41_rope(b1, WIDTH, 1, 1, starts[i], kind, inverse));
+            CHECK(ds4_gpu_end_commands());
+            CHECK(!memcmp(x0, y0, (N0 + 1u) * sizeof(float)));
+            CHECK(!memcmp(x1, y1, (N1 + 1u) * sizeof(float)));
+            CHECK(x0[N0] == 12345 && x1[N1] == 54321);
+        }
+    }
+    CHECK(!ds4_gpu_dsv41_rope_pair(NULL, HEADS, a1, 1, WIDTH, 0, false, false));
+    CHECK(!ds4_gpu_dsv41_rope_pair(a0, HEADS, NULL, 1, WIDTH, 0, false, false));
+    CHECK(!ds4_gpu_dsv41_rope_pair(a0, 0, a1, 1, WIDTH, 0, false, false));
+    CHECK(!ds4_gpu_dsv41_rope_pair(a0, HEADS, a1, 0, WIDTH, 0, false, false));
+    CHECK(!ds4_gpu_dsv41_rope_pair(a0, HEADS, a1, 1, 32, 0, false, false));
+    CHECK(!ds4_gpu_dsv41_rope_pair(a0, HEADS, a1, 1, WIDTH, 1048576, false, false));
+    CHECK(!ds4_gpu_dsv41_rope_pair(a0, HEADS + 1u, a1, 1, WIDTH, 0, false, false));
+    CHECK(!ds4_gpu_dsv41_rope_pair(a0, HEADS, a1, 2, WIDTH, 0, false, false));
+    ds4_gpu_tensor_free(b1); ds4_gpu_tensor_free(a1);
+    ds4_gpu_tensor_free(b0); ds4_gpu_tensor_free(a0);
+    fprintf(stderr, "V4.1 paired q+kv RoPE: bit-identical to two dispatches, guards PASS\n");
+    return 1;
+}
+
+/* 3.5(c): the fused quantize + window store must equal quantize followed by the copy, and must
+ * leave the rest of the window untouched. */
+static int check_quantize_store(void) {
+    enum { WIDTH = 512, ROWS = 3, SLOT = 5, SLOTS = 128, N = WIDTH * ROWS, WN = SLOTS * WIDTH };
+    float *source = malloc(N * sizeof(float));
+    CHECK(source);
+    ds4_gpu_tensor *xa = upload(NULL, N * sizeof(float));
+    ds4_gpu_tensor *xb = upload(NULL, N * sizeof(float));
+    ds4_gpu_tensor *wa = upload(NULL, WN * sizeof(float));
+    ds4_gpu_tensor *wb = upload(NULL, WN * sizeof(float));
+    CHECK(xa && xb && wa && wb);
+    float *pa = ds4_gpu_tensor_contents(wa), *pb = ds4_gpu_tensor_contents(wb);
+    for (int mode = 0; mode < 4; mode++) {
+        const int block = mode == DS4_V41_FP4_E4M3 ? 16 : 32;
+        for (int i = 0; i < N; i++) source[i] = random_value() * (1u << ((i / block) % 4));
+        for (int i = 0; i < WN; i++) pa[i] = pb[i] = (float)(i % 251) - 125.0f;
+        CHECK(ds4_gpu_tensor_write(xa, 0, source, N * sizeof(float)));
+        CHECK(ds4_gpu_tensor_write(xb, 0, source, N * sizeof(float)));
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_quantize(xa, WIDTH, ROWS, (ds4_v41_activation_format)mode));
+        CHECK(ds4_gpu_tensor_copy(wa, (uint64_t)SLOT * WIDTH * 4u, xa, 0, (uint64_t)N * 4u));
+        CHECK(ds4_gpu_dsv41_quantize_store(xb, WIDTH, ROWS, (ds4_v41_activation_format)mode,
+                                           wb, (uint64_t)SLOT * WIDTH * 4u));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(xa), ds4_gpu_tensor_contents(xb), N * sizeof(float)));
+        CHECK(!memcmp(pa, pb, WN * sizeof(float)));
+    }
+    CHECK(!ds4_gpu_dsv41_quantize_store(xa, WIDTH, ROWS, DS4_V41_FP8_E8M0, NULL, 0));
+    CHECK(!ds4_gpu_dsv41_quantize_store(xa, WIDTH, ROWS, (ds4_v41_activation_format)4, wb, 0));
+    CHECK(!ds4_gpu_dsv41_quantize_store(xa, 24, 1, DS4_V41_FP8_E8M0, wb, 0));
+    CHECK(!ds4_gpu_dsv41_quantize_store(xa, WIDTH, ROWS, DS4_V41_FP8_E8M0, wb,
+                                        (uint64_t)(WN - N + 1) * 4u));
+    CHECK(!ds4_gpu_dsv41_quantize_store(xa, WIDTH, ROWS, DS4_V41_FP8_E8M0, wb, 2));
+    CHECK(!ds4_gpu_dsv41_quantize_store(xa, UINT32_MAX, UINT32_MAX, DS4_V41_BF16, wb, 0));
+    ds4_gpu_tensor_free(wb); ds4_gpu_tensor_free(wa);
+    ds4_gpu_tensor_free(xb); ds4_gpu_tensor_free(xa);
+    free(source);
+    fprintf(stderr, "V4.1 fused quantize + window store: bit-identical to quantize + copy, guards PASS\n");
+    return 1;
+}
+
+/* Exactness witness for the shared RoPE device function: an FNV-1a digest of kernel_dsv41_rope's
+ * output over a fixed matrix of shapes. It must not move when metal/dsv41.metal is edited - run it
+ * once with DS4_METAL_DSV41_SOURCE pointing at the previous file and once without. */
+static int check_rope_digest(void) {
+    enum { WIDTH = 512, HEADS = 3, ROWS = 9, N = WIDTH * HEADS * ROWS };
+    ds4_gpu_tensor *a = upload(NULL, N * sizeof(float));
+    CHECK(a);
+    float *x = ds4_gpu_tensor_contents(a);
+    const uint32_t starts[] = {0, 1, 127, 2048, 32766, 1048318};
+    uint64_t digest = 14695981039346656037ull;
+    seed = 7919;
+    for (uint32_t kind = 0; kind < 2; kind++) for (uint32_t inverse = 0; inverse < 2; inverse++) {
+        for (size_t i = 0; i < sizeof(starts) / sizeof(*starts); i++) {
+            for (uint32_t stride = 1; stride <= 2; stride++) {
+                for (size_t j = 0; j < N; j++) x[j] = bf16(random_value());
+                CHECK(ds4_gpu_begin_commands());
+                CHECK(ds4_gpu_dsv41_rope_stride(a, WIDTH, HEADS, ROWS, starts[i], stride,
+                                                kind, inverse));
+                CHECK(ds4_gpu_end_commands());
+                const unsigned char *bytes = (const unsigned char *)x;
+                for (size_t j = 0; j < N * sizeof(float); j++) {
+                    digest ^= bytes[j];
+                    digest *= 1099511628211ull;
+                }
+            }
+        }
+    }
+    ds4_gpu_tensor_free(a);
+    printf("rope_digest=%016llx\n", (unsigned long long)digest);
+    fprintf(stderr, "V4.1 RoPE digest over 48 fixed dispatches: %016llx\n",
+            (unsigned long long)digest);
+    return 1;
+}
+
+/* Host-side witness for the other half of the RoPE change. The digest above runs one binary
+ * against two kernel files, so it cannot see that the frequency table moved out of
+ * ds4_gpu_dsv41_rope_stride into ds4_gpu_dsv41_rope_frequencies - and that table is what every
+ * theta on the untouched default path is built from. Recompute it here from the pre-patch source
+ * text, verbatim, under the same precise float control (ds4_metal.m is compiled with -ffast-math,
+ * so leaving the pragma region is exactly the way the move could have changed a value), and
+ * require the 64 floats to be byte-identical. */
+#pragma float_control(precise, on, push)
+static int check_rope_freqs(void) {
+    float expected[2][32];
+    for (int kind = 0; kind < 2; kind++) {
+        const float base = kind ? 160000.0f : 10000.0f;
+        const float low = (float)floor(64.0 * log(65536.0 / (32.0 * 2.0 * M_PI)) / (2.0 * log(base)));
+        const float high = (float)ceil(64.0 * log(65536.0 / (2.0 * M_PI)) / (2.0 * log(base)));
+        for (int i = 0; i < 32; i++) {
+            const float denominator = powf(base, (float)i / 32.0f);
+            float f = 1.0f / denominator;
+            if (kind) {
+                const float ramp = fminf(1.0f, fmaxf(0.0f, (i - low) / (high - low)));
+                const float smooth = 1.0f - ramp;
+                const float interpolate = (f / 16.0f) * (1.0f - smooth);
+                const float extrapolate = f * smooth;
+                f = interpolate + extrapolate;
+            }
+            expected[kind][i] = f;
+        }
+    }
+    uint64_t digest = 14695981039346656037ull;
+    for (int kind = 0; kind < 2; kind++) {
+        const float *actual = ds4_gpu_dsv41_rope_frequencies(kind != 0);
+        CHECK(actual);
+        CHECK(!memcmp(actual, expected[kind], sizeof(expected[kind])));
+        const unsigned char *bytes = (const unsigned char *)actual;
+        for (size_t j = 0; j < sizeof(expected[kind]); j++) {
+            digest ^= bytes[j];
+            digest *= 1099511628211ull;
+        }
+    }
+    printf("rope_freqs=%016llx\n", (unsigned long long)digest);
+    fprintf(stderr, "V4.1 RoPE frequencies: host table matches the pre-patch expressions, "
+                    "digest %016llx\n", (unsigned long long)digest);
+    return 1;
+}
+#pragma float_control(pop)
+
+/* The three rollback switches are read by file-static helpers in ds4.c, which no test can reach
+ * by name; the fused entry points above are called directly and are deliberately unaware of them.
+ * ds4_v41_decode_fusion_gates() is the oracle: assert that each env name, spelled as ds4.c spells
+ * it, disables exactly its own fusion and nothing else. A misspelt name would otherwise survive
+ * every check - including the strict bench, which would then A/B the fused path against itself. */
+static int check_fusion_gates(void) {
+    static const char *const names[3] = {
+        "DS4_METAL_DISABLE_PRE_M5_V41_PRE_COPY",
+        "DS4_METAL_DISABLE_PRE_M5_V41_ROPE_PAIR",
+        "DS4_METAL_DISABLE_PRE_M5_V41_QUANTIZE_STORE",
+    };
+    /* ds4_gpu_init() must have run: the pre-M5 test reads the Metal device name, and without it
+     * every gate reads false and this whole check would pass vacuously. */
+    const int pre_m5 = ds4_gpu_device_is_pre_m5_apple_silicon();
+    const int base = ds4_v41_decode_fusion_gates();
+    printf("fusion_gates=%d\n", base);
+    CHECK(pre_m5 || base == 0);          /* nothing fuses off pre-M5 Apple silicon */
+    for (int i = 0; i < 3; i++) {
+        const int bit = 1 << i;
+        if (getenv(names[i])) {
+            /* Inherited from the caller (the runner sets one per process): must read as off. */
+            CHECK(!(base & bit));
+            continue;
+        }
+        CHECK(!pre_m5 || (base & bit));  /* default on */
+        CHECK(setenv(names[i], "1", 1) == 0);
+        const int masked = ds4_v41_decode_fusion_gates();
+        CHECK(!(masked & bit));
+        CHECK((masked & ~bit) == (base & ~bit));
+        CHECK(unsetenv(names[i]) == 0);
+        CHECK(ds4_v41_decode_fusion_gates() == base);
+    }
+    fprintf(stderr, "V4.1 decode fusion gates: pre_m5=%d live=0x%x, each rollback env disables "
+                    "exactly its own fusion PASS\n", pre_m5, base);
+    return 1;
+}
+#endif
+
 static int check_pool(void) {
     enum { D = 512, ROWS = 257, PAIRS = ROWS / 2 };
     float *kv = malloc(ROWS * D * sizeof(float)), *scores = malloc(ROWS * D * sizeof(float));
@@ -1379,6 +1580,24 @@ static int check_fused_bf16(void) {
         CHECK(ds4_gpu_hc_weighted_sum_split_bf16_tensor(ob1, res, w4, E, H));
         CHECK(ds4_gpu_end_commands());
         CHECK(!memcmp(ds4_gpu_tensor_contents(oa1), ds4_gpu_tensor_contents(ob1), E * 4));
+        /* 3.5(a) pre-copy removal: `pre` is a copy of the first n_hc floats of the previous
+         * sublayer's ffn_split, and at one token the split variant never reads its row stride,
+         * so reading ffn_split directly is the same dispatch on the same four floats. */
+        ds4_gpu_tensor *pre4 = upload(NULL, H * 4);
+        CHECK(pre4);
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_tensor_copy(pre4, 0, w4, 0, H * 4));
+        CHECK(ds4_gpu_hc_weighted_sum_tensor(oa1, res, pre4, E, H));
+        CHECK(ds4_gpu_hc_weighted_sum_split_tensor(ob1, res, w4, E, H));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(oa1), ds4_gpu_tensor_contents(ob1), E * 4));
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_hc_weighted_sum_bf16_tensor(oa1, res, pre4, E, H));
+        CHECK(ds4_gpu_hc_weighted_sum_split_bf16_tensor(ob1, res, w4, E, H));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(oa1), ds4_gpu_tensor_contents(ob1), E * 4));
+        ds4_gpu_tensor_free(pre4);
+        fprintf(stderr, "HC weighted sum from ffn_split == from the copied pre row: bit-identical\n");
         ds4_gpu_tensor_free(oa1); ds4_gpu_tensor_free(ob1);
         fprintf(stderr, "HC weighted sums + BF16 epilogue: bit-identical\n");
         CHECK(ds4_gpu_begin_commands());
@@ -1409,6 +1628,32 @@ int main(int argc, char **argv) {
 #ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--fused-bf16")) {
         const int ok = ds4_gpu_init() && check_fused_bf16();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--rope-pair")) {
+        const int ok = ds4_gpu_init() && check_rope_pair();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--quantize-store")) {
+        const int ok = ds4_gpu_init() && check_quantize_store();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--rope-digest")) {
+        const int ok = ds4_gpu_init() && check_rope_digest();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--rope-freqs")) {
+        const int ok = ds4_gpu_init() && check_rope_freqs();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--fusion-gates")) {
+        /* ds4_gpu_init() first: the gates start with the Metal device name. */
+        const int ok = ds4_gpu_init() && check_fusion_gates();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
@@ -1477,6 +1722,10 @@ int main(int argc, char **argv) {
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
+#ifdef __APPLE__
+    if (ok) ok = check_rope_pair() && check_quantize_store() &&
+                 check_rope_freqs() && check_fusion_gates();
+#endif
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }

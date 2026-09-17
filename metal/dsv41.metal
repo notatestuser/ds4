@@ -44,19 +44,51 @@ struct ds4_metal_args_dsv41_rope {
     float frequencies[32];
 };
 
+// One lane's adjacent pair. kernel_dsv41_rope and kernel_dsv41_rope2 both go
+// through this, so the two dispatch shapes run the identical arithmetic in the
+// identical order; only which tensor and head a threadgroup owns differs.
+static inline void dsv41_rope_lane(device float *x, float frequency,
+                                   uint width, uint heads, uint head, uint row,
+                                   uint start, uint stride, uint inverse, uint lane) {
+    const float theta = float(start + row * stride) * frequency;
+    const float c = precise::cos(theta);
+    const float s = inverse ? -precise::sin(theta) : precise::sin(theta);
+    const ulong i = ((ulong)row * heads + head) * width +
+                    width - 64u + 2u * lane;
+    const float re = x[i], im = x[i + 1u];
+    x[i] = dsv41_bf16(re * c - im * s);
+    x[i + 1u] = dsv41_bf16(re * s + im * c);
+}
+
 kernel void kernel_dsv41_rope(
         constant ds4_metal_args_dsv41_rope &args,
         device float *x,
         uint2 group [[threadgroup_position_in_grid]],
         uint lane [[thread_index_in_simdgroup]]) {
-    const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
-    const float c = precise::cos(theta);
-    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
-    const ulong i = ((ulong)group.y * args.heads + group.x) * args.width +
-                    args.width - 64u + 2u * lane;
-    const float re = x[i], im = x[i + 1u];
-    x[i] = dsv41_bf16(re * c - im * s);
-    x[i + 1u] = dsv41_bf16(re * s + im * c);
+    dsv41_rope_lane(x, args.frequencies[lane], args.width, args.heads,
+                    group.x, group.y, args.start, args.stride, args.inverse, lane);
+}
+
+struct ds4_metal_args_dsv41_rope2 {
+    uint width, heads0, heads1, start, inverse;
+    float frequencies[32];
+};
+
+// PRE_M5 (2026-09-17): the decode step's q RoPE and its single kv RoPE share a
+// position and a frequency table, so one dispatch of heads0 + heads1 groups
+// covers both. Each threadgroup picks its tensor from its index and runs the
+// single-row case (row 0, where the stride is never read) of dsv41_rope_lane.
+kernel void kernel_dsv41_rope2(
+        constant ds4_metal_args_dsv41_rope2 &args,
+        device float *x0,
+        device float *x1,
+        uint group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const bool first = group < args.heads0;
+    dsv41_rope_lane(first ? x0 : x1, args.frequencies[lane], args.width,
+                    first ? args.heads0 : args.heads1,
+                    first ? group : group - args.heads0,
+                    0u, args.start, 1u, args.inverse, lane);
 }
 
 kernel void kernel_dsv41_quantize(
@@ -81,6 +113,39 @@ kernel void kernel_dsv41_quantize(
         result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
     }
     if (valid) x[index] = dsv41_bf16(result);
+}
+
+// PRE_M5 (2026-09-17): the decode step quantizes its 512-float KV row and then
+// copies that row into the layer's 128-slot sliding window. This is the body of
+// kernel_dsv41_quantize with a second store of the same rounded value, so the
+// window receives exactly the bytes the copy used to move.
+kernel void kernel_dsv41_quantize_store2(
+        constant ds4_metal_args_dsv41_quantize &args,
+        device float *x,
+        device float *dst,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const uint block = args.mode == 3u ? 16u : 32u;
+    const uint column = group.x * block + lane;
+    const bool valid = lane < block && column < args.width;
+    const ulong index = (ulong)group.y * args.width + column;
+    const float value = valid ? dsv41_bf16(x[index]) : 0.0f;
+    const float amax = simd_max(abs(value));
+    float result = value;
+    if (args.mode == 1u) {
+        const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
+        result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
+    } else if (args.mode == 2u || args.mode == 3u) {
+        const float scale = args.mode == 3u
+            ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
+            : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
+        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+    }
+    if (valid) {
+        const float stored = dsv41_bf16(result);
+        x[index] = stored;
+        dst[index] = stored;
+    }
 }
 
 struct ds4_metal_args_dsv41_engram {

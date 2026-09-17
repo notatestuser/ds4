@@ -40183,6 +40183,14 @@ typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
+    /* PRE_M5 (2026-09-17): true only while ds41_graph_step runs its layer loop, which is
+     * the single-token decode path the three fusions are scoped to. pre_fused also elides
+     * the per-layer ffn_split -> pre copy there and makes layers >= 1 read the mixer
+     * weights straight from ffn_split. Every other caller of ds41_attention and
+     * ds41_graph_after_moe (prefill sweep, decoder prepare, batched step) builds its row
+     * from a *g whose flags are false - and does not always re-point ffn_split - so it
+     * keeps the copy and the two separate dispatches. */
+    bool pre_fused, rope_pair_fused, quantize_store_fused;
     uint32_t tp_world, tp_rank;
     ds4_gpu_tensor *tp_logits_half;
     ds4_gpu_tensor **tp_out, **tp_in;
@@ -40442,6 +40450,30 @@ static bool ds41_bf16_epilogue_enabled(void) {
     return ds4_gpu_device_is_pre_m5_apple_silicon() &&
         !getenv("DS4_METAL_DISABLE_PRE_M5_V41_BF16_EPILOGUE");
 }
+/* PRE_M5 (2026-09-17): the three remaining single-token elementwise fusions. Each keeps the same
+ * values in the same per-element order, so each is bit-identical to what it replaces; each has its
+ * own rollback env so the schedule bench can A/B it in one process. */
+static bool ds41_pre_copy_fused(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_PRE_COPY");
+}
+static bool ds41_rope_pair_fused(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_ROPE_PAIR");
+}
+static bool ds41_quantize_store_fused(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_QUANTIZE_STORE");
+}
+/* Test oracle (tests/test_deepseek41_metal --fusion-gates). The three helpers above are file
+ * static, so without this nothing outside ds4.c can observe the switches: a misspelt name would
+ * leave the schedule bench's --candidate-env A/B comparing the fused path with itself and
+ * reporting it exact. The test asserts each name disables exactly its own fusion. */
+int ds4_v41_decode_fusion_gates(void) {
+    return (ds41_pre_copy_fused() ? 1 : 0) |
+           (ds41_rope_pair_fused() ? 2 : 0) |
+           (ds41_quantize_store_fused() ? 4 : 0);
+}
 #endif
 
 /* Producers with the rounding folded in; each falls back to producer + rounding kernel. */
@@ -40645,6 +40677,36 @@ static bool ds41_rope(ds4_gpu_tensor *x, uint32_t heads, uint32_t width,
                               ds4_layer_compress_ratio(il) != 0, inverse);
 }
 
+/* q (heads rows) and kv (one row) rotate at the same position with the same frequencies, so one
+ * dispatch covers both; the kernel runs the same per-element code as the two it replaces. Only
+ * the single-token decode loop takes it (g->rope_pair_fused is raised there and nowhere else):
+ * ds41_attention also runs per row inside the prefill sweep and the batched session step. */
+static bool ds41_rope_qkv(ds41_gpu_graph *g, uint32_t heads, uint32_t il, uint32_t pos) {
+#ifdef __APPLE__
+    if (g->rope_pair_fused &&
+        ds4_gpu_dsv41_rope_pair(g->q, heads, g->kv, 1, DS4_N_HEAD_DIM, pos,
+                                ds4_layer_compress_ratio(il) != 0, false))
+        return true;
+#endif
+    return ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) &&
+           ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false);
+}
+
+/* The FP8 quantize of the KV row and its sliding-window slot write in one dispatch: the kernel
+ * stores the same rounded value to both destinations, which is what the copy moved. Decode loop
+ * only, for the same reason as the paired RoPE above. */
+static bool ds41_quantize_kv_store(ds41_gpu_graph *g, uint32_t il, uint32_t pos) {
+    const uint64_t slot = (uint64_t)(pos % 128u) * 512u * 4u;
+#ifdef __APPLE__
+    if (g->quantize_store_fused &&
+        ds4_gpu_dsv41_quantize_store(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0,
+                                     g->window[il], slot))
+        return true;
+#endif
+    return ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) &&
+           ds4_gpu_tensor_copy(g->window[il], slot, g->kv, 0, 512u * 4u);
+}
+
 static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
                         const ds4_layer_weights *l, bool ffn) {
     const ds4_gpu_tensor *residual = ffn ? g->after_attn : g->residual;
@@ -40790,11 +40852,8 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
     if (!projected && !ds41_attention_project(g, m, l)) return false;
-    if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
-        !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
-                             g->kv, 0, 512u * 4u) ||
+    if (!ds41_rope_qkv(g, heads, il, pos) ||
+        !ds41_quantize_kv_store(g, il, pos) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
@@ -40915,7 +40974,11 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
             return false;
     }
     return ds41_hc_mix(g, m, l, false) &&
-        ds41_hc_weighted_sum_round(g->x, g->residual, g->pre) &&
+        /* Same host function, same kernel: the split variant only differs in the weight row
+         * stride, which is multiplied by the token index and so never read at one token. */
+        (il && g->pre_fused ?
+            ds41_hc_weighted_sum_split_round(g->x, g->residual, g->ffn_split) :
+            ds41_hc_weighted_sum_round(g->x, g->residual, g->pre)) &&
         ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
@@ -41203,15 +41266,21 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
             (n_raw - kept + part) * row_bytes, (kept - part) * row_bytes));
 }
 
-static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds41_hc_expand_split_round(g->residual, g->block, g->after_attn, g->ffn_split) &&
-        ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
+static bool ds41_graph_after_moe(ds41_gpu_graph *g, uint32_t il) {
+    if (!ds41_hc_expand_split_round(g->residual, g->block, g->after_attn, g->ffn_split))
+        return false;
+    /* In the single-token decode loop the next layer reads these four floats straight out of
+     * ffn_split, so only the last layer still has to land them in `pre` - for the output head and
+     * for the prefill/batch hand-offs, which begin from `pre` and can run after a step that
+     * computed no head. Every other caller keeps the copy at every layer. */
+    if (g->pre_fused && il + 1u < DS4_N_LAYER) return true;
+    return ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float)) != 0;
 }
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
     return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+        ds41_graph_after_moe(g, il);
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41252,7 +41321,7 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
         ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
         (ds41_out_b_prerounded(g) || ds41_bf16(g->block, DS4_N_EMBD)) &&
         ds41_decode_island(g, m, l, il, 1) &&
-        ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
+        ds41_moe_finish(g, il) && ds41_graph_after_moe(g, il);
 }
 #endif
 
@@ -41474,6 +41543,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (rows_t0) ds41_engram_rows_account((now_sec() - rows_t0) * 1000.0);
     ds4_gpu_tensor *const engram_rows_scratch = g->engram_rows;
     const float initial_pre[] = {1, 0, 0, 0};
+#ifdef __APPLE__
+    g->pre_fused = ds41_pre_copy_fused();
+    g->rope_pair_fused = ds41_rope_pair_fused();
+    g->quantize_store_fused = ds41_quantize_store_fused();
+#else
+    g->pre_fused = g->rope_pair_fused = g->quantize_store_fused = false;
+#endif
     if (ok && (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
                !ds4_gpu_begin_commands())) ok = false;
     if (ok) ok = ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
@@ -41518,6 +41594,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
+    /* The last layer wrote `pre`; the head and every hand-off read it from there. The
+     * fusions end with the layer loop, so no later call on this graph - the head, a
+     * prefill chunk, a batched step, ds41_decoder_prepare - can inherit them. */
+    g->pre_fused = g->rope_pair_fused = g->quantize_store_fused = false;
     ds41_engram_rows_join(rows_pre, &rows_joined, &ok, !ok);   /* before any commit, or to cancel on failure */
     /* Queued decode leaves the last buffer open for the head, so the token
      * ends in the single wait inside ds41_graph_logits. */
@@ -42057,7 +42137,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #undef DS41_USE_FFN_ROW
                     ok = ds41_graph_after_attention(&row, m, l);
                     if (ok && !batch_moe) ok = ds41_moe(&row, m, l, il, (uint32_t)tokens[off + t]) &&
-                        ds41_graph_after_moe(&row);
+                        ds41_graph_after_moe(&row, il);
                 }
             }
             if (ok && batch_moe) {
@@ -42075,7 +42155,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     DS41_PREFILL_ROWS(DS41_USE_MOE_ROW)
 #undef DS41_USE_MOE_ROW
                     ok = ds4_gpu_add_tensor(row.block, row.routed, row.shared, DS4_N_EMBD) &&
-                        ds41_bf16(row.block, DS4_N_EMBD) && ds41_graph_after_moe(&row);
+                        ds41_bf16(row.block, DS4_N_EMBD) && ds41_graph_after_moe(&row, il);
                 }
             }
             DS41_STAGE("hc expand");
@@ -42352,7 +42432,20 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                                  (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
             ds4_gpu_tensor_copy(s->pre, 0, g->rows_view[i].ffn_split, 0, DS4_N_HC * sizeof(float));
         if (!ok || prefill_only) continue;
-        ok = ds4_gpu_hc_weighted_sum_tensor(s->x, s->residual, s->pre, DS4_N_EMBD, DS4_N_HC) &&
+        ok = (
+#ifdef __APPLE__
+            /* The weights are the first DS4_N_HC floats of the row's ffn_split, which the copy
+             * above just placed in s->pre; at one token the split variant's row stride is never
+             * read, so this is the same dispatch on the same four floats. The env is read
+             * directly here: this is the batched step, outside the decode loop the graph flags
+             * are scoped to, and the plan asks for the batched head to read ffn_split too. It
+             * removes no dispatch (the s->pre copy stays for the next step's layer 0), only the
+             * head's dependency on it; run-3_5.sh gates it with a batched dump-logits A/B. */
+            ds41_pre_copy_fused() ?
+            ds4_gpu_hc_weighted_sum_split_tensor(s->x, s->residual,
+                g->rows_view[i].ffn_split, DS4_N_EMBD, DS4_N_HC) :
+#endif
+            ds4_gpu_hc_weighted_sum_tensor(s->x, s->residual, s->pre, DS4_N_EMBD, DS4_N_HC)) &&
             ds41_bf16(s->x, DS4_N_EMBD) && ds41_norm(s->norm, s->x, model, weights->output_norm);
         if (ok) ok = batch_logits ?
             ds4_gpu_tensor_copy(g->rows_view[i].norm, 0, s->norm, 0, DS4_N_EMBD * sizeof(float)) :
