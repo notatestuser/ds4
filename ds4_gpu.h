@@ -163,6 +163,35 @@ int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
 void ds4_gpu_kv_norm_task_end_concurrent(void);
+
+/* PRE_M5 3.4 (2026-09-17) -- V4.1 MoE concurrent-dispatch section.
+ * start() plans the section and records that a finish() is owed; it does not
+ * touch the compute encoder.  The routed MoE call turns the encoder
+ * concurrent only once it knows it is taking the generic resident fused
+ * pair-SwiGLU + direct sum6 decode route, encodes the shared gate and up into
+ * that first level beside its own pair-SwiGLU, and then encodes the shared
+ * SwiGLU and the shared down around two global level barriers.  finish()
+ * closes the encoder and reports whether the section completed: 0 means the
+ * caller must run the whole serial shared-expert chain itself (nothing of it
+ * was encoded, or what was encoded is fenced and idempotent).  Same kernels,
+ * same arguments, same buffers as the serial chain -- only the schedule
+ * differs, so the results are bit-identical.
+ * Rollback: DS4_METAL_DISABLE_PRE_M5_V41_PARALLEL_FFN. */
+int ds4_gpu_dsv41_parallel_ffn_start(
+        ds4_gpu_tensor       *shared_gate,
+        ds4_gpu_tensor       *shared_up,
+        ds4_gpu_tensor       *shared_mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp);
+int ds4_gpu_dsv41_parallel_ffn_finish(void);
 #endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
@@ -280,6 +309,20 @@ enum {
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+/* 3.4: the routed-MoE routes the V4.1 concurrent MoE section is scheduled for.
+ * Both encode the same six dispatches in the same three levels; they differ
+ * only in how the routed pair-SwiGLU and sum6 kernels address their experts. */
+enum {
+    DS4_GPU_V41_PAR_ROUTE_ID    = 0,  /* generic fused pair-SwiGLU + sum6 */
+    DS4_GPU_V41_PAR_ROUTE_SLOTS = 1,  /* selected-slots pair-SwiGLU + sum6 */
+    DS4_GPU_V41_PAR_ROUTE_COUNT = 2,
+};
+/* 3.4 test hook: how often the V4.1 MoE section actually opened a concurrent
+ * encoder on that route (any other value returns the total over all routes).
+ * The exact test uses it to prove both that the section armed on the route
+ * under test and that a route it was not scheduled for never turned the
+ * encoder concurrent at all. */
+uint32_t ds4_gpu_test_v41_parallel_ffn_armed_count(unsigned route);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }

@@ -40872,8 +40872,13 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            (ds41_out_b_prerounded(g) || ds41_bf16(g->block, DS4_N_EMBD));
 }
 
+/* `decode` is true only for the single-token decode layer.  The prefill
+ * per-row fallback (DS4_METAL_DISABLE_V41_BATCH_MOE) also lands here with one
+ * token per call, so the 3.4 concurrent section keys on this flag rather than
+ * on the token count. */
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
-                     const ds4_layer_weights *l, uint32_t il, uint32_t token) {
+                     const ds4_layer_weights *l, uint32_t il, uint32_t token,
+                     bool decode) {
     uint64_t gate_row = 0, down_row = 0;
     if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
         !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
@@ -40903,7 +40908,36 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         shared_queued = rc > 0;
     }
 #endif
-    if (shared_here && !shared_queued &&
+    /* PRE_M5 3.4 (2026-09-17, Apple only, single-token decode only): run the
+     * shared expert concurrently with the routed experts instead of as the
+     * four serial calls below.  start() only plans the section -- the encoder
+     * stays serial until the routed call reaches the one branch the schedule
+     * was built for, and if it never does, the four calls run afterwards
+     * instead, on a serial encoder, with the same arguments.  When the section
+     * does run it encodes the same kernels with the same arguments over the
+     * same buffers, in levels of one concurrent encoder separated by global
+     * barriers, so every stored float is identical; only the schedule changes.
+     * Rollback: DS4_METAL_DISABLE_PRE_M5_V41_PARALLEL_FFN.  The batched step,
+     * TP, the prefill per-row fallback, streaming, quality, imatrix and the
+     * non-epilogue path never reach it, and a start that fails changes
+     * nothing. */
+    bool par = false;
+#ifdef __APPLE__
+    if (decode && shared_here && !shared_queued && g->tp_world == 1 &&
+        !g->streaming && !g->quality && !g->imatrix &&
+        ds41_bf16_epilogue_enabled() &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_PARALLEL_FFN")) {
+        par = ds4_gpu_dsv41_parallel_ffn_start(
+                  g->shared_gate, g->shared_up, g->shared_mid, g->shared,
+                  m->map, m->size, l->ffn_gate_shexp->abs_offset,
+                  l->ffn_up_shexp->abs_offset, l->ffn_down_shexp->abs_offset,
+                  DS4_N_EMBD, DS4_N_FF_EXP, g->norm, DS4_SWIGLU_CLAMP_EXP) != 0;
+    }
+#endif
+    if (shared_here && !shared_queued && !par &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
         !ds41_swiglu_round(g->shared_mid, g->shared_gate, g->shared_up, DS4_N_FF_EXP) ||
@@ -40930,7 +40964,22 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
+#ifdef __APPLE__
+    /* The section closes its encoder here (before the routed_ok check, so a
+     * failed routed call can never leave it armed).  If the routed call did
+     * not take the route the section was scheduled for, nothing of the shared
+     * expert ran inside it and the whole serial chain runs below on the
+     * ordinary serial encoder, which orders everything. */
+    const bool par_joined = par && ds4_gpu_dsv41_parallel_ffn_finish() != 0;
+#endif
     if (!routed_ok) return false;
+#ifdef __APPLE__
+    if (par && !par_joined &&
+        (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
+        !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
+        !ds41_swiglu_round(g->shared_mid, g->shared_gate, g->shared_up, DS4_N_FF_EXP) ||
+        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+#endif
     /* Keep the shared expert's BF16 boundary, then include it exactly once
      * in the existing F32 reduction. Alternate ownership across layers. */
     if (shared_owner && g->tp_rank == (il & 1u) &&
@@ -40948,8 +40997,9 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
 }
 
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
-                     const ds4_layer_weights *l, uint32_t il, uint32_t token) {
-    return ds41_moe_partial(g, m, l, il, token) && ds41_moe_finish(g, il);
+                     const ds4_layer_weights *l, uint32_t il, uint32_t token,
+                     bool decode) {
+    return ds41_moe_partial(g, m, l, il, token, decode) && ds41_moe_finish(g, il);
 }
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
@@ -41278,8 +41328,10 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g, uint32_t il) {
 }
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
-                            const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
+                            const ds4_layer_weights *l, uint32_t il, int token,
+                            bool decode) {
+    return ds41_graph_before_moe(g, m, l, il) &&
+        ds41_moe(g, m, l, il, (uint32_t)token, decode) &&
         ds41_graph_after_moe(g, il);
 }
 
@@ -41300,7 +41352,7 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
         const bool ok = island == 0 ?
             ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l) :
             island == 2 ? ds41_attention_output(g, m, l) :
-            ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0);
+            ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0, true);
         if (state != 0) return ok;
         if (!ok) ds4_gpu_decode_graph_abort(&key);
         else if (ds4_gpu_decode_graph_end(&key) == 0) return true;
@@ -41315,7 +41367,7 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
         g_expert_profile.active || getenv("DS4_CUDA_MOE_PROFILE") ||
         metal_graph_debug_get_config()->prefix ||
         !ds4_gpu_decode_graphs_supported())
-        return ds41_graph_layer(g, m, l, il, token);
+        return ds41_graph_layer(g, m, l, il, token, true);
     return ds41_decode_island(g, m, l, il, 0) &&
         ds41_attention(g, m, l, il, true) && ds41_decode_island(g, m, l, il, 2) &&
         ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -41574,7 +41626,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
             ok = ds41_graph_decode_layer(g, m, l, il, token);
 #else
-            ok = ds41_graph_layer(g, m, l, il, token);
+            ok = ds41_graph_layer(g, m, l, il, token, true);
 #endif
         }
         /* TP gates already submit ordered, bounded command buffers. Drain
@@ -42092,7 +42144,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #undef DS41_USE_ROW
                 ok = batch_attention ? ds41_graph_before_attention(&row, m, &w->layer[il], il) :
                     batch_moe ? ds41_graph_before_moe(&row, m, &w->layer[il], il) :
-                    ds41_graph_layer(&row, m, &w->layer[il], il, tokens[off + t]);
+                    ds41_graph_layer(&row, m, &w->layer[il], il, tokens[off + t], false);
             }
             if (ok && batch_attention) {
                 const ds4_layer_weights *l = &w->layer[il];
@@ -42136,7 +42188,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     DS41_PREFILL_ROWS(DS41_USE_FFN_ROW)
 #undef DS41_USE_FFN_ROW
                     ok = ds41_graph_after_attention(&row, m, l);
-                    if (ok && !batch_moe) ok = ds41_moe(&row, m, l, il, (uint32_t)tokens[off + t]) &&
+                    if (ok && !batch_moe) ok = ds41_moe(&row, m, l, il, (uint32_t)tokens[off + t], false) &&
                         ds41_graph_after_moe(&row, il);
                 }
             }

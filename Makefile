@@ -245,6 +245,12 @@ test-deepseek41-fused-bf16: tests/test_deepseek41_metal
 test-deepseek41-metal: tests/test_deepseek41_metal
 	./tests/test_deepseek41_metal
 	./tests/test_deepseek41_metal --fused-bf16
+# 3.4's bit-identity proof for the concurrent MoE section: five modes per
+# route against a serial reference taken on the same route, over both arm
+# points (the generic fused branch the resident decode takes, and the
+# selected-slots branch only the test can reach).
+	./tests/test_deepseek41_metal --v41-parallel-ffn
+	./tests/test_deepseek41_metal --v41-parallel-ffn-slots
 
 tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<

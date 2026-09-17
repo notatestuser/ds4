@@ -416,6 +416,31 @@ static bool g_use_dsv4_head_rms_norm_rope_tail_pipeline;
 /* V4.1 decode knobs read once per command batch instead of ~1,000 times per token (2026-09-17). */
 static bool g_v41_linear_bf16_disabled, g_v41_topk_shuffle_disabled, g_v41_topk_prefix_disabled;
 static bool g_pre_m5_small_compute_copy;   /* PRE_M5: small copies as a copy kernel, not a blit encoder */
+/* PRE_M5 3.4: bisecting aid only (DS4_METAL_V41_PARALLEL_FFN_SCOPE_BARRIER) --
+ * the scope form of the V4.1 concurrent MoE section's level barriers.  Both
+ * forms are global execution barriers, so the schedule is the same either way.
+ * Snapshotted per command batch in ds4_gpu_begin_commands. */
+static BOOL g_v41_par_scope_barrier;
+/* PRE_M5 3.4: diagnostic only (DS4_METAL_V41_PARALLEL_FFN_REPORT) -- print the
+ * section's own counters instead of trying to read them out of the encoder
+ * timeline, which stops recording once its counter sample buffers run out.
+ * The periodic lines are sampled, so an exit handler prints the exact totals
+ * once; it is registered only when the variable is set. */
+static BOOL g_v41_par_report, g_v41_par_report_atexit;
+static void ds4_gpu_dsv41_parallel_ffn_report_totals(void);
+/* PRE_M5 3.4: the routed-tensor floor that picks the selected-expert-view Q4
+ * routes inside ds4_gpu_routed_moe_one_tensor.  It was a 2 GiB literal there;
+ * it is a per-command-batch snapshot so that tests/test_deepseek41_metal can
+ * lower it (DS4_METAL_TEST_Q4_SELECTED_MIN_TENSOR_MB) and reach the
+ * selected-slots route with a 29 MiB synthetic model instead of 6 GiB of
+ * synthetic experts.  The initializer, the default and the maximum are all the
+ * production 2 GiB, so the variable can only ever lower the bound, an unset
+ * environment is bit-for-bit today's route choice, and a routed call that runs
+ * before any ds4_gpu_begin_commands still sees exactly the old constant.  It is
+ * a snapshot rather than a getenv at the point of use for the reason stated on
+ * the refresh block in ds4_gpu_begin_commands: no environment lookups per
+ * layer. */
+static uint64_t g_q4_selected_min_tensor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
 static bool g_pre_m5_bf16_epilogue;   /* PRE_M5 V4.1: rounding folded into producers */
 static id<MTLComputePipelineState> g_hc_split_sinkhorn_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_pipeline;
@@ -9275,6 +9300,113 @@ void ds4_gpu_test_set_flags(uint32_t flags) {
     g_test_flags = flags;
 }
 
+/* PRE_M5 3.4 (2026-09-17): the single-token Q8_0 matvec's pipeline, arguments
+ * and grid, lifted verbatim out of ds4_gpu_matmul_q8_0_legacy_tensor so that
+ * the concurrent V4.1 MoE section encodes the shared expert's gate, up and
+ * down through exactly this code instead of a second copy of the geometry.
+ * Same kernel name, same nsg, same nr0, same threadgroup memory, same
+ * threadgroup count -- so the section and the serial path store the same
+ * floats. */
+typedef struct {
+    id<MTLComputePipelineState> pipeline;
+    ds4_gpu_q8_0_matvec_args    args;
+    NSUInteger                  smem;
+    NSUInteger                  groups;
+    NSUInteger                  nsg;
+} ds4_gpu_q8_mv_plan;
+
+static int ds4_gpu_plan_q8_0_mv_single(uint64_t            in_dim,
+                                       uint64_t            out_dim,
+                                       bool                round,
+                                       ds4_gpu_q8_mv_plan *plan) {
+    ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+    ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+    if (out_dim > 65536u) mv_dispatch.nsg = 8;
+    mv_args.nr0 = mv_dispatch.nr0;
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_mul_mv_pipeline(round ? "kernel_mul_mv_q8_0_f32_bf16" : mv_dispatch.function_name,
+                                    mv_dispatch.nsg);
+    if (!pipeline) return 0;
+    plan->pipeline = pipeline;
+    plan->args = mv_args;
+    plan->smem = mv_dispatch.smem;
+    plan->groups = ((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                   (NSUInteger)mv_dispatch.nr0;
+    plan->nsg = (NSUInteger)mv_dispatch.nsg;
+    return 1;
+}
+
+static void ds4_gpu_encode_q8_0_mv_single(id<MTLComputeCommandEncoder> enc,
+                                          const ds4_gpu_q8_mv_plan    *plan,
+                                          id<MTLBuffer>                wbuf,
+                                          NSUInteger                   woff,
+                                          id<MTLBuffer>                xbuf,
+                                          NSUInteger                   xoff,
+                                          id<MTLBuffer>                outbuf,
+                                          NSUInteger                   ooff) {
+    [enc setComputePipelineState:plan->pipeline];
+    [enc setBytes:&plan->args length:sizeof(plan->args) atIndex:0];
+    [enc setBuffer:wbuf offset:woff atIndex:1];
+    [enc setBuffer:xbuf offset:xoff atIndex:2];
+    [enc setBuffer:outbuf offset:ooff atIndex:3];
+    [enc setThreadgroupMemoryLength:plan->smem atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(plan->groups, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, plan->nsg, 1)];
+}
+
+/* PRE_M5 3.4 (2026-09-17): the flat SwiGLU dispatch, lifted out of
+ * ds4_gpu_swiglu_impl for the same reason.  Every element is computed
+ * independently from one gate/up pair, so the arguments -- not the grid --
+ * decide the result; the section reuses both unchanged. */
+typedef struct {
+    ds4_gpu_glu_args args;
+    NSUInteger       nth;
+    NSUInteger       groups;
+} ds4_gpu_swiglu_flat_plan;
+
+static ds4_gpu_swiglu_flat_plan ds4_gpu_make_swiglu_flat_plan(uint32_t n,
+                                                              float    clamp,
+                                                              float    weight) {
+    ds4_gpu_swiglu_flat_plan plan = {0};
+    plan.args = (ds4_gpu_glu_args){
+        .ne00 = (int32_t)n,
+        .nb01 = (uint64_t)n * sizeof(float),
+        .ne10 = (int32_t)n,
+        .nb11 = (uint64_t)n * sizeof(float),
+        .ne0 = (int32_t)n,
+        .nb1 = (uint64_t)n * sizeof(float),
+        .i00 = 0,
+        .i10 = 0,
+        .alpha = weight,
+        .limit = clamp,
+    };
+    NSUInteger nth = g_swiglu_flat_pipeline.maxTotalThreadsPerThreadgroup;
+    if (nth > 256u) nth = 256u;
+    if (nth > (NSUInteger)n) nth = (NSUInteger)n;
+    if (nth == 0u) nth = 1u;
+    plan.nth = nth;
+    plan.groups = ((NSUInteger)n + nth - 1u) / nth;
+    return plan;
+}
+
+static void ds4_gpu_encode_swiglu_flat_plan(id<MTLComputeCommandEncoder>    enc,
+                                       id<MTLComputePipelineState>     pipeline,
+                                       const ds4_gpu_swiglu_flat_plan *plan,
+                                       id<MTLBuffer>                   gatebuf,
+                                       NSUInteger                      gate_off,
+                                       id<MTLBuffer>                   upbuf,
+                                       NSUInteger                      up_off,
+                                       id<MTLBuffer>                   outbuf,
+                                       NSUInteger                      out_off) {
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&plan->args length:sizeof(plan->args) atIndex:0];
+    [enc setBuffer:gatebuf offset:gate_off atIndex:1];
+    [enc setBuffer:upbuf offset:up_off atIndex:2];
+    [enc setBuffer:outbuf offset:out_off atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(plan->groups, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(plan->nth, 1, 1)];
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
@@ -9585,6 +9717,22 @@ int ds4_gpu_begin_commands(void) {
         getenv("DS4_METAL_DISABLE_PRE_M5_HEAD_RMS_ROPE_PIPELINE_STATIC") == NULL;
     g_pre_m5_bf16_epilogue = ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_PRE_M5_V41_BF16_EPILOGUE") == NULL;
+    /* 3.4 (2026-09-17): bisecting aid for the V4.1 concurrent MoE section --
+     * swap its two level barriers for the buffer-scope form.  Both are global
+     * execution barriers, so the schedule and the results are the same. */
+    g_v41_par_scope_barrier =
+        getenv("DS4_METAL_V41_PARALLEL_FFN_SCOPE_BARRIER") != NULL;
+    g_v41_par_report = getenv("DS4_METAL_V41_PARALLEL_FFN_REPORT") != NULL;
+    if (g_v41_par_report && !g_v41_par_report_atexit) {
+        g_v41_par_report_atexit = YES;
+        atexit(ds4_gpu_dsv41_parallel_ffn_report_totals);
+    }
+    /* 3.4 (2026-09-17): test-only, and only downwards -- default 2048 MiB,
+     * maximum 2048 MiB.  Unset (production, always) this recomputes the same
+     * 2 GiB the routed function used to spell as a literal. */
+    g_q4_selected_min_tensor_bytes =
+        ds4_gpu_env_u64("DS4_METAL_TEST_Q4_SELECTED_MIN_TENSOR_MB",
+                        2048ull, 1ull, 2048ull) * 1024ull * 1024ull;
     g_pre_m5_small_compute_copy = ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_PRE_M5_SMALL_COMPUTE_COPY") == NULL;
     g_v41_linear_bf16_disabled = getenv("DS4_METAL_DISABLE_V41_LINEAR_BF16") != NULL;
@@ -9687,6 +9835,74 @@ static ds4_gpu_shared_split_args g_parallel_split_args;
 static id<MTLBuffer> g_parallel_split_ids;
 static NSUInteger g_parallel_split_ids_offset;
 
+/* PRE_M5 3.4 (2026-09-17): the V4.1 MoE layer's concurrent-dispatch section.
+ * Same kernels, same argument geometry and the same buffers as the serial
+ * chain it replaces -- only the level schedule changes:
+ *
+ *   ... serial router matvec + router select ... | encoder boundary |
+ *   L0 { shared gate, shared up, routed pair-SwiGLU }
+ *     -- barrier --
+ *   L1 { shared SwiGLU + BF16 }
+ *     -- barrier --
+ *   L2 { shared down, routed sum6 }              | encoder boundary |
+ *   ... serial ds41_moe_finish add ...
+ *
+ * memoryBarrierWithResources on a concurrent encoder is a global execution
+ * barrier (see the note in ds4_gpu_parallel_q8_matvec_encode_pending), so each
+ * dependent chain needs its own level; the resource list narrows visibility,
+ * not completion.  The encoder boundary before the section fences the router
+ * that produced `selected` / `route_weights` / `norm`, and the boundary after
+ * it fences the consumers of `routed` / `shared`, so no trailing barrier is
+ * needed.
+ *
+ * stage is the whole safety story:
+ *   0  start() planned the section but NOTHING is encoded and the encoder is
+ *      still serial -- the state is inert and every route behaves exactly as
+ *      it did before this patch;
+ *   1  the routed call reached the generic fused pair-SwiGLU branch, turned
+ *      the encoder concurrent and encoded the shared gate and up into L0;
+ *   2  the mid hook added the two barriers, the shared SwiGLU and the shared
+ *      down, so the section is complete.
+ * The encoder is therefore only ever concurrent while the route is already
+ * known, which is why no dispatch outside the schedule above can ever land in
+ * a concurrent encoder. */
+typedef struct {
+    BOOL                        pending;
+    int                         stage;
+    ds4_gpu_q8_mv_plan          gate_plan;  /* gate and up share a shape */
+    ds4_gpu_q8_mv_plan          down_plan;
+    ds4_gpu_swiglu_flat_plan    swiglu_plan;
+    id<MTLComputePipelineState> swiglu_pipeline;
+    id<MTLBuffer>               gate_weight, up_weight, down_weight;
+    NSUInteger                  gate_weight_offset, up_weight_offset,
+                                down_weight_offset;
+    id<MTLBuffer>               x_in;
+    NSUInteger                  x_in_offset;
+    id<MTLBuffer>               gate_out, up_out, mid_out, shared_out;
+    NSUInteger                  gate_out_offset, up_out_offset,
+                                mid_out_offset, shared_out_offset;
+} ds4_gpu_v41_parallel_ffn;
+static ds4_gpu_v41_parallel_ffn g_v41_par;
+/* Lifetime counters for the test hook and for
+ * DS4_METAL_V41_PARALLEL_FFN_REPORT.  They are never reset by
+ * ds4_gpu_parallel_ffn_reset_state -- the test reads differences and the
+ * report reads totals:
+ *   planned   ds41_moe_partial asked for a section and start() accepted
+ *   armed     the routed call opened the concurrent encoder, per route
+ *   declined  a planned section reached an arm point that did not admit the
+ *             route, so the caller ran the serial chain instead
+ *   refused   start() itself said no (preconditions), nothing was planned
+ *   unjoined  a planned section did not complete: either a command-buffer
+ *             boundary inside the routed call dropped the plan, or the routed
+ *             call took a route with no arm point in it (a declined arm point
+ *             counts here too).  This is the counter that separates "the
+ *             section never ran" from "ds4.c never asked for one"
+ * The encoder timeline cannot prove any of this on a real decode (its counter
+ * sample buffers are exhausted by the prefill and later command batches
+ * record no encoders at all), which is why the section counts itself. */
+static uint32_t g_v41_par_armed_count[DS4_GPU_V41_PAR_ROUTE_COUNT];
+static uint32_t g_v41_par_planned_count, g_v41_par_declined_count,
+                g_v41_par_refused_count, g_v41_par_unjoined_count;
 /* Reset is deliberately idempotent. Closing the concurrent encoder preserves
  * work already encoded, while clearing every admission/reference field keeps
  * a failed FFN path from turning later ordinary dispatches concurrent. */
@@ -9694,9 +9910,18 @@ static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder) {
     if (close_encoder &&
         (g_batch_encoder_concurrent || g_parallel_q8_pending ||
          g_parallel_q8_encoded || g_parallel_ffn_mode != 0 ||
-         g_parallel_ffn_stage != 0)) {
+         g_parallel_ffn_stage != 0 || g_v41_par.stage != 0)) {
         ds4_gpu_close_batch_encoder();
     }
+
+    /* 3.4: the V4.1 section shares this reset, so begin/end/flush_commands,
+     * flush_encoder and the profile-mode end/begin inside the routed function
+     * can never leak it into a later command batch.  Clearing the whole struct
+     * releases every retained buffer and pipeline it held.  Note the close
+     * above keys on `stage`, not on `pending`: a section that is only planned
+     * has encoded nothing and left the encoder serial, so there is nothing to
+     * fence and no encoder boundary is added on its account. */
+    g_v41_par = (ds4_gpu_v41_parallel_ffn){0};
 
     g_batch_encoder_concurrent = NO;
     g_parallel_q8_pending = NO;
@@ -9745,7 +9970,20 @@ void ds4_gpu_parallel_ffn_abort(void) {
  * wrapper abort an armed concurrent FFN without touching its many
  * established fallback branches. */
 static void ds4_gpu_parallel_ffn_scope_cleanup(BOOL *armed) {
-    if (armed && *armed && g_parallel_q8_pending) {
+    /* 3.4: the V4.1 section joins the same net, with no carve-out for a
+     * section that already reached stage 2.  The normal return cannot reach
+     * this branch: ds4_gpu_routed_moe_one_tensor has exactly one `return 1;`
+     * and it disarms the guard (`parallel_ffn_scope = NO;`) on the line
+     * before, so *armed is YES only on one of the function's many early
+     * `return 0;` paths -- where the caller is about to fail the layer and an
+     * open concurrent encoder with g_batch_encoder_concurrent still YES is
+     * exactly the leak this net exists to close.  (ds41_moe_partial does call
+     * ds4_gpu_dsv41_parallel_ffn_finish() on every path once start() has
+     * succeeded, so this is a second line of defence, not the only one; being
+     * a superset of it costs nothing, because an aborted section just makes
+     * finish() report `plan-dropped` and the caller re-encode the shared chain
+     * serially -- same bytes, and the layer has failed anyway.) */
+    if (armed && *armed && (g_parallel_q8_pending || g_v41_par.pending)) {
         ds4_gpu_parallel_ffn_abort();
     }
 }
@@ -10187,6 +10425,336 @@ int ds4_gpu_parallel_ffn_finish(void) {
         g_parallel_ffn_stage == 2 && g_batch_encoder_concurrent;
     /* Reset even on an incomplete join. This makes the error path just as
      * safe and idempotent as an explicit abort. */
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    return completed;
+}
+
+/* ---- 3.4: the V4.1 MoE concurrent-dispatch section (see g_v41_par) ---- */
+
+uint32_t ds4_gpu_test_v41_parallel_ffn_armed_count(unsigned route) {
+    if (route < DS4_GPU_V41_PAR_ROUTE_COUNT) return g_v41_par_armed_count[route];
+    uint32_t total = 0;
+    for (unsigned i = 0; i < DS4_GPU_V41_PAR_ROUTE_COUNT; i++)
+        total += g_v41_par_armed_count[i];
+    return total;
+}
+
+static const char *ds4_gpu_dsv41_parallel_ffn_route_name(unsigned route) {
+    return route == DS4_GPU_V41_PAR_ROUTE_SLOTS ? "slots6" :
+           route == DS4_GPU_V41_PAR_ROUTE_ID ? "id" : "-";
+}
+
+/* Diagnostic only (DS4_METAL_V41_PARALLEL_FFN_REPORT): one stderr line, from
+ * whichever binary is running.  Callers rate-limit it -- the first event of
+ * each kind and then one line per 128 arms -- so an 8-token decode prints a
+ * handful of lines and a 1024-token bench a few dozen. */
+static void ds4_gpu_dsv41_parallel_ffn_report(const char *event,
+                                              const char *detail,
+                                              uint32_t    layer_index) {
+    if (!g_v41_par_report) return;
+    fprintf(stderr,
+            "ds4: Metal V4.1 parallel FFN %s layer=%u detail=%s "
+            "planned=%u armed_id=%u armed_slots=%u declined=%u refused=%u "
+            "unjoined=%u\n",
+            event, layer_index, detail ? detail : "-",
+            g_v41_par_planned_count,
+            g_v41_par_armed_count[DS4_GPU_V41_PAR_ROUTE_ID],
+            g_v41_par_armed_count[DS4_GPU_V41_PAR_ROUTE_SLOTS],
+            g_v41_par_declined_count, g_v41_par_refused_count,
+            g_v41_par_unjoined_count);
+}
+
+/* Registered from ds4_gpu_begin_commands the first time the report variable is
+ * seen, so the exact totals land in the log of whatever binary ran, however it
+ * exits.  The periodic lines above are samples; this one is the answer to "did
+ * the section engage, and how often?". */
+static void ds4_gpu_dsv41_parallel_ffn_report_totals(void) {
+    ds4_gpu_dsv41_parallel_ffn_report("totals", "exit", 0u);
+}
+
+static void ds4_gpu_dsv41_parallel_ffn_abort(void) {
+    /* With stage 0 this only drops the plan: the encoder was never made
+     * concurrent and nothing was encoded, so reset_state leaves it alone.
+     * With stage >= 1 closing the encoder is the fence -- work already
+     * encoded keeps its order and the flag goes back to serial. */
+    ds4_gpu_parallel_ffn_reset_state(YES);
+}
+
+static void ds4_gpu_dsv41_parallel_ffn_barrier(id<MTLComputeCommandEncoder> enc,
+                                               id<MTLResource> __strong *resources,
+                                               NSUInteger                count) {
+    if (g_v41_par_scope_barrier) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return;
+    }
+    [enc memoryBarrierWithResources:resources count:count];
+}
+
+static int ds4_gpu_dsv41_parallel_ffn_start_impl(
+        ds4_gpu_tensor       *shared_gate,
+        ds4_gpu_tensor       *shared_up,
+        ds4_gpu_tensor       *shared_mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* The section reproduces the BF16-epilogue producers exactly (the Q8
+     * matvec that rounds in its store, the BF16 SwiGLU).  With the epilogue
+     * off the serial chain is a different pair of dispatches per producer, so
+     * the section is simply skipped and nothing changes. */
+    if (!g_pre_m5_bf16_epilogue || !g_swiglu_flat_bf16_pipeline) return 0;
+    if (!g_batch_cb || g_parallel_q8_pending || g_batch_encoder_concurrent ||
+        g_v41_par.pending ||
+        !shared_gate || !shared_up || !shared_mid || !shared_out || !x ||
+        !model_map || model_dim == 0 || shared_dim == 0 ||
+        (model_dim & 31u) != 0 || (shared_dim & 31u) != 0 ||
+        !isfinite(clamp) || clamp < 0.0f) {
+        return 0;
+    }
+
+    id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+    id<MTLBuffer> gatebuf = ds4_gpu_tensor_buffer(shared_gate);
+    id<MTLBuffer> upbuf = ds4_gpu_tensor_buffer(shared_up);
+    id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(shared_mid);
+    id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(shared_out);
+    if (!xbuf || !gatebuf || !upbuf || !midbuf || !outbuf ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)model_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(shared_gate) < (uint64_t)shared_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(shared_up) < (uint64_t)shared_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(shared_mid) < (uint64_t)shared_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(shared_out) < (uint64_t)model_dim * sizeof(float)) {
+        return 0;
+    }
+
+    /* The same ranges ds4_gpu_matmul_q8_0_legacy_tensor would wrap for the
+     * three serial calls, so the cache hands back the same buffers and the
+     * same inner offsets. */
+    const uint64_t gate_row_bytes = ((uint64_t)model_dim / 32u) * 34u;
+    const uint64_t gate_weight_bytes = (uint64_t)shared_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = ((uint64_t)shared_dim / 32u) * 34u;
+    const uint64_t down_weight_bytes = (uint64_t)model_dim * down_row_bytes;
+    if (gate_offset > model_size || gate_weight_bytes > model_size - gate_offset ||
+        up_offset > model_size || gate_weight_bytes > model_size - up_offset ||
+        down_offset > model_size || down_weight_bytes > model_size - down_offset) {
+        return 0;
+    }
+
+    uint64_t gate_inner = 0, up_inner = 0, down_inner = 0;
+    id<MTLBuffer> gate_wbuf = ds4_gpu_wrap_model_range(
+        model_map, model_size, gate_offset, gate_weight_bytes, &gate_inner);
+    id<MTLBuffer> up_wbuf = ds4_gpu_wrap_model_range(
+        model_map, model_size, up_offset, gate_weight_bytes, &up_inner);
+    id<MTLBuffer> down_wbuf = ds4_gpu_wrap_model_range(
+        model_map, model_size, down_offset, down_weight_bytes, &down_inner);
+    if (!gate_wbuf || !up_wbuf || !down_wbuf) return 0;
+
+    /* gate and up have the same shape, so one plan drives both. */
+    ds4_gpu_q8_mv_plan gate_plan = {0}, down_plan = {0};
+    if (!ds4_gpu_plan_q8_0_mv_single(model_dim, shared_dim, true, &gate_plan) ||
+        !ds4_gpu_plan_q8_0_mv_single(shared_dim, model_dim, true, &down_plan)) {
+        return 0;
+    }
+
+    /* Planned, not armed: the compute encoder is untouched and stays serial
+     * until (and unless) the routed call reaches the one branch this schedule
+     * was built for. */
+    g_v41_par.gate_plan = gate_plan;
+    g_v41_par.down_plan = down_plan;
+    g_v41_par.swiglu_plan = ds4_gpu_make_swiglu_flat_plan(shared_dim, clamp, 1.0f);
+    g_v41_par.swiglu_pipeline = g_swiglu_flat_bf16_pipeline;
+    g_v41_par.gate_weight = gate_wbuf;
+    g_v41_par.up_weight = up_wbuf;
+    g_v41_par.down_weight = down_wbuf;
+    g_v41_par.gate_weight_offset = (NSUInteger)gate_inner;
+    g_v41_par.up_weight_offset = (NSUInteger)up_inner;
+    g_v41_par.down_weight_offset = (NSUInteger)down_inner;
+    g_v41_par.x_in = xbuf;
+    g_v41_par.x_in_offset = ds4_gpu_tensor_offset(x);
+    g_v41_par.gate_out = gatebuf;
+    g_v41_par.up_out = upbuf;
+    g_v41_par.mid_out = midbuf;
+    g_v41_par.shared_out = outbuf;
+    g_v41_par.gate_out_offset = ds4_gpu_tensor_offset(shared_gate);
+    g_v41_par.up_out_offset = ds4_gpu_tensor_offset(shared_up);
+    g_v41_par.mid_out_offset = ds4_gpu_tensor_offset(shared_mid);
+    g_v41_par.shared_out_offset = ds4_gpu_tensor_offset(shared_out);
+    g_v41_par.stage = 0;
+    g_v41_par.pending = YES;
+    return 1;
+}
+
+int ds4_gpu_dsv41_parallel_ffn_start(
+        ds4_gpu_tensor       *shared_gate,
+        ds4_gpu_tensor       *shared_up,
+        ds4_gpu_tensor       *shared_mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp) {
+    const int planned = ds4_gpu_dsv41_parallel_ffn_start_impl(
+            shared_gate, shared_up, shared_mid, shared_out, model_map,
+            model_size, gate_offset, up_offset, down_offset, model_dim,
+            shared_dim, x, clamp);
+    /* Counting here rather than at every early return keeps the refusals in
+     * one place; the report is rate-limited to the first two so a device that
+     * can never run the section does not print per layer per token. */
+    if (planned) {
+        g_v41_par_planned_count++;
+        if (g_v41_par_planned_count == 1u)
+            ds4_gpu_dsv41_parallel_ffn_report("planned", "start", 0u);
+    } else {
+        g_v41_par_refused_count++;
+        if (g_v41_par_refused_count <= 2u)
+            ds4_gpu_dsv41_parallel_ffn_report("refused", "start", 0u);
+    }
+    return planned;
+}
+
+/* Called from the routed MoE function at the top of the branch that is about
+ * to encode the routed pair-SwiGLU, BEFORE that branch encodes anything.
+ * `admitted` is the rest of the route check made there and `route` names which
+ * of the two scheduled routes it is.  Only here does the encoder become
+ * concurrent, and only for the exact schedule the section was planned for;
+ * anything else drops the plan and leaves the encoder serial, so the caller
+ * runs the ordinary serial chain and nothing about its dispatches changes.
+ * Never fails the caller. */
+static void ds4_gpu_dsv41_parallel_ffn_arm(id<MTLCommandBuffer> cb,
+                                           bool                 admitted,
+                                           unsigned             route,
+                                           uint32_t             layer_index) {
+    if (!g_v41_par.pending) return;
+    if (!admitted || route >= DS4_GPU_V41_PAR_ROUTE_COUNT ||
+        !g_batch_cb || cb != g_batch_cb || g_v41_par.stage != 0 ||
+        g_batch_encoder_concurrent || g_parallel_q8_pending) {
+        ds4_gpu_dsv41_parallel_ffn_abort();
+        g_v41_par_declined_count++;
+        if (g_v41_par_declined_count <= 2u ||
+            (g_v41_par_declined_count % 128u) == 0u) {
+            ds4_gpu_dsv41_parallel_ffn_report(
+                    "declined", ds4_gpu_dsv41_parallel_ffn_route_name(route),
+                    layer_index);
+        }
+        return;
+    }
+
+    ds4_gpu_close_batch_encoder();
+    g_batch_encoder_concurrent = YES;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    if (!enc || enc.dispatchType != MTLDispatchTypeConcurrent) {
+        ds4_gpu_close_batch_encoder();
+        g_batch_encoder_concurrent = NO;
+        ds4_gpu_dsv41_parallel_ffn_abort();
+        g_v41_par_declined_count++;
+        if (g_v41_par_declined_count <= 2u)
+            ds4_gpu_dsv41_parallel_ffn_report("declined", "not-concurrent",
+                                              layer_index);
+        return;
+    }
+
+    /* L0: the shared expert's gate and up. The routed pair-SwiGLU, encoded by
+     * the branch we were called from, joins them in the same level. */
+    ds4_gpu_encode_q8_0_mv_single(enc, &g_v41_par.gate_plan,
+                                  g_v41_par.gate_weight, g_v41_par.gate_weight_offset,
+                                  g_v41_par.x_in, g_v41_par.x_in_offset,
+                                  g_v41_par.gate_out, g_v41_par.gate_out_offset);
+    ds4_gpu_encode_q8_0_mv_single(enc, &g_v41_par.gate_plan,
+                                  g_v41_par.up_weight, g_v41_par.up_weight_offset,
+                                  g_v41_par.x_in, g_v41_par.x_in_offset,
+                                  g_v41_par.up_out, g_v41_par.up_out_offset);
+    g_v41_par.stage = 1;
+    g_v41_par_armed_count[route]++;
+    {
+        const uint32_t armed = g_v41_par_armed_count[route];
+        if (armed == 1u || (armed % 128u) == 0u)
+            ds4_gpu_dsv41_parallel_ffn_report(
+                    "armed", ds4_gpu_dsv41_parallel_ffn_route_name(route),
+                    layer_index);
+    }
+}
+
+/* Called from the routed MoE function once its pair-SwiGLU is encoded: the
+ * level break.  The route was already decided at the arm point, so there is
+ * nothing to admit here. */
+static int ds4_gpu_dsv41_parallel_ffn_encode_mid(id<MTLCommandBuffer> cb,
+                                                 id<MTLBuffer>        routed_mid) {
+    if (g_v41_par.stage != 1) return 1;
+    if (!routed_mid || !g_batch_cb || cb != g_batch_cb ||
+        !g_batch_encoder_concurrent) {
+        ds4_gpu_dsv41_parallel_ffn_abort();
+        return 1;
+    }
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc || enc.dispatchType != MTLDispatchTypeConcurrent) {
+        ds4_gpu_dsv41_parallel_ffn_abort();
+        return 1;
+    }
+
+    /* End of L0: the routed pair-SwiGLU's `mid` feeds the routed sum6 in L2 and
+     * the shared gate/up feed the SwiGLU in L1.  One barrier covers both -- it
+     * is a global execution barrier, the resource list only narrows what the
+     * later dispatches are guaranteed to see. */
+    id<MTLResource> level0[3] = {
+        routed_mid,
+        g_v41_par.gate_out,
+        g_v41_par.up_out,
+    };
+    ds4_gpu_dsv41_parallel_ffn_barrier(enc, level0, 3u);
+
+    /* L1: the shared SwiGLU + BF16 boundary rounding. */
+    ds4_gpu_encode_swiglu_flat_plan(enc, g_v41_par.swiglu_pipeline,
+                                    &g_v41_par.swiglu_plan,
+                                    g_v41_par.gate_out, g_v41_par.gate_out_offset,
+                                    g_v41_par.up_out, g_v41_par.up_out_offset,
+                                    g_v41_par.mid_out, g_v41_par.mid_out_offset);
+
+    /* End of L1: the shared `mid` feeds the shared down in L2. */
+    id<MTLResource> level1[1] = { g_v41_par.mid_out };
+    ds4_gpu_dsv41_parallel_ffn_barrier(enc, level1, 1u);
+
+    /* L2: the shared down.  The caller's sum6 lands in the same level. */
+    ds4_gpu_encode_q8_0_mv_single(enc, &g_v41_par.down_plan,
+                                  g_v41_par.down_weight, g_v41_par.down_weight_offset,
+                                  g_v41_par.mid_out, g_v41_par.mid_out_offset,
+                                  g_v41_par.shared_out, g_v41_par.shared_out_offset);
+    g_v41_par.stage = 2;
+    return 1;
+}
+
+int ds4_gpu_dsv41_parallel_ffn_finish(void) {
+    const int completed =
+        g_v41_par.pending && g_v41_par.stage == 2 && g_batch_encoder_concurrent;
+    if (!completed) {
+        /* Every way of getting here is safe, but they are worth telling apart
+         * when the section does not engage on a real decode: the plan was
+         * dropped by a command-buffer boundary inside the routed call (pending
+         * clear -- end/begin_commands and flush_commands both reset the
+         * state), or the routed call took a route with no arm point in it, or
+         * an arm point refused (both stage 0; the refusal already printed its
+         * own line with a detail). */
+        const char *why = !g_v41_par.pending ? "plan-dropped" :
+                          g_v41_par.stage == 0 ? "never-armed" : "stage1";
+        g_v41_par_unjoined_count++;
+        if (g_v41_par_unjoined_count <= 2u ||
+            (g_v41_par_unjoined_count % 128u) == 0u)
+            ds4_gpu_dsv41_parallel_ffn_report("unjoined", why, 0u);
+    }
+    /* Reset on an incomplete join too. The caller then runs the whole serial
+     * shared-expert chain: with stage 0 nothing of it was encoded, and with
+     * stage 1 the closed encoder fences the gate/up that were, so recomputing
+     * them writes the same bytes again. Either way the result is identical. */
     ds4_gpu_parallel_ffn_reset_state(YES);
     return completed;
 }
@@ -19448,26 +20016,16 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 ds4_gpu_warn_mpp_fallback();
             }
 
-            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
-            ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
-            if (out_dim > 65536u) mv_dispatch.nsg = 8;
-            mv_args.nr0 = mv_dispatch.nr0;
-            id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(round ? "kernel_mul_mv_q8_0_f32_bf16" : mv_dispatch.function_name,
-                                            mv_dispatch.nsg);
-            if (!pipeline) return 0;
+            /* 3.4: one copy of this geometry, shared with the V4.1 concurrent
+             * MoE section (ds4_gpu_dsv41_parallel_ffn_start). */
+            ds4_gpu_q8_mv_plan mv_plan = {0};
+            if (!ds4_gpu_plan_q8_0_mv_single(in_dim, out_dim, round, &mv_plan)) return 0;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:pipeline];
-            [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
-            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                                  1,
-                                                  1)
-                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+            ds4_gpu_encode_q8_0_mv_single(enc, &mv_plan,
+                                          wbuf, (NSUInteger)inner_offset,
+                                          xbuf, ds4_gpu_tensor_offset(x),
+                                          outbuf, ds4_gpu_tensor_offset(out));
             ds4_gpu_end_compute_encoder(cb, enc);
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 tensor matvec")) {
@@ -31292,32 +31850,16 @@ static int ds4_gpu_swiglu_impl(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        ds4_gpu_glu_args args = {
-            .ne00 = (int32_t)n,
-            .nb01 = (uint64_t)n * sizeof(float),
-            .ne10 = (int32_t)n,
-            .nb11 = (uint64_t)n * sizeof(float),
-            .ne0 = (int32_t)n,
-            .nb1 = (uint64_t)n * sizeof(float),
-            .i00 = 0,
-            .i10 = 0,
-            .alpha = weight,
-            .limit = clamp,
-        };
-        NSUInteger nth = g_swiglu_flat_pipeline.maxTotalThreadsPerThreadgroup;
-        if (nth > 256u) nth = 256u;
-        if (nth > (NSUInteger)n) nth = (NSUInteger)n;
-        if (nth == 0u) nth = 1u;
-        const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
+        /* 3.4: one copy of this dispatch, shared with the V4.1 concurrent MoE
+         * section (ds4_gpu_dsv41_parallel_ffn_encode_mid). */
+        const ds4_gpu_swiglu_flat_plan plan =
+            ds4_gpu_make_swiglu_flat_plan(n, clamp, weight);
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:pipeline];
-        [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:gatebuf offset:ds4_gpu_tensor_offset(gate) atIndex:1];
-        [enc setBuffer:upbuf offset:ds4_gpu_tensor_offset(up) atIndex:2];
-        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_encode_swiglu_flat_plan(enc, pipeline, &plan,
+                                        gatebuf, ds4_gpu_tensor_offset(gate),
+                                        upbuf, ds4_gpu_tensor_offset(up),
+                                        outbuf, ds4_gpu_tensor_offset(out));
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "SwiGLU")) return 0;
@@ -40597,7 +41139,7 @@ int ds4_gpu_routed_moe_one_tensor(
         bool                    force_resident) {
     BOOL parallel_ffn_scope
         __attribute__((cleanup(ds4_gpu_parallel_ffn_scope_cleanup))) =
-            g_parallel_q8_pending;
+            g_parallel_q8_pending || g_v41_par.pending;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* TP sharding: only the owned contiguous expert range is mapped,
      * so bind from the owned base, validate only its bytes, and tell the
@@ -40973,7 +41515,15 @@ int ds4_gpu_routed_moe_one_tensor(
             fprintf(stderr, "ds4: tensor-parallel routed MoE requires the fused pair+sum6 decode path\n");
             return 0;
         }
-        const uint64_t q4_selected_min_tensor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
+        /* PRE_M5 3.4 (2026-09-17): the 2 GiB literal became the per-command
+         * batch snapshot g_q4_selected_min_tensor_bytes, so that the model-free
+         * test can lower it (DS4_METAL_TEST_Q4_SELECTED_MIN_TENSOR_MB, test
+         * only, downwards only) and reach the selected-slots route with a
+         * synthetic model small enough to build.  Production never sets the
+         * variable and the snapshot then recomputes exactly this constant, so
+         * the route choice is unchanged and no environment lookup was added to
+         * this function.  See the declaration for the full argument. */
+        const uint64_t q4_selected_min_tensor_bytes = g_q4_selected_min_tensor_bytes;
         /*
          * The grouped Q4 experiment keeps selected IDs on GPU, but it also walks
          * every expert window in the layer.  On PRO Q4 this measured far slower
@@ -42787,6 +43337,72 @@ int ds4_gpu_routed_moe_one_tensor(
                                                                     nil);
                 }
             } else {
+                /* PRE_M5 3.4 (2026-09-17): the V4.1 concurrent MoE section's
+                 * second arm point -- the selected-slots route.  Same
+                 * position in the schedule as the generic one: the route is
+                 * decided, nothing has been encoded for it yet, and the
+                 * pair-SwiGLU dispatch that follows is L0's third member.
+                 *
+                 * UNREACHABLE FROM THE V4.1 DECODE, twice over -- this is
+                 * coverage of the routed-MoE encode schedule, not a path the
+                 * shipping decode can take, and only
+                 * tests/test_deepseek41_metal --v41-parallel-ffn-slots ever
+                 * gets here:
+                 *   1. ds41_moe_partial passes force_resident = !g->streaming
+                 *      and only plans a section when !g->streaming, so
+                 *      force_resident is always true underneath it, while
+                 *      use_q4_selected_slots requires !force_resident.  The
+                 *      resident decode therefore takes the generic fused
+                 *      pair-SwiGLU branch below, which is where it arms.
+                 *   2. Even with that lifted, this route obtains its expert
+                 *      ids on the host.  Every source of them except the
+                 *      g_routed_moe_selected_override one crosses a command
+                 *      buffer boundary first -- ds4_gpu_signal_batch_and_wait_event
+                 *      and ds4_gpu_end_commands both call
+                 *      ds4_gpu_parallel_ffn_reset_state(YES), which clears
+                 *      g_v41_par -- so a section planned before the routed
+                 *      call is already dropped by the time this runs, and
+                 *      ds4_gpu_dsv41_parallel_ffn_finish() reports it as
+                 *      `plan-dropped`.  The override is set only by the V4 /
+                 *      GLM graph paths in ds4.c and by the test; no ds41_*
+                 *      function calls it.  `if (g_v41_par.pending)` below is
+                 *      what makes that harmless rather than a latent bug.
+                 *
+                 * Only the Q4_K selected-slots variant is admitted: the IQ2
+                 * and MXFP4 variants exist for streaming, where
+                 * ds41_moe_partial never plans a section in the first place,
+                 * and admitting only what is tested keeps the schedule
+                 * enumerable.  use_stream_expert_addr_table is false here by
+                 * construction (this is its else), and it is restated in the
+                 * predicate so that moving this code cannot silently admit
+                 * the flushing variants.  Excluding the streaming expert
+                 * cache makes the mark_entries_inflight below a guaranteed
+                 * short circuit on an armed section, so the only thing
+                 * between this point and the pair-SwiGLU dispatch is the
+                 * dispatch itself. */
+                if (g_v41_par.pending) {
+                    const bool v41_par_admit_slots =
+                        use_q4_selected_slots &&
+                        !use_q4_gather_slots &&
+                        !use_iq2_selected_slots &&
+                        !use_mxfp4_selected_slots &&
+                        !use_iq2_stream_addr_table &&
+                        !use_stream_expert_addr_table &&
+                        !stream_expert_split_completed &&
+                        !g_ssd_streaming_mode &&
+                        !use_stream_expert_cache &&
+                        direct_down_sum &&
+                        !moe_one_stage_profile &&
+                        g_tp_split_world == 1 &&
+                        add_in == NULL &&
+                        n_tokens == 1 &&
+                        n_expert == 6 &&
+                        gate_type == DS4_METAL_TENSOR_Q4_K &&
+                        down_type == DS4_METAL_TENSOR_Q4_K;
+                    ds4_gpu_dsv41_parallel_ffn_arm(cb, v41_par_admit_slots,
+                                                   DS4_GPU_V41_PAR_ROUTE_SLOTS,
+                                                   layer_index);
+                }
                 ok = (!use_stream_expert_cache ||
                       ds4_gpu_stream_expert_cache_mark_entries_inflight(
                               stream_slot_entries,
@@ -42815,6 +43431,38 @@ int ds4_gpu_routed_moe_one_tensor(
                                                               false);
             }
         } else if (fuse_pair_swiglu) {
+            /* PRE_M5 3.4 (2026-09-17): the V4.1 concurrent MoE section's arm
+             * point for the generic id route -- the one the resident V4.1
+             * decode takes (ds41_moe_partial passes force_resident =
+             * !g->streaming and the section requires !g->streaming, so
+             * use_q4_selected_slots, which needs !force_resident, is never
+             * true underneath it).  Reaching this branch is itself the proof
+             * that none of the grouped / group6 / group8 / group24 / exact /
+             * address-table / table / gather / selected-slots encoders above
+             * is in play -- each of them relies on dispatch ordering a
+             * concurrent encoder would silently break -- and nothing has been
+             * encoded yet on this route, so this is the first and only place
+             * on it where the encoder may become concurrent.  The rest of the
+             * route check is the plan's predicate; anything failing it drops
+             * the section and this call is encoded on the ordinary serial
+             * encoder exactly as before.  (moe_one_stage_profile is excluded
+             * because its end/begin_commands split the batch between our
+             * levels.) */
+            if (g_v41_par.pending) {
+                const bool v41_par_admit =
+                    direct_down_sum &&
+                    !moe_one_stage_profile &&
+                    g_tp_split_world == 1 &&
+                    add_in == NULL &&
+                    n_tokens == 1 &&
+                    n_expert == 6 &&
+                    gate_type == DS4_METAL_TENSOR_Q4_K &&
+                    down_type == DS4_METAL_TENSOR_Q4_K &&
+                    (force_resident || !g_ssd_streaming_mode);
+                ds4_gpu_dsv41_parallel_ffn_arm(cb, v41_par_admit,
+                                               DS4_GPU_V41_PAR_ROUTE_ID,
+                                               layer_index);
+            }
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
                 .width = expert_mid_dim,
                 .rows = pair_rows,
@@ -42939,6 +43587,17 @@ int ds4_gpu_routed_moe_one_tensor(
         DS4_METAL_PROFILE_MOE_ONE_STAGE("activation_weight");
         if (ok && g_parallel_q8_pending) {
             ok = ds4_gpu_parallel_q8_matvec_encode_pending(cb, midbuf) != 0;
+        }
+        if (ok && g_v41_par.stage == 1) {
+            /* 3.4: the V4.1 section's level break, shared by both arm points.
+             * stage 1 means one of them admitted this route and opened the
+             * concurrent encoder, so there is nothing left to decide here.
+             * This sits after the routed pair-SwiGLU of either route and
+             * before its sum6, and on an admitted route the only dispatch
+             * between them would be the separate SwiGLU+weight above (skipped,
+             * because both routes require fuse_pair_swiglu) or V4's
+             * g_parallel_q8_pending hook (excluded by both predicates). */
+            ok = ds4_gpu_dsv41_parallel_ffn_encode_mid(cb, midbuf) != 0;
         }
 
         id<MTLBuffer> down_dst = n_expert == 1 ? outbuf : (expertsbuf ? expertsbuf : g_moe_down_scratch_buffer);

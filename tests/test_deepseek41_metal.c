@@ -1622,12 +1622,387 @@ static int check_fused_bf16(void) {
             fused_matvec ? " + rollback" : " SKIPPED");
     return 1;
 }
+
+/* 3.4: the concurrent-dispatch section for the V4.1 MoE layer.  Synthetic Q4_K
+ * routed experts plus synthetic Q8_0 shared-expert weights at matching widths;
+ * no model file and no GGUF.  The section replaces four serial calls -- two Q8
+ * matvecs with the BF16 epilogue, the BF16 SwiGLU and the Q8 down matvec --
+ * with three levels of one concurrent encoder.
+ *
+ * The same body runs on both routes the section arms, because a route is only
+ * covered if the arm point inside it is exercised:
+ *
+ *   DS4_GPU_V41_PAR_ROUTE_ID     16 experts at the real V4.1 decode shapes
+ *                                (in 5120, mid 2304, out 5120) with
+ *                                force_resident = true.  n_total_expert is 16
+ *                                and the expert tensors are far below the
+ *                                2 GiB floor, so the grouped / group6 /
+ *                                group8 / group24 / exact / table / addr /
+ *                                gather / slots paths are all excluded and the
+ *                                routed call takes the generic fused
+ *                                pair-SwiGLU + direct sum6 branch -- the route
+ *                                the resident V4.1 decode takes.
+ *
+ *   DS4_GPU_V41_PAR_ROUTE_SLOTS  128 experts at reduced shapes (in 512,
+ *                                mid 256, out 512) with force_resident = false,
+ *                                the selected-expert-view opt-in and the
+ *                                test-only tensor-size override, which is the
+ *                                only combination that turns
+ *                                use_q4_selected_slots on: every other Q4 path
+ *                                needs n_total_expert == 384 or its own enable
+ *                                variable.  The routed call then takes the
+ *                                selected-slots pair-SwiGLU + sum6 branch.
+ *                                This route is NOT reachable from the shipping
+ *                                V4.1 decode and this mode is not a
+ *                                production-representative configuration: (a)
+ *                                ds41_moe_partial passes force_resident =
+ *                                !g->streaming and only plans a section when
+ *                                !g->streaming, so force_resident is always
+ *                                true there while use_q4_selected_slots needs
+ *                                it false; and (b) the mode has to set the
+ *                                selected-id override to keep the plan alive
+ *                                across the route's host-side id readback,
+ *                                and no ds41_* path ever sets that override
+ *                                (see the comment at the setenv below).  What
+ *                                it buys is coverage of the section's encode
+ *                                schedule against the slots6 encoders, so the
+ *                                schedule stays correct if that route ever
+ *                                does become reachable.
+ *
+ * Five modes per route, each compared byte for byte against a serial reference
+ * taken on the SAME routed route:
+ *   0  serial baseline, pair-SwiGLU fusion on          -> reference A
+ *   1  section armed, resource barriers                -> == A, joined, armed
+ *   2  section armed, scope barriers                   -> == A, joined, armed
+ *   3  serial baseline, fusion OFF (no section)        -> reference B
+ *   4  section armed, fusion OFF                       -> == B, NOT joined and
+ *                                                         NEVER armed
+ * Mode 4 is the regression test for the arm points: with the fusion off the
+ * routed call leaves both of them (the generic arm sits inside
+ * `else if (fuse_pair_swiglu)`, and use_q4_selected_slots requires the fusion
+ * too) and encodes a gate matvec, an up matvec and a dependent activation
+ * dispatch with no barrier between them, so if the section had turned the
+ * encoder concurrent before knowing the route, the routed mid/out would be
+ * computed from unwritten gate/up -- the buffers are pre-filled with NaN to
+ * make that loud.  The per-route armed counter additionally proves that no
+ * concurrent encoder was opened at all, which is the structural version of the
+ * same claim, and on modes 1 and 2 that the section armed on the route under
+ * test and never on the other one.  Modes 0 and 1 differ only in whether
+ * start() was called, and nothing start() does is read by any route predicate,
+ * so mode 1's armed route also identifies mode 0's reference. */
+static int check_v41_parallel_ffn_route(unsigned route) {
+    typedef struct { uint16_t d, dmin; uint8_t scales[12], qs[128]; } q4_block;
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    enum { SEL = 6, Q4_K_TYPE = 12, MODES = 5 };
+    const int slots = route == DS4_GPU_V41_PAR_ROUTE_SLOTS;
+    /* The slots route needs n_total_expert >= 128, so it trades expert width
+     * for expert count and keeps the synthetic model at ~29 MiB. */
+    const uint32_t D = slots ? 512u : 5120u;
+    const uint32_t H = slots ? 256u : 2304u;
+    const uint32_t E = slots ? 128u : 16u;
+    const char *const route_name = slots ? "slots6" : "id";
+    const uint64_t row = D / 256 * sizeof(q4_block);
+    const uint64_t down_row = H / 256 * sizeof(q4_block);
+    const uint64_t expert = (uint64_t)H * row;
+    const uint64_t tensor = (uint64_t)E * expert;
+    const uint64_t q4_bytes = 3 * tensor;
+    const uint64_t shexp_gate_bytes = (uint64_t)H * (D / 32) * sizeof(q8_block);
+    const uint64_t shexp_down_bytes = (uint64_t)D * (H / 32) * sizeof(q8_block);
+    const uint64_t shexp_gate_off = q4_bytes;
+    const uint64_t shexp_up_off = shexp_gate_off + shexp_gate_bytes;
+    const uint64_t shexp_down_off = shexp_up_off + shexp_gate_bytes;
+    const uint64_t bytes = shexp_down_off + shexp_down_bytes;
+    CHECK((uint64_t)D * down_row == expert);
+
+    unsetenv("DS4_METAL_ENABLE_Q4_SELECTED_EXPERT_VIEWS");
+    unsetenv("DS4_METAL_TEST_Q4_SELECTED_MIN_TENSOR_MB");
+    if (slots) {
+        /* Opt in to the selected-expert views off the streaming path, and
+         * lower the 2 GiB routed-tensor floor to 1 MiB so a synthetic model
+         * can reach the route at all.  Both are cleared again at the end. */
+        setenv("DS4_METAL_ENABLE_Q4_SELECTED_EXPERT_VIEWS", "1", 1);
+        setenv("DS4_METAL_TEST_Q4_SELECTED_MIN_TENSOR_MB", "1", 1);
+    }
+
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), bytes) == 0);
+    uint32_t r = 0x9e3779b9u;
+    uint32_t *words = model;
+    for (uint64_t i = 0; i < bytes / 4; i++) {
+        r ^= r << 13; r ^= r >> 17; r ^= r << 5;
+        words[i] = r;
+    }
+    q4_block *blocks = model;
+    for (uint64_t i = 0; i < q4_bytes / sizeof(*blocks); i++) {
+        blocks[i].d = 0x1800;
+        blocks[i].dmin = 0x1800;
+    }
+    q8_block *q8 = (q8_block *)((char *)model + shexp_gate_off);
+    for (uint64_t i = 0; i < (bytes - q4_bytes) / sizeof(*q8); i++) {
+        q8[i].d = 0x2000;
+        for (int j = 0; j < 32; j++) q8[i].qs[j] = (int)(random_value() * 8192) % 8;
+    }
+
+    float *xh = malloc(D * 4);
+    CHECK(xh);
+    for (uint32_t i = 0; i < D; i++) xh[i] = random_value() / 8.0f;
+    int32_t ids[SEL] = {0, 3, 5, 9, 12, 15};
+    float weights[SEL];
+    for (int s = 0; s < SEL; s++) weights[s] = (s + 1) / 21.0f;
+
+    ds4_gpu_tensor *xt = upload(xh, D * 4);
+    ds4_gpu_tensor *it = upload(ids, sizeof(ids));
+    ds4_gpu_tensor *wt = upload(weights, sizeof(weights));
+    ds4_gpu_tensor *gate = upload(NULL, (size_t)SEL * H * 4);
+    ds4_gpu_tensor *up = upload(NULL, (size_t)SEL * H * 4);
+    ds4_gpu_tensor *mid = upload(NULL, (size_t)SEL * H * 4);
+    ds4_gpu_tensor *down = upload(NULL, (size_t)SEL * D * 4);
+    ds4_gpu_tensor *out = upload(NULL, D * 4);
+    ds4_gpu_tensor *sgate = upload(NULL, H * 4);
+    ds4_gpu_tensor *sup = upload(NULL, H * 4);
+    ds4_gpu_tensor *smid = upload(NULL, H * 4);
+    ds4_gpu_tensor *sout = upload(NULL, D * 4);
+    CHECK(xt && it && wt && gate && up && mid && down && out &&
+          sgate && sup && smid && sout);
+    CHECK(ds4_gpu_set_model_map(model, bytes));
+
+    const size_t pair_bytes = (size_t)SEL * H * 4, out_bytes = D * 4;
+    const size_t sh_bytes = H * 4;
+    /* Two routed references: [0] with the pair-SwiGLU fusion on (modes 0-2),
+     * [1] with it off (modes 3-4).  The shared expert is the same chain in
+     * every mode, so one reference covers it. */
+    float *ref_gate[2], *ref_up[2], *ref_mid[2], *ref_out[2];
+    for (int i = 0; i < 2; i++) {
+        ref_gate[i] = malloc(pair_bytes); ref_up[i] = malloc(pair_bytes);
+        ref_mid[i] = malloc(pair_bytes); ref_out[i] = malloc(out_bytes);
+        CHECK(ref_gate[i] && ref_up[i] && ref_mid[i] && ref_out[i]);
+    }
+    float *ref_sgate = malloc(sh_bytes), *ref_sup = malloc(sh_bytes);
+    float *ref_smid = malloc(sh_bytes), *ref_sout = malloc(out_bytes);
+    CHECK(ref_sgate && ref_sup && ref_smid && ref_sout);
+
+    /* ds4_gpu_begin_commands only arms the section on pre-M5 Apple silicon (it
+     * needs the BF16 epilogue).  Elsewhere every mode runs the serial chain and
+     * the comparisons hold trivially; only the "the section really ran" checks
+     * are conditioned on the device. */
+    unsetenv("DS4_METAL_DISABLE_PRE_M5_V41_BF16_EPILOGUE");
+    const int section_dev = ds4_gpu_device_is_pre_m5_apple_silicon() != 0;
+    if (!section_dev)
+        fprintf(stderr, "V4.1 parallel FFN: section unavailable on this device "
+                        "(not pre-M5 Apple silicon)\n");
+    static const char *const mode_name[MODES] = {
+        "serial baseline",
+        "section, resource barriers",
+        "section, scope barriers",
+        "serial baseline, fusion off",
+        "section armed, fusion off (not admitted)"};
+    /* mode:                         0      1      2      3      4   */
+    static const int mode_section[MODES] = {0,     1,     1,     0,     1};
+    static const int mode_nofuse[MODES]  = {0,     0,     0,     1,     1};
+    static const int mode_ref[MODES]     = {0,     0,     0,     1,     1};
+    int ok = 1;
+    for (int mode = 0; mode < MODES && ok; mode++) {
+        unsetenv("DS4_METAL_V41_PARALLEL_FFN_SCOPE_BARRIER");
+        unsetenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION");
+        if (mode == 2) setenv("DS4_METAL_V41_PARALLEL_FFN_SCOPE_BARRIER", "1", 1);
+        if (mode_nofuse[mode]) setenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION", "1", 1);
+        CHECK(ds4_gpu_tensor_fill_f32(gate, NAN, (uint64_t)SEL * H) &&
+              ds4_gpu_tensor_fill_f32(up, NAN, (uint64_t)SEL * H) &&
+              ds4_gpu_tensor_fill_f32(mid, NAN, (uint64_t)SEL * H) &&
+              ds4_gpu_tensor_fill_f32(out, NAN, D) &&
+              ds4_gpu_tensor_fill_f32(sgate, NAN, H) &&
+              ds4_gpu_tensor_fill_f32(sup, NAN, H) &&
+              ds4_gpu_tensor_fill_f32(smid, NAN, H) &&
+              ds4_gpu_tensor_fill_f32(sout, NAN, D));
+
+        const uint32_t armed_before_id =
+            ds4_gpu_test_v41_parallel_ffn_armed_count(DS4_GPU_V41_PAR_ROUTE_ID);
+        const uint32_t armed_before_slots =
+            ds4_gpu_test_v41_parallel_ffn_armed_count(DS4_GPU_V41_PAR_ROUTE_SLOTS);
+        CHECK(ds4_gpu_begin_commands());
+        int par = 0;
+        if (mode_section[mode]) {
+            par = ds4_gpu_dsv41_parallel_ffn_start(sgate, sup, smid, sout,
+                                                   model, bytes,
+                                                   shexp_gate_off, shexp_up_off,
+                                                   shexp_down_off, D, H, xt, 7.0f);
+            if (par != section_dev)
+                fprintf(stderr, "V4.1 parallel FFN %s mode=%d: start returned %d, expected %d\n",
+                        route_name, mode, par, section_dev);
+            CHECK(par == section_dev);
+        }
+        if (!par) {
+            /* Exactly what ds41_moe_partial encodes without the section. */
+            CHECK(ds4_gpu_matmul_q8_0_tensor_bf16(sgate, model, bytes, shexp_gate_off,
+                                                  D, H, xt, 1));
+            CHECK(ds4_gpu_matmul_q8_0_tensor_bf16(sup, model, bytes, shexp_up_off,
+                                                  D, H, xt, 1));
+            CHECK(ds4_gpu_swiglu_bf16_tensor(smid, sgate, sup, H, 7.0f, 1.0f));
+            CHECK(ds4_gpu_matmul_q8_0_tensor_bf16(sout, model, bytes, shexp_down_off,
+                                                  H, D, smid, 1));
+        }
+        /* The selected-slots route reads the expert ids on the host.  Without
+         * an override that is a command-buffer boundary plus a readback in the
+         * middle of the routed call, which would drop the planned section (by
+         * design: end_commands calls ds4_gpu_parallel_ffn_reset_state, which
+         * clears g_v41_par) and prove nothing.
+         *
+         * This IS a test shortcut, and it is the second of the two reasons the
+         * slots arm point cannot be reached by the V4.1 decode (the first is
+         * force_resident; see check_v41_parallel_ffn_route's header).  The
+         * only non-test callers of ds4_gpu_routed_moe_set_selected_override
+         * are V4/GLM graph paths in ds4.c -- metal_graph_decode_set_hash_selected_override,
+         * metal_graph_decode_cpu_router, metal_graph_decode_selected_readahead_override,
+         * metal_graph_selected_async_load_finish and
+         * metal_graph_encode_decode_layer_phase -- and none of them plans a
+         * section; ds41_moe_partial, which does, selects on the GPU via
+         * ds4_gpu_router_select_tensor and never sets the override.  So what
+         * this mode validates is the section's encode schedule on the slots
+         * encoders, not a configuration any shipping path produces. */
+        if (slots)
+            CHECK(ds4_gpu_routed_moe_set_selected_override(ids, SEL));
+        CHECK(ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, down, model, bytes,
+                                            0, tensor, 2 * tensor,
+                                            Q4_K_TYPE, Q4_K_TYPE,
+                                            expert, row, expert, down_row,
+                                            D, H, D, it, wt, E, SEL, 7.0f, xt,
+                                            NULL, 0, !slots));
+        int joined = 0;
+        if (par) {
+            joined = ds4_gpu_dsv41_parallel_ffn_finish();
+            if (!joined) {
+                /* The section encoded nothing (or what it encoded is fenced):
+                 * the caller's whole serial chain, exactly as ds41_moe_partial
+                 * runs it. */
+                CHECK(ds4_gpu_matmul_q8_0_tensor_bf16(sgate, model, bytes, shexp_gate_off,
+                                                      D, H, xt, 1));
+                CHECK(ds4_gpu_matmul_q8_0_tensor_bf16(sup, model, bytes, shexp_up_off,
+                                                      D, H, xt, 1));
+                CHECK(ds4_gpu_swiglu_bf16_tensor(smid, sgate, sup, H, 7.0f, 1.0f));
+                CHECK(ds4_gpu_matmul_q8_0_tensor_bf16(sout, model, bytes, shexp_down_off,
+                                                      H, D, smid, 1));
+            }
+        }
+        CHECK(ds4_gpu_end_commands());
+
+        const int want_joined = (mode == 1 || mode == 2) && section_dev;
+        if (joined != want_joined)
+            fprintf(stderr, "V4.1 parallel FFN %s mode=%d (%s): joined=%d expected=%d\n",
+                    route_name, mode, mode_name[mode], joined, want_joined);
+        CHECK(joined == want_joined);
+        const uint32_t armed_id =
+            ds4_gpu_test_v41_parallel_ffn_armed_count(DS4_GPU_V41_PAR_ROUTE_ID) -
+            armed_before_id;
+        const uint32_t armed_slots =
+            ds4_gpu_test_v41_parallel_ffn_armed_count(DS4_GPU_V41_PAR_ROUTE_SLOTS) -
+            armed_before_slots;
+        const uint32_t armed = slots ? armed_slots : armed_id;
+        const uint32_t armed_other = slots ? armed_id : armed_slots;
+
+        if (mode == 0 || mode == 3) {
+            const int ri = mode_ref[mode];
+            memcpy(ref_gate[ri], ds4_gpu_tensor_contents(gate), pair_bytes);
+            memcpy(ref_up[ri], ds4_gpu_tensor_contents(up), pair_bytes);
+            memcpy(ref_mid[ri], ds4_gpu_tensor_contents(mid), pair_bytes);
+            memcpy(ref_out[ri], ds4_gpu_tensor_contents(out), out_bytes);
+            /* The baseline must not be all-NaN: prove the kernels really ran. */
+            CHECK(ref_out[ri][0] == ref_out[ri][0] &&
+                  ref_mid[ri][0] == ref_mid[ri][0]);
+        }
+        if (mode == 0) {
+            memcpy(ref_sgate, ds4_gpu_tensor_contents(sgate), sh_bytes);
+            memcpy(ref_sup, ds4_gpu_tensor_contents(sup), sh_bytes);
+            memcpy(ref_smid, ds4_gpu_tensor_contents(smid), sh_bytes);
+            memcpy(ref_sout, ds4_gpu_tensor_contents(sout), out_bytes);
+            CHECK(ref_sout[0] == ref_sout[0] && ref_smid[0] == ref_smid[0]);
+        } else {
+            if (memcmp(ds4_gpu_tensor_contents(sgate), ref_sgate, sh_bytes) ||
+                memcmp(ds4_gpu_tensor_contents(sup), ref_sup, sh_bytes) ||
+                memcmp(ds4_gpu_tensor_contents(smid), ref_smid, sh_bytes) ||
+                memcmp(ds4_gpu_tensor_contents(sout), ref_sout, out_bytes)) {
+                fprintf(stderr, "V4.1 parallel FFN %s mode=%d (%s): shared-expert mismatch\n",
+                        route_name, mode, mode_name[mode]);
+                ok = 0;
+            }
+            const int ri = mode_ref[mode];
+            if (ok && mode != 3 &&
+                (memcmp(ds4_gpu_tensor_contents(gate), ref_gate[ri], pair_bytes) ||
+                 memcmp(ds4_gpu_tensor_contents(up), ref_up[ri], pair_bytes) ||
+                 memcmp(ds4_gpu_tensor_contents(mid), ref_mid[ri], pair_bytes) ||
+                 memcmp(ds4_gpu_tensor_contents(out), ref_out[ri], out_bytes))) {
+                fprintf(stderr, "V4.1 parallel FFN %s mode=%d (%s): routed mismatch "
+                                "vs reference %d\n",
+                        route_name, mode, mode_name[mode], ri);
+                ok = 0;
+            }
+        }
+        /* The concurrent encoder must be opened for the admitted route and for
+         * nothing else: mode 4 arms the section on a route that encodes a gate
+         * matvec, an up matvec and a dependent activation dispatch with no
+         * barrier between them, so a single concurrent encoder there is the
+         * bug -- checked after the memcmps so a regression reports both the
+         * structural cause and the corrupted output.  armed_other also pins
+         * the route: the section must have opened its encoder inside the
+         * branch under test and not the other one. */
+        if (armed != (uint32_t)want_joined || armed_other != 0) {
+            fprintf(stderr, "V4.1 parallel FFN %s mode=%d (%s): concurrent encoders "
+                            "opened id=%u slots6=%u, expected %s=%d and the other 0\n",
+                    route_name, mode, mode_name[mode], armed_id, armed_slots,
+                    route_name, want_joined);
+            ok = 0;
+        }
+        if (ok)
+            fprintf(stderr, "V4.1 parallel FFN %-6s %-40s joined=%d armed=%u: bit-identical\n",
+                    route_name, mode_name[mode], joined, armed);
+    }
+    unsetenv("DS4_METAL_V41_PARALLEL_FFN_SCOPE_BARRIER");
+    unsetenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION");
+    unsetenv("DS4_METAL_ENABLE_Q4_SELECTED_EXPERT_VIEWS");
+    unsetenv("DS4_METAL_TEST_Q4_SELECTED_MIN_TENSOR_MB");
+
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
+    ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(sgate); ds4_gpu_tensor_free(sup);
+    ds4_gpu_tensor_free(smid); ds4_gpu_tensor_free(sout);
+    /* Release Metal before the mapped block: the model bytes are wrapped by
+     * cached no-copy buffer views (and a residency set) that only go away in
+     * cleanup.  ds4_gpu_cleanup is idempotent, so main()'s call is a no-op. */
+    ds4_gpu_cleanup();
+    for (int i = 0; i < 2; i++) {
+        free(ref_gate[i]); free(ref_up[i]); free(ref_mid[i]); free(ref_out[i]);
+    }
+    free(ref_sgate); free(ref_sup); free(ref_smid); free(ref_sout);
+    free(xh); free(model);
+    CHECK(ok);
+    fprintf(stderr, "PRE_M5 V4.1 concurrent MoE section (%s route), 5 modes, "
+                    "bit-identical: PASS\n", route_name);
+    return 1;
+}
+
+static int check_v41_parallel_ffn(void) {
+    return check_v41_parallel_ffn_route(DS4_GPU_V41_PAR_ROUTE_ID);
+}
+
+static int check_v41_parallel_ffn_slots(void) {
+    return check_v41_parallel_ffn_route(DS4_GPU_V41_PAR_ROUTE_SLOTS);
+}
 #endif
 
 int main(int argc, char **argv) {
 #ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--fused-bf16")) {
         const int ok = ds4_gpu_init() && check_fused_bf16();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--v41-parallel-ffn")) {
+        const int ok = ds4_gpu_init() && check_v41_parallel_ffn();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--v41-parallel-ffn-slots")) {
+        const int ok = ds4_gpu_init() && check_v41_parallel_ffn_slots();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
