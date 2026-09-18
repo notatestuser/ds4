@@ -3591,10 +3591,169 @@ static int check_dspark_dump_layout(void) {
     return 1;
 }
 
+/*
+ * 3.7 stage 5: the verify loop's bookkeeping, with no model and no device.
+ *
+ * Everything the loop can get wrong that is NOT a GPU question lives in a
+ * handful of pure helpers in ds4.c, and this is their oracle:
+ *
+ *   ds4_v41_spec_carry_slot / ds4_v41_spec_restore_slot -- the compressor
+ *     pair-carry chain.  ds4_v41_spec_rewind_selftest() simulates the pool2
+ *     write-at-even / read-at-odd rule over every block width up to eight
+ *     rows, both starting parities and every committed prefix, against a
+ *     serial simulation of the same rows.  An off-by-one, a slot table too
+ *     small, or a restore that picks the wrong prefix fails there instead of
+ *     as a token divergence hundreds of tokens into a model run -- which is
+ *     the only other place it would show, because a wrong pair carry changes
+ *     one compressed key and the indexer hides it until it does not.
+ *   ds4_v41_spec_history_tail -- the Engram tail re-derivation, against
+ *     ds4_engram_hash itself over a synthetic layout.
+ *   ds4_v41_spec_window_slot / ds4_v41_spec_window_range -- the raw-KV ring
+ *     slot each block row writes and the range the save and the commit copy.
+ *     The oracle runs the whole cycle over a 128-slot shadow ring: it saves
+ *     through the two helpers, writes every proposed row at pos % 128
+ *     (ds41_quantize_kv_store's rule, restated independently), restores
+ *     through the helpers again and compares the ring against a serial
+ *     simulation of the committed prefix.  Restoring one row too many undoes
+ *     a committed key; one too few leaves a future key where a 128-old one
+ *     belongs, which is the failure a 128-token run cannot see at all -- and
+ *     because the ring is written by the store's rule rather than read back
+ *     out of window_slot, a wrong slot map fails here too.
+ *   ds4_v41_spec_draft_len -- the confidence prefix and the k ceiling.
+ *
+ * And the switches: ds4_v41_dspark_verify_gates() is the only way anything
+ * outside ds4.c can observe them, and it is a separate word from stage 4's so
+ * that adding a stage-5 switch cannot silently move a stage-4 assertion.
+ */
+#define DSPARK_VERIFY_DEFAULT_GATES (1 | 2 | 4 | 8 | (3 << 4))
+
+static const char *const dspark_verify_env_names[] = {
+    "DS4_DISABLE_V41_DSPARK_VERIFY", "DS4_DISABLE_V41_DSPARK_VERIFY_BATCH",
+    "DS4_DISABLE_V41_DSPARK_PREFILL_SEED", "DS4_V41_DSPARK_VERIFY_BATCH_HEAD",
+    "DS4_V41_DSPARK_MAX_DRAFTS"};
+#define DSPARK_VERIFY_ENV_COUNT \
+    (sizeof(dspark_verify_env_names) / sizeof(*dspark_verify_env_names))
+
+/* ds41_dspark_env_u32()'s rule, restated here so the expectation is derived
+ * from the environment rather than copied from the implementation: absent,
+ * empty, trailing junk or out of range all mean the default -- a typo must not
+ * silently turn the block into "propose nothing". */
+static uint32_t dspark_verify_env_u32(const char *name, uint32_t fallback) {
+    const char *value = getenv(name);
+    char *end = NULL;
+    unsigned long parsed;
+    if (!value || !*value) return fallback;
+    parsed = strtoul(value, &end, 10);
+    if (!end || *end || parsed > UINT32_MAX) return fallback;
+    return (uint32_t)parsed;
+}
+
+/* The switch state ds4.c must report for the environment as it stands now.
+ * `--dspark-verify-env` is how run-3_7s5.sh proves that exporting a switch
+ * actually reaches ds4.c: the gate table below normalises the environment, so
+ * without this mode every variant of that loop would run byte-identically. */
+static int check_dspark_verify_env(void) {
+    const int want =
+        (getenv("DS4_DISABLE_V41_DSPARK_VERIFY") ? 0 : 1) |
+        (getenv("DS4_DISABLE_V41_DSPARK_VERIFY_BATCH") ? 0 : 2) |
+        (getenv("DS4_DISABLE_V41_DSPARK_PREFILL_SEED") ? 0 : 4) |
+        (getenv("DS4_V41_DSPARK_VERIFY_BATCH_HEAD") ? 0 : 8) |
+        (int)(dspark_verify_env_u32("DS4_V41_DSPARK_MAX_DRAFTS", 3u) << 4);
+    const int got = ds4_v41_dspark_verify_gates();
+    if (got != want)
+        fprintf(stderr, "dspark verify gates 0x%x, the environment says 0x%x\n",
+                got, want);
+    CHECK(got == want);
+    printf("dspark verify gates follow the environment (0x%x)\n", want);
+    return 1;
+}
+
+/* The table itself, with the environment already normalised by its caller. */
+static int check_dspark_verify_gate_table(void) {
+    /* Defaults: verify on, the verify rows' attention-output batched, prefill
+     * seeding on, the head per-row (bit 3 set means EXACT), k = 3. */
+    CHECK(ds4_v41_dspark_verify_gates() == DSPARK_VERIFY_DEFAULT_GATES);
+    setenv("DS4_DISABLE_V41_DSPARK_VERIFY", "1", 1);
+    CHECK(ds4_v41_dspark_verify_gates() == (2 | 4 | 8 | (3 << 4)));
+    unsetenv("DS4_DISABLE_V41_DSPARK_VERIFY");
+    setenv("DS4_DISABLE_V41_DSPARK_VERIFY_BATCH", "1", 1);
+    CHECK(ds4_v41_dspark_verify_gates() == (1 | 4 | 8 | (3 << 4)));
+    unsetenv("DS4_DISABLE_V41_DSPARK_VERIFY_BATCH");
+    setenv("DS4_DISABLE_V41_DSPARK_PREFILL_SEED", "1", 1);
+    CHECK(ds4_v41_dspark_verify_gates() == (1 | 2 | 8 | (3 << 4)));
+    unsetenv("DS4_DISABLE_V41_DSPARK_PREFILL_SEED");
+    setenv("DS4_V41_DSPARK_VERIFY_BATCH_HEAD", "1", 1);
+    CHECK(ds4_v41_dspark_verify_gates() == (1 | 2 | 4 | (3 << 4)));
+    unsetenv("DS4_V41_DSPARK_VERIFY_BATCH_HEAD");
+    setenv("DS4_V41_DSPARK_MAX_DRAFTS", "5", 1);
+    CHECK(ds4_v41_dspark_verify_gates() == (1 | 2 | 4 | 8 | (5 << 4)));
+    /* A value that is not a number is the default, not zero. */
+    setenv("DS4_V41_DSPARK_MAX_DRAFTS", "three", 1);
+    CHECK(ds4_v41_dspark_verify_gates() == DSPARK_VERIFY_DEFAULT_GATES);
+    unsetenv("DS4_V41_DSPARK_MAX_DRAFTS");
+    CHECK(ds4_v41_dspark_verify_gates() == DSPARK_VERIFY_DEFAULT_GATES);
+
+    /* The carry chain, the Engram tail and the proposal length. */
+    CHECK(ds4_v41_spec_rewind_selftest());
+
+    /* And the two slot helpers directly, so a failure inside the selftest is
+     * not the only evidence about which of them moved. */
+    CHECK(ds4_v41_spec_carry_slot(0, 0) == 0);
+    CHECK(ds4_v41_spec_carry_slot(0, 1) == 0);
+    CHECK(ds4_v41_spec_carry_slot(0, 2) == 1);
+    CHECK(ds4_v41_spec_carry_slot(0, 7) == 3);
+    CHECK(ds4_v41_spec_carry_slot(1, 0) == UINT32_MAX);
+    CHECK(ds4_v41_spec_carry_slot(1, 1) == 0);
+    CHECK(ds4_v41_spec_carry_slot(1, 2) == 0);
+    CHECK(ds4_v41_spec_carry_slot(1, 7) == 3);
+    CHECK(ds4_v41_spec_restore_slot(0, 0) == UINT32_MAX);
+    CHECK(ds4_v41_spec_restore_slot(1, 1) == UINT32_MAX);
+    CHECK(ds4_v41_spec_restore_slot(1, 2) == 0);
+    CHECK(ds4_v41_spec_restore_slot(0, 3) == 1);
+    CHECK(ds4_v41_spec_window_slot(127, 0) == 127);
+    CHECK(ds4_v41_spec_window_slot(127, 1) == 0);
+    CHECK(ds4_v41_spec_window_slot(255, 3) == 2);
+    /* And the range the two window passes copy.  The save's own start is the
+     * one thing the shadow-ring cycle cannot observe -- row 0 always commits,
+     * so its saved copy is never read back -- so it is pinned here. */
+    {
+        uint32_t first = UINT32_MAX;
+        CHECK(ds4_v41_spec_window_range(1, 0u, 8u, &first) && first == 0u);
+        CHECK(ds4_v41_spec_window_range(0, 1u, 8u, &first) && first == 1u);
+        CHECK(ds4_v41_spec_window_range(0, 7u, 8u, &first) && first == 7u);
+        /* a fully accepted block restores nothing */
+        CHECK(!ds4_v41_spec_window_range(0, 8u, 8u, &first));
+    }
+    printf("dspark verify bookkeeping OK\n");
+    return 1;
+}
+
+/* The table needs a known environment; the caller's is given back, so a
+ * --dspark-verify run inside the battery cannot change what a later
+ * --dspark-verify-env run observes. */
+static int check_dspark_verify(void) {
+    char *saved[DSPARK_VERIFY_ENV_COUNT];
+    int rc;
+    for (unsigned i = 0; i < DSPARK_VERIFY_ENV_COUNT; i++) {
+        const char *value = getenv(dspark_verify_env_names[i]);
+        saved[i] = value ? strdup(value) : NULL;
+        unsetenv(dspark_verify_env_names[i]);
+    }
+    rc = check_dspark_verify_gate_table();
+    for (unsigned i = 0; i < DSPARK_VERIFY_ENV_COUNT; i++) {
+        if (saved[i]) setenv(dspark_verify_env_names[i], saved[i], 1);
+        else unsetenv(dspark_verify_env_names[i]);
+        free(saved[i]);
+    }
+    return rc;
+}
+
+
 static int check_dspark_draft(void) {
     enum { HEADS = 64, DIM = 512, DRAFT = 5, WINDOW = 128, CAP = WINDOW + DRAFT };
     enum { EXPERTS = 128, USED = 3, N_WIN = 37 };
     CHECK(check_dspark_gates());
+    CHECK(check_dspark_verify());
     CHECK(check_dspark_dump_layout());
     CHECK(check_dspark_hc());
     /* 0. The capture, driven directly inside ds4.c over a synthetic residual
@@ -3926,6 +4085,14 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    /* 3.7 stage 5: pure host arithmetic, so both need no device at all --
+     * which is also why neither is worth running under MTL_SHADER_VALIDATION.
+     * --dspark-verify normalises the four switches and checks the whole gate
+     * table; --dspark-verify-env leaves them alone and checks that ds4.c reads
+     * the ones the caller exported. */
+    if (argc == 2 && !strcmp(argv[1], "--dspark-verify")) return check_dspark_verify() ? 0 : 1;
+    if (argc == 2 && !strcmp(argv[1], "--dspark-verify-env"))
+        return check_dspark_verify_env() ? 0 : 1;
 #endif
     if (argc != 1) return 2;
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&

@@ -40300,6 +40300,23 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
  */
 #define DS41_DSPARK_WINDOW 128u
 
+/* 3.7 stage 5.  The ratio-2 compressor keeps one half-finished pair per owner
+ * in previous_kv/previous_score, and it is the ONLY V4.1 decode state that a
+ * rejected speculative row overwrites rather than appends to (spec 1.7).  A
+ * block of N verify rows at consecutive positions touches it in a strict
+ * chain -- an even position writes it, the odd position after it reads it --
+ * so N rows need ceil(N/2) carry buffers, and each committed prefix ends on
+ * one of them.  This is the V4.1 analogue of V4's DS4_SPEC_PREFIX_SLOTS, two
+ * orders of magnitude smaller because V4.1 has no per-layer attention state
+ * to snapshot. */
+#define DS41_SPEC_CARRY_SLOTS ((DS4_TP_BATCH_MAX_ROWS + 1u) / 2u)
+#define DS41_SPEC_CARRY_OWNERS 4u
+#define DS41_SPEC_CARRY_WIDTH 512u
+/* One raw-KV row of g->window[il]: ds41_quantize_kv_store writes
+ * (pos % 128) * 512 * 4, and ds41_state_spans measures the same row. */
+#define DS41_SPEC_RAW_WIDTH 512u
+#define DS41_SPEC_RAW_SLOTS 128u
+
 typedef struct ds41_dspark {
     uint32_t stages, block_size, rows;
     uint32_t markov_rank, noise_token_id;
@@ -40355,7 +40372,54 @@ typedef struct ds41_dspark {
     ds4_gpu_tensor *row_low[DS4_DSPARK_MAX_BLOCK_SIZE];
     ds4_gpu_tensor *row_logits[DS4_DSPARK_MAX_BLOCK_SIZE];
     ds4_gpu_tensor *row_embed[DS4_DSPARK_MAX_BLOCK_SIZE];
+    /* 3.7 stage 5: the prefill seed ring.  seed_layer[i] holds the HC mean of
+     * the target residual at target_layers[i] for window positions
+     * [seed_base, seed_base + seed_win), and seed_from[i] is the lowest index
+     * this prompt actually captured for that layer (a decoder-suffix prefill
+     * does not run every late layer over every row, so the layers can differ;
+     * the seed uses their intersection). */
+    uint32_t seed_win, seed_base, seed_from[DS4_DSPARK_MAX_TARGET_LAYERS];
+    uint32_t seeded_rows;
+    double seed_ms;
+    ds4_gpu_tensor *seed_hidden;
+    ds4_gpu_tensor *seed_layer[DS4_DSPARK_MAX_TARGET_LAYERS];
+    ds4_gpu_tensor *seed_concat, *seed_main_x, *seed_kv, *seed_weights;
+    /* 3.7 stage 5: the verify block.  verify_layer[i] is the same capture for
+     * the block's rows, so the committed row's hidden becomes the next
+     * proposal's input without a second target step; verify_logits carries
+     * every row's head output back in one read. */
+    /* The frontier the current proposal belongs to: g->pos at the moment the
+     * draft was made, i.e. the token count the next cycle must start from.
+     * Without it a proposal could survive an ordinary ds4_session_eval, a new
+     * prompt or a session rewind and be verified against the wrong position --
+     * still not a wrong token (the target verifies every one of them) but a
+     * wasted block every cycle, invisible except as lost acceptance. */
+    uint32_t draft_pos;
+    uint32_t verify_calls, verify_rows;
+    double verify_ms, verify_last_ms;
+    ds4_gpu_tensor *verify_hidden;
+    ds4_gpu_tensor *verify_layer[DS4_DSPARK_MAX_TARGET_LAYERS];
+    ds4_gpu_tensor *verify_weights, *verify_logits;
+    /* DS4_N_LAYER * rows raw-KV rows: the window slots the block is about to
+     * overwrite, so a rejected row can give them back (see
+     * ds41_spec_window_copy). */
+    ds4_gpu_tensor *window_save;
+    ds4_gpu_tensor *carry_kv[DS41_SPEC_CARRY_OWNERS][DS41_SPEC_CARRY_SLOTS];
+    ds4_gpu_tensor *carry_score[DS41_SPEC_CARRY_OWNERS][DS41_SPEC_CARRY_SLOTS];
+    float *host_verify_logits;
 } ds41_dspark;
+
+/* 3.7 stage 5: what ds41_graph_step_batch() needs to know to run a block of
+ * speculative verify rows instead of a mixed session batch.  NULL everywhere
+ * else, and every field it carries is read only under that NULL test, so the
+ * batched decode step is unchanged for every existing caller. */
+typedef struct ds41_spec_verify {
+    ds4_gpu_tensor *logits;       /* rows * DS4_N_VOCAB, one row per verify row */
+    ds4_gpu_tensor *carry_kv[DS41_SPEC_CARRY_OWNERS][DS41_SPEC_CARRY_SLOTS];
+    ds4_gpu_tensor *carry_score[DS41_SPEC_CARRY_OWNERS][DS41_SPEC_CARRY_SLOTS];
+    ds41_dspark *capture;         /* per-row target hidden for the next proposal */
+    uint32_t first_pos;
+} ds41_spec_verify;
 
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
@@ -40460,6 +40524,25 @@ static void ds41_dspark_free(ds41_dspark *d) {
     ds4_gpu_tensor_free(d->in_hc);
     ds4_gpu_tensor_free(d->main_kv);
     ds4_gpu_tensor_free(d->main_x);
+    for (uint32_t i = 0; i < DS4_DSPARK_MAX_TARGET_LAYERS; i++) {
+        ds4_gpu_tensor_free(d->verify_layer[i]);
+        ds4_gpu_tensor_free(d->seed_layer[i]);
+    }
+    for (uint32_t o = 0; o < DS41_SPEC_CARRY_OWNERS; o++)
+        for (uint32_t k = 0; k < DS41_SPEC_CARRY_SLOTS; k++) {
+            ds4_gpu_tensor_free(d->carry_score[o][k]);
+            ds4_gpu_tensor_free(d->carry_kv[o][k]);
+        }
+    free(d->host_verify_logits);
+    ds4_gpu_tensor_free(d->window_save);
+    ds4_gpu_tensor_free(d->verify_logits);
+    ds4_gpu_tensor_free(d->verify_weights);
+    ds4_gpu_tensor_free(d->verify_hidden);
+    ds4_gpu_tensor_free(d->seed_weights);
+    ds4_gpu_tensor_free(d->seed_kv);
+    ds4_gpu_tensor_free(d->seed_main_x);
+    ds4_gpu_tensor_free(d->seed_concat);
+    ds4_gpu_tensor_free(d->seed_hidden);
     ds4_gpu_tensor_free(d->identity_pre);
     ds4_gpu_tensor_free(d->target_hidden);
     ds4_gpu_tensor_free(d->hc_mean);
@@ -40575,6 +40658,23 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
     ds4_engram_history_reset(&g->history);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
      * partial pair is overwritten by its even-position token before use. */
+    /* 3.7 stage 5: the draft's private windows are the exception -- their live
+     * length is d->seeded, which is derived from nothing, and their rows carry
+     * the PREVIOUS conversation's RoPE positions.  A prompt that never reaches
+     * ds41_graph_prefill_sweep (ds41_graph_short_prefill, a single
+     * ds41_graph_step, a failed seed, DS4_DISABLE_V41_DSPARK_PREFILL_SEED)
+     * would otherwise leave the old keys live and let the draft attend to
+     * them.  Zeroing the storage is unnecessary once seeded is 0: the window
+     * then admits only the row the next call writes.  Acceptance, not
+     * correctness -- the target verifies every proposal -- but the whole point
+     * of the seeding is that this window matches the target's own tail. */
+    if (g->dspark) {
+        g->dspark->seeded = 0;
+        g->dspark->seeded_rows = 0;
+        g->dspark->seed_win = 0;
+        g->dspark->capture_mask = 0;
+        g->dspark->capture_valid = false;
+    }
 }
 
 static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model *m,
@@ -40754,6 +40854,333 @@ int ds4_v41_dspark_draft_gates(void) {
            (int)(ds41_dspark_dump_limit() << 4);
 }
 
+/* =========================================================================
+ * 3.7 stage 5 switches and the pure arithmetic of the rewind.
+ * =========================================================================
+ * Same discipline as stage 4: each DS4_*_V41_DSPARK_VERIFY* name is spelled
+ * EXACTLY ONCE in ds4.c, in one of the four helpers below, and
+ * ds4_v41_dspark_verify_gates() is how the model-free battery sees them.
+ */
+static bool ds41_dspark_verify_enabled(void) {
+    return getenv("DS4_DISABLE_V41_DSPARK_VERIFY") == NULL;
+}
+
+/* The verify rows share a session, which every 3.6 gate refuses outright
+ * (prefill_rows != 0).  For two of the three stages that refusal is
+ * load-bearing and the block keeps the per-row path:
+ *
+ *   3.6a (batched RoPE / quantize / window store / publish) -- rows at
+ *     consecutive positions read and write previous_kv/previous_score in
+ *     order, a serial chain a rows kernel cannot express.
+ *   3.6c (one N-row flash dispatch) -- it needs EVERY row's front, window
+ *     store included, to run before ANY row's attention.  Once the window has
+ *     wrapped (pos + 1 >= 128) a row's key range is n_raw = 128 starting at
+ *     (pos + 1 - 128) % 128, i.e. the whole ring, so the slot row i+1 has just
+ *     written, (pos_i + 1) % 128, IS the slot row i must read as its oldest
+ *     position.  Row i would attend to a future key in place of a past one,
+ *     its argmax could move, and an accepted draft would then differ from
+ *     serial decode -- the one thing this stage may not do.  The per-row loop
+ *     is correct precisely because row i's flash runs before row i+1's front,
+ *     and no descriptor repairs it: shortening n_raw changes the key set
+ *     rather than restoring it.
+ *
+ * 3.6d, the batched attention-OUTPUT projection, is different: it runs after
+ * every row's flash tail, reads each row's own slice of the shared heads slab
+ * and touches no session cache at all, so its prefill_rows exclusion is
+ * conservative rather than necessary.  The verify block opts back into that
+ * one.  Rollback returns the verify rows -- and only those -- to the fully
+ * per-row attention. */
+static bool ds41_dspark_verify_batch_enabled(void) {
+    return getenv("DS4_DISABLE_V41_DSPARK_VERIFY_BATCH") == NULL;
+}
+
+/* How many of the block's proposals to verify.  The confidence rule of spec
+ * 1.6.1 trims first; this is the ceiling the plan's k sweep moves. */
+static uint32_t ds41_dspark_max_drafts(void) {
+    return ds41_dspark_env_u32("DS4_V41_DSPARK_MAX_DRAFTS", 3u);
+}
+
+static bool ds41_dspark_seed_enabled(void) {
+    return getenv("DS4_DISABLE_V41_DSPARK_PREFILL_SEED") == NULL;
+}
+
+/*
+ * The verify rows' HEAD, and why it is not batched.
+ *
+ * A verify row's logits do two things that serial decode's logits do: they
+ * decide whether the proposal at that position is accepted, and the committed
+ * row's become the session's logits, from which the caller picks the next
+ * token.  Both are argmax decisions, so the row's logits have to be the ones
+ * serial decode would have produced -- not merely close to them.
+ *
+ * A batched head is not.  ds41_matmul_batch_q8_row_exact() deliberately
+ * REFUSES the vocabulary head (`outputs != DS4_N_VOCAB`), so `rows` rows of it
+ * fall through to metal_graph_matmul_plain_tensor() ->
+ * kernel_mul_mv_ext_q8_0_f32_r1_N, whose lane partition (nxpsg 16 at two rows,
+ * 8 at three or more) and reduction tree differ from the n_tok == 1 dispatch
+ * serial decode takes.  That is the same reordering 3.6d's first revision
+ * shipped and had to withdraw because it flipped tokens, and it is why V4's
+ * own DSpark banner warns that "output may differ from one-token decode due to
+ * batched floating-point operation order".  Measured on this tree, batched
+ * decode against sequential decode is 78-83 % of logits differing by up to
+ * 1.1e-5 -- token-agreeing with a wide margin, but not bit-identical, and this
+ * stage's gate is identity, not agreement.
+ *
+ * So the verify block projects its head ONE ROW AT A TIME, into that row's
+ * slice of the block's logits slab: the same kernel, the same lane map and the
+ * same reduction order as the single-token path, at ~1 ms a row against a
+ * ~100 ms cycle.  This switch puts the batched head back for measuring what
+ * that costs.  It is a diagnostic, NOT a rollback: with it set the emitted
+ * stream is no longer guaranteed to equal serial greedy decode.
+ */
+static bool ds41_dspark_verify_batch_head_enabled(void) {
+    return getenv("DS4_V41_DSPARK_VERIFY_BATCH_HEAD") != NULL;
+}
+
+/* Stage 4's oracle keeps its exact encoding; this is a separate word so the
+ * battery's stage-4 assertions cannot drift when a stage-5 switch is added.
+ * Bit 3 is set when the head is the EXACT per-row one, i.e. by default. */
+int ds4_v41_dspark_verify_gates(void) {
+    return (ds41_dspark_verify_enabled() ? 1 : 0) |
+           (ds41_dspark_verify_batch_enabled() ? 2 : 0) |
+           (ds41_dspark_seed_enabled() ? 4 : 0) |
+           (ds41_dspark_verify_batch_head_enabled() ? 0 : 8) |
+           (int)(ds41_dspark_max_drafts() << 4);
+}
+
+/*
+ * The carry chain.  Row `row` of a verify block whose first row sits at
+ * `first_pos` is at position first_pos + row.  kernel_dsv41_pool2 (and its
+ * rows twin) WRITES previous_kv/previous_score at an even position and READS
+ * them at an odd one, so consecutive rows pair up: the even row of a pair
+ * writes the slot, the odd row after it reads it.  Giving each pair its own
+ * slot means
+ *
+ *   - row i reads exactly what row i-1 wrote, i.e. the serial order;
+ *   - the session's own previous_kv is never written by the block, so the
+ *     frontier value survives a full rejection with no snapshot at all;
+ *   - committing c rows is one copy from the slot the last even-position row
+ *     below c wrote -- and when there is none (c == 1 with an odd first row)
+ *     the session buffer already holds the right value.
+ *
+ * UINT32_MAX means "this row uses the session's own buffer": only row 0 of a
+ * block that starts at an odd position, which reads the frontier value and
+ * writes nothing.
+ */
+/* The raw-KV window slot row `row` of a block starting at `first_pos` writes:
+ * ds41_quantize_kv_store's own pos % 128, in one place so the save/restore and
+ * its oracle cannot drift from the store. */
+uint32_t ds4_v41_spec_window_slot(uint32_t first_pos, uint32_t row) {
+    return (first_pos + row) % DS41_SPEC_RAW_SLOTS;
+}
+
+/* The block rows one window save/restore pass copies, as a pure function of
+ * the pass instead of a range spelled out at each call site: the save before
+ * the block covers every row, [0, rows), and a commit of `committed` rows
+ * copies back exactly the rejected tail, [committed, rows).  Zero means the
+ * pass is a no-op -- the only such case is a fully accepted block, which has
+ * nothing to undo.  ds41_spec_window_copy's two callers and the model-free
+ * oracle all take the range from here, so the range itself is under test
+ * rather than restated in three places. */
+int ds4_v41_spec_window_range(int save, uint32_t committed, uint32_t rows,
+                              uint32_t *first_row) {
+    const uint32_t start = save ? 0u : committed;
+    if (first_row) *first_row = start;
+    return start < rows;
+}
+
+uint32_t ds4_v41_spec_carry_slot(uint32_t first_pos, uint32_t row) {
+    if (!(first_pos & 1u)) return row / 2u;
+    return row == 0u ? UINT32_MAX : (row - 1u) / 2u;
+}
+
+/* The slot holding the pair state as of `committed` rows, or UINT32_MAX when
+ * the session buffer is already correct (nothing committed, or the only
+ * committed row was an odd-position reader). */
+uint32_t ds4_v41_spec_restore_slot(uint32_t first_pos, uint32_t committed) {
+    if (committed == 0u) return UINT32_MAX;
+    const uint32_t phase = first_pos & 1u;
+    uint32_t last = committed - 1u;
+    if ((last & 1u) != phase) {
+        if (last == 0u) return UINT32_MAX;
+        last--;
+    }
+    return ds4_v41_spec_carry_slot(first_pos, last);
+}
+
+/* The Engram hash state after `len` tokens: tail[i] is the compressed id of
+ * tokens[len-1-i], newest first, DEAD where the history is shorter than the
+ * n-gram.  Exactly what ds4_engram_hash leaves behind (ds4_engram.c:85-86)
+ * and what ds41_load_payload rebuilds from a checkpoint (ds4.c:62716), which
+ * is why a rewind can re-derive it instead of snapshotting it. */
+void ds4_v41_spec_history_tail(const uint32_t *token_map, const int *tokens,
+                               uint32_t len, int32_t *tail) {
+    for (uint32_t i = 0; i < (uint32_t)DS4_ENGRAM_NGRAM - 1u; i++)
+        tail[i] = DS4_ENGRAM_DEAD;
+    if (!token_map || !tokens) return;
+    for (uint32_t i = 0; i < (uint32_t)DS4_ENGRAM_NGRAM - 1u && i < len; i++)
+        tail[i] = (int32_t)token_map[tokens[len - 1u - i]];
+}
+
+/* The proposal length: the confidence prefix of spec 1.6.1, then the k the
+ * runner sweeps, then the batched step's row ceiling. */
+uint32_t ds4_v41_spec_draft_len(const float *confidence, uint32_t rows,
+                                float threshold, uint32_t cap) {
+    uint32_t len = dspark_confident_prefix_len(confidence, rows, threshold);
+    if (len > cap) len = cap;
+    if (len > (uint32_t)DS4_TP_BATCH_MAX_ROWS) len = (uint32_t)DS4_TP_BATCH_MAX_ROWS;
+    return len;
+}
+
+/*
+ * Model-free oracle for all of the above (tests/test_deepseek41_metal
+ * --dspark-verify).  It simulates the pool2 write/read rule over a block of
+ * rows with the carry slots the shipping code hands them, against a plain
+ * serial simulation of the same rows, for every block width, every starting
+ * parity and every committed prefix -- so an off-by-one in either helper, or
+ * a slot count too small for eight rows, fails here rather than as a token
+ * divergence 500 tokens into a model run.  Then it checks the Engram tail
+ * re-derivation against ds4_engram_hash itself over a synthetic layout, and
+ * the proposal-length rule.
+ */
+int ds4_v41_spec_rewind_selftest(void) {
+    /* (1) the carry chain. */
+    for (uint32_t first_pos = 0; first_pos < 4u; first_pos++) {
+        for (uint32_t rows = 2u; rows <= (uint32_t)DS4_TP_BATCH_MAX_ROWS; rows++) {
+            int slot_value[DS41_SPEC_CARRY_SLOTS];
+            int session = -1000;            /* the frontier value */
+            int serial[DS4_TP_BATCH_MAX_ROWS + 1];
+            for (uint32_t i = 0; i < DS41_SPEC_CARRY_SLOTS; i++) slot_value[i] = -1;
+            /* Serial reference: decode rows one at a time into one buffer. */
+            serial[0] = session;
+            for (uint32_t r = 0; r < rows; r++) {
+                const uint32_t pos = first_pos + r;
+                /* even pos writes the row's own projection, odd pos reads. */
+                serial[r + 1u] = (pos & 1u) ? serial[r] : (int)(100u + r);
+            }
+            /* The block, with the carry slots. */
+            for (uint32_t r = 0; r < rows; r++) {
+                const uint32_t pos = first_pos + r;
+                const uint32_t slot = ds4_v41_spec_carry_slot(first_pos, r);
+                if (slot != UINT32_MAX && slot >= DS41_SPEC_CARRY_SLOTS) return 0;
+                int *buffer = slot == UINT32_MAX ? &session : &slot_value[slot];
+                if (pos & 1u) {
+                    /* the read must see its predecessor's write */
+                    if (*buffer != serial[r]) return 0;
+                } else {
+                    *buffer = (int)(100u + r);
+                }
+            }
+            if (session != -1000) return 0;   /* the block never writes it */
+            for (uint32_t c = 1u; c <= rows; c++) {
+                const uint32_t slot = ds4_v41_spec_restore_slot(first_pos, c);
+                const int restored = slot == UINT32_MAX ? session : slot_value[slot];
+                if (restored != serial[c]) return 0;
+            }
+        }
+    }
+    /* (2) the Engram tail, against ds4_engram_hash. */
+    {
+        ds4_engram_layout layout;
+        uint32_t map[64];
+        int tokens[8] = {5, 9, 1, 63, 2, 2, 40, 7};
+        uint32_t rows_out[8 * DS4_ENGRAM_LAYERS * DS4_ENGRAM_COLS];
+        memset(&layout, 0, sizeof(layout));
+        for (uint32_t i = 0; i < 64u; i++) map[i] = (i * 7u + 3u) % 61u;
+        layout.token_map = map;
+        layout.vocab_size = 64u;
+        layout.compressed_vocab_size = 61u;
+        layout.pad_id = 60u;
+        for (uint32_t l = 0; l < DS4_ENGRAM_LAYERS; l++) {
+            layout.rows[l] = 4096u;
+            for (uint32_t j = 0; j < DS4_ENGRAM_NGRAM; j++)
+                layout.multipliers[l][j] = 0x9e3779b97f4a7c15ull + j + l;
+            for (uint32_t c = 0; c < DS4_ENGRAM_COLS; c++) layout.primes[l][c] = 97u + c;
+        }
+        for (uint32_t len = 1u; len <= 8u; len++) {
+            ds4_engram_history h;
+            int32_t tail[DS4_ENGRAM_NGRAM - 1];
+            ds4_engram_history_reset(&h);
+            if (!ds4_engram_hash(&layout, &h, tokens, NULL, len, rows_out)) return 0;
+            ds4_v41_spec_history_tail(map, tokens, len, tail);
+            for (uint32_t i = 0; i < (uint32_t)DS4_ENGRAM_NGRAM - 1u; i++)
+                if (tail[i] != h.tail[i]) return 0;
+        }
+    }
+    /* (3) the raw-KV window ring: a whole save / block / restore cycle over a
+     * 128-slot shadow ring, against a serial simulation of the rows the block
+     * actually committed.  A block of at most eight rows writes eight distinct
+     * slots, and the ring the commit leaves behind must equal the one serial
+     * greedy decode of the committed prefix would have left.
+     *
+     * The simulation writes slot pos % 128 itself -- ds41_quantize_kv_store's
+     * own rule, restated here and nowhere else -- while the save and the
+     * restore go through ds4_v41_spec_window_slot and the range
+     * ds4_v41_spec_window_range hands ds41_spec_window_copy.  So this kills a
+     * wrong slot map (the earlier form, which read the restore back out of the
+     * same helper that wrote it, could not) AND a restore one row too long or
+     * too short: too long undoes a committed key, too short leaves a future
+     * key where a 128-old one belongs, and that second one is the failure a
+     * 128-token run cannot see at all.  The save's own start is not
+     * observable here -- row 0 always commits, so its saved copy is never
+     * read back -- and is pinned by a direct assertion in the battery. */
+    for (uint32_t first_pos = 120u; first_pos < 136u; first_pos++) {
+        for (uint32_t rows = 2u; rows <= (uint32_t)DS4_TP_BATCH_MAX_ROWS; rows++) {
+            uint32_t slots[DS4_TP_BATCH_MAX_ROWS];
+            for (uint32_t i = 0; i < rows; i++) {
+                slots[i] = ds4_v41_spec_window_slot(first_pos, i);
+                if (slots[i] >= DS41_SPEC_RAW_SLOTS) return 0;
+                for (uint32_t j = 0; j < i; j++) if (slots[j] == slots[i]) return 0;
+            }
+            for (uint32_t c = 1u; c <= rows; c++) {
+                uint32_t ring[DS41_SPEC_RAW_SLOTS], serial[DS41_SPEC_RAW_SLOTS];
+                uint32_t keep[DS4_TP_BATCH_MAX_ROWS];
+                uint32_t first_row = 0u;
+                /* the live keys the ring holds before the block: every slot
+                 * is somebody's, which is exactly why a rejected row hurts. */
+                for (uint32_t s = 0; s < DS41_SPEC_RAW_SLOTS; s++)
+                    ring[s] = serial[s] = 1000u + s;
+                for (uint32_t i = 0; i < rows; i++) keep[i] = UINT32_MAX;
+                /* the save ds41_graph_spec_verify runs before the block */
+                if (!ds4_v41_spec_window_range(1, 0u, rows, &first_row) ||
+                    first_row >= rows) return 0;
+                for (uint32_t i = first_row; i < rows; i++)
+                    keep[i] = ring[ds4_v41_spec_window_slot(first_pos, i)];
+                /* the block: every proposed row stores at its own pos % 128 */
+                for (uint32_t i = 0; i < rows; i++)
+                    ring[(first_pos + i) % DS41_SPEC_RAW_SLOTS] = 2000u + i;
+                /* the restore ds41_graph_spec_commit runs for c committed */
+                if (ds4_v41_spec_window_range(0, c, rows, &first_row)) {
+                    if (first_row >= rows) return 0;
+                    for (uint32_t i = first_row; i < rows; i++) {
+                        if (keep[i] == UINT32_MAX) return 0;  /* never saved */
+                        ring[ds4_v41_spec_window_slot(first_pos, i)] = keep[i];
+                    }
+                } else if (c != rows) {
+                    return 0;      /* only a fully accepted block skips it */
+                }
+                /* serial greedy decode of the c positions that committed */
+                for (uint32_t i = 0; i < c; i++)
+                    serial[(first_pos + i) % DS41_SPEC_RAW_SLOTS] = 2000u + i;
+                for (uint32_t s = 0; s < DS41_SPEC_RAW_SLOTS; s++)
+                    if (ring[s] != serial[s]) return 0;
+            }
+        }
+    }
+    /* (4) the proposal length. */
+    {
+        /* sigmoid(0) = 0.5, sigmoid(2) = 0.88, sigmoid(-2) = 0.12 */
+        const float conf[5] = {2.0f, 2.0f, 0.0f, 2.0f, 2.0f};
+        if (ds4_v41_spec_draft_len(conf, 5u, 0.6f, 8u) != 2u) return 0;
+        if (ds4_v41_spec_draft_len(conf, 5u, 0.6f, 1u) != 1u) return 0;
+        if (ds4_v41_spec_draft_len(conf, 5u, 0.4f, 8u) != 5u) return 0;
+        if (ds4_v41_spec_draft_len(conf, 5u, 0.95f, 8u) != 0u) return 0;
+        /* threshold <= 0 disables the propose-side gate entirely */
+        if (ds4_v41_spec_draft_len(conf, 5u, 0.0f, 8u) != 5u) return 0;
+    }
+    return 1;
+}
+
 /* Allocate the draft state for one session's graph.  Every buffer is sized
  * from the support file's own geometry, so a file with a different block
  * size or expert count needs no code change.  Returns true and leaves
@@ -40923,6 +41350,63 @@ static bool ds41_dspark_configure(ds41_gpu_graph *g, const ds4_dspark_weights *d
     d->host_embed = xmalloc((size_t)rows * d->markov_rank * sizeof(float));
     d->host_head_x = xmalloc((size_t)rows * DS4_N_EMBD * sizeof(float));
     d->host_conf = xmalloc((size_t)rows * sizeof(float));
+
+    /* 3.7 stage 5.  ~19 MiB a session at V4.1's geometry, almost all of it
+     * the 128-row prefill seed ring; DSpark is single-stream (spec 5.9), so
+     * it is paid once. */
+    d->seed_win = 0;
+    d->host_verify_logits = xmalloc((size_t)rows * DS4_N_VOCAB * sizeof(float));
+#define DS41_SPEC_ALLOC(field, count) \
+    do { d->field = ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)); \
+         if (!d->field) goto fail; } while (0)
+    DS41_SPEC_ALLOC(seed_hidden,
+        (uint64_t)d->target_layer_count * DS41_DSPARK_WINDOW * DS4_N_EMBD);
+    DS41_SPEC_ALLOC(seed_concat,
+        (uint64_t)DS41_DSPARK_WINDOW * d->target_layer_count * DS4_N_EMBD);
+    DS41_SPEC_ALLOC(seed_main_x, (uint64_t)DS41_DSPARK_WINDOW * DS4_N_EMBD);
+    DS41_SPEC_ALLOC(seed_kv, (uint64_t)DS41_DSPARK_WINDOW * DS4_N_HEAD_DIM);
+    DS41_SPEC_ALLOC(seed_weights, (uint64_t)DS41_DSPARK_WINDOW * DS4_N_HC);
+    DS41_SPEC_ALLOC(verify_hidden,
+        (uint64_t)d->target_layer_count * rows * DS4_N_EMBD);
+    DS41_SPEC_ALLOC(verify_weights, (uint64_t)rows * DS4_N_HC);
+    DS41_SPEC_ALLOC(verify_logits, (uint64_t)rows * DS4_N_VOCAB);
+    DS41_SPEC_ALLOC(window_save,
+        (uint64_t)DS4_N_LAYER * rows * DS41_SPEC_RAW_WIDTH);
+#undef DS41_SPEC_ALLOC
+    for (uint32_t i = 0; i < d->target_layer_count; i++) {
+        d->seed_layer[i] = ds4_gpu_tensor_view(d->seed_hidden,
+            (uint64_t)i * DS41_DSPARK_WINDOW * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS41_DSPARK_WINDOW * DS4_N_EMBD * sizeof(float));
+        d->verify_layer[i] = ds4_gpu_tensor_view(d->verify_hidden,
+            (uint64_t)i * rows * DS4_N_EMBD * sizeof(float),
+            (uint64_t)rows * DS4_N_EMBD * sizeof(float));
+        if (!d->seed_layer[i] || !d->verify_layer[i]) goto fail;
+    }
+    /* Only the ratio-2 owners have a pair accumulator at all; the rest keep a
+     * NULL slot and the row override skips them. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds41_kv_source(il) || ds4_layer_compress_ratio(il) != 2u) continue;
+        const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+        for (uint32_t k = 0; k < DS41_SPEC_CARRY_SLOTS; k++) {
+            if (d->carry_kv[owner][k]) continue;
+            d->carry_kv[owner][k] =
+                ds4_gpu_tensor_alloc(DS41_SPEC_CARRY_WIDTH * sizeof(float));
+            d->carry_score[owner][k] =
+                ds4_gpu_tensor_alloc(DS41_SPEC_CARRY_WIDTH * sizeof(float));
+            if (!d->carry_kv[owner][k] || !d->carry_score[owner][k]) goto fail;
+        }
+    }
+    {
+        float *seed_w = xmalloc((size_t)DS41_DSPARK_WINDOW * DS4_N_HC * sizeof(float));
+        for (uint32_t i = 0; i < DS41_DSPARK_WINDOW * DS4_N_HC; i++) seed_w[i] = inv_hc;
+        const bool wrote =
+            ds4_gpu_tensor_write(d->seed_weights, 0, seed_w,
+                (uint64_t)DS41_DSPARK_WINDOW * DS4_N_HC * sizeof(float)) &&
+            ds4_gpu_tensor_write(d->verify_weights, 0, seed_w,
+                (uint64_t)rows * DS4_N_HC * sizeof(float));
+        free(seed_w);
+        if (!wrote) goto fail;
+    }
     g->dspark = d;
     fprintf(stderr,
             "ds4: V4.1 DSpark draft graph armed: %u stages, block %u, "
@@ -40931,7 +41415,7 @@ static bool ds41_dspark_configure(ds41_gpu_graph *g, const ds4_dspark_weights *d
             d->markov_rank);
     for (uint32_t i = 0; i < d->target_layer_count; i++)
         fprintf(stderr, "%s%u", i ? "," : " ", d->target_layers[i]);
-    fprintf(stderr, " (private %u-row windows, decode-seeded)\n", DS41_DSPARK_WINDOW);
+    fprintf(stderr, " (private %u-row windows, prefill-seeded)\n", DS41_DSPARK_WINDOW);
     return true;
 fail:
     free(identity);
@@ -40971,6 +41455,67 @@ static bool ds41_dspark_capture(ds41_gpu_graph *g, uint32_t il) {
     }
     return true;
 }
+
+
+/* 3.7 stage 5: ds41_dspark_capture() for N rows of a batched pass.  The HC
+ * weighted sum is elementwise over the four HC copies of one row, so the row
+ * count changes nothing about any row's arithmetic -- the kernel derives it
+ * from the output buffer's size and the weight buffer supplies one 1/HC row
+ * per token.  Returns true and does nothing when `il` is not a target layer,
+ * so the caller can hand it every layer exactly as the decode loop does. */
+static bool ds41_dspark_capture_rows(ds41_dspark *d, uint32_t il,
+                                     const ds4_gpu_tensor *residual_rows,
+                                     uint32_t src_row, uint32_t count,
+                                     ds4_gpu_tensor *const *dst_layer,
+                                     const ds4_gpu_tensor *weights,
+                                     uint32_t dst_row) {
+    if (!d || !count) return true;
+    for (uint32_t i = 0; i < d->target_layer_count; i++) {
+        if (d->target_layers[i] != il) continue;
+        ds4_gpu_tensor *src = ds4_gpu_tensor_view((ds4_gpu_tensor *)residual_rows,
+            (uint64_t)src_row * DS4_N_HC * DS4_N_EMBD * sizeof(float),
+            (uint64_t)count * DS4_N_HC * DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *dst = ds4_gpu_tensor_view(dst_layer[i],
+            (uint64_t)dst_row * DS4_N_EMBD * sizeof(float),
+            (uint64_t)count * DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *w = ds4_gpu_tensor_view((ds4_gpu_tensor *)weights, 0,
+            (uint64_t)count * DS4_N_HC * sizeof(float));
+        const bool ok = src && dst && w &&
+            ds4_gpu_hc_weighted_sum_tensor(dst, src, w, DS4_N_EMBD, DS4_N_HC) != 0;
+        ds4_gpu_tensor_free(w);
+        ds4_gpu_tensor_free(dst);
+        ds4_gpu_tensor_free(src);
+        return ok;
+    }
+    return true;
+}
+
+/* The prefill sweep's hook: capture whatever part of this chunk falls inside
+ * the trailing seed window.  Chunks arrive in increasing position order, so
+ * each target layer's captured set is a suffix of the window and seed_from[i]
+ * is all the bookkeeping it needs. */
+static bool ds41_dspark_capture_prefill(ds41_gpu_graph *g, uint32_t il,
+                                        uint32_t start, uint32_t count) {
+    ds41_dspark *d = g->dspark;
+    if (!d || !d->seed_win || !count) return true;
+    uint32_t from = start, n = count;
+    if (from < d->seed_base) {
+        if (d->seed_base - from >= n) return true;
+        n -= d->seed_base - from;
+        from = d->seed_base;
+    }
+    const uint32_t dst_row = from - d->seed_base;
+    if (dst_row >= d->seed_win) return true;
+    if (n > d->seed_win - dst_row) n = d->seed_win - dst_row;
+    if (!ds41_dspark_capture_rows(d, il, g->batch.residual, from - start, n,
+                                  d->seed_layer, d->seed_weights, dst_row))
+        return false;
+    for (uint32_t i = 0; i < d->target_layer_count; i++)
+        if (d->target_layers[i] == il && dst_row < d->seed_from[i])
+            d->seed_from[i] = dst_row;
+    return true;
+}
+
 
 /*
  * Model-free oracle for the capture (tests/test_deepseek41_metal
@@ -43019,6 +43564,177 @@ static DS4_MAYBE_UNUSED bool ds41_graph_dspark_step(ds41_gpu_graph *g,
     return ok;
 }
 
+
+/*
+ * 3.7 stage 5: push `n` captured target rows -- already laid out in
+ * d->seed_concat as [row][target_layer][DS4_N_EMBD], the shape main_proj
+ * reads -- into every stage's private window, at RoPE positions
+ * first_pos .. first_pos + n - 1 and ring slots slot_base .. slot_base + n - 1.
+ *
+ * This is the pipeline ds41_dspark_block_forward computes for its one target
+ * row (main_proj -> main_norm -> wkv -> kv_norm -> RoPE -> FP8, model.py:1040
+ * and :1065), run over n rows at once.  Two callers: the prompt's trailing
+ * window (ds41_dspark_seed_prefill) and the rows a speculative commit adds
+ * (ds41_dspark_seed_commit).
+ *
+ * The ring's rotation carries no meaning -- attention over the window is a
+ * set and the position is already in the RoPE -- so a run that does not wrap
+ * is one copy per stage and only a wrapping one pays per row.
+ */
+static bool ds41_dspark_seed_push(ds41_gpu_graph *g, const ds4_model *dm,
+                                  const ds4_dspark_weights *dw, uint32_t n,
+                                  uint32_t first_pos, uint32_t slot_base) {
+    ds41_dspark *d = g->dspark;
+    const ds4_dspark_stage_weights *first = &dw->stage[0];
+    const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t concat = (uint64_t)d->target_layer_count * DS4_N_EMBD;
+    if (!n || !d->target_layer_count || n > DS41_DSPARK_WINDOW) return false;
+    const uint32_t base = slot_base % DS41_DSPARK_WINDOW;
+    ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(d->seed_concat, 0,
+        (uint64_t)n * concat * sizeof(float));
+    ds4_gpu_tensor *main_x = ds4_gpu_tensor_view(d->seed_main_x, 0,
+        (uint64_t)n * DS4_N_EMBD * sizeof(float));
+    ds4_gpu_tensor *kv = ds4_gpu_tensor_view(d->seed_kv, 0, (uint64_t)n * kv_bytes);
+    bool ok = hidden && main_x && kv &&
+        ds41_matmul_batch(main_x, dm, first->main_proj, hidden, n, true) &&
+        ds41_norm_batch(main_x, main_x, dm, first->main_norm, n);
+    for (uint32_t s = 0; ok && s < d->stages; s++) {
+        const ds4_layer_weights *l = &dw->stage[s].block;
+        ok = ds41_matmul_batch(kv, dm, l->attn_kv, main_x, n, true) &&
+             ds41_norm_batch(kv, kv, dm, l->attn_kv_a_norm, n);
+        /* One dispatch per row: ds4_gpu_dsv41_rope applies ONE position to
+         * every row it is given, and each seeded row carries its own.  This
+         * is the same call the decode path makes for its single target row. */
+        for (uint32_t r = 0; ok && r < n; r++) {
+            ds4_gpu_tensor *row = ds4_gpu_tensor_view(kv, (uint64_t)r * kv_bytes, kv_bytes);
+            ok = row && ds4_gpu_dsv41_rope(row, DS4_N_HEAD_DIM, 1, 1,
+                                           first_pos + r, false, false) != 0;
+            ds4_gpu_tensor_free(row);
+        }
+        if (ok) ok = ds4_gpu_dsv41_quantize(kv, DS4_N_HEAD_DIM, n, DS4_V41_FP8_E8M0) != 0;
+        if (ok && base + n <= DS41_DSPARK_WINDOW)
+            ok = ds4_gpu_tensor_copy(d->window[s], (uint64_t)base * kv_bytes,
+                                     kv, 0, (uint64_t)n * kv_bytes) != 0;
+        else
+            for (uint32_t r = 0; ok && r < n; r++)
+                ok = ds4_gpu_tensor_copy(d->window[s],
+                        (uint64_t)((base + r) % DS41_DSPARK_WINDOW) * kv_bytes,
+                        kv, (uint64_t)r * kv_bytes, kv_bytes) != 0;
+    }
+    ds4_gpu_tensor_free(kv);
+    ds4_gpu_tensor_free(main_x);
+    ds4_gpu_tensor_free(hidden);
+    return ok;
+}
+
+/*
+ * 3.7 stage 5: the rows a speculative commit adds to the private windows.
+ *
+ * ds41_graph_dspark_step() appends exactly ONE target row per call and the
+ * cycle calls it once, after the commit -- so without this the window would
+ * gain one row per CYCLE while the frontier advanced by 1 + committed, and
+ * the draft would attend to a sparse subsample of the positions the reference
+ * uses (model.py:1040/1065 say "the target's last <= 128 positions").  At
+ * k = 3 and 80 % acceptance a 128-row window would span ~378 positions with
+ * two thirds of the keys missing, which costs exactly the acceptance rate the
+ * plan's >= 1.3x row and the runner's k sweep are there to measure.
+ *
+ * The `committed` rows added here are positions first_pos - 1 (the cycle's own
+ * target step, still in d->target_slot -- the caller has not yet replaced it)
+ * through first_pos + committed - 2 (verify rows 0 .. committed - 2).  The LAST
+ * committed position, first_pos + committed - 1, is deliberately left out: the
+ * draft call that follows writes it itself from the target_slot the commit
+ * installs.  So the window advances by exactly 1 + committed per cycle, the
+ * same as the frontier, with no gap and no duplicate.
+ *
+ * Acceptance only.  Every emitted token is still the target's own argmax, so a
+ * failure here -- or the whole function being skipped -- costs throughput and
+ * can never change a token.
+ */
+static bool ds41_dspark_seed_commit(ds41_gpu_graph *g, const ds4_model *dm,
+                                    const ds4_dspark_weights *dw,
+                                    uint32_t first_pos, uint32_t committed) {
+    ds41_dspark *d = g->dspark;
+    if (!dm || !dw || !committed || first_pos == 0u) return true;
+    if (!d->seed_concat || d->stages != dw->n_stages) return true;
+    if (committed > DS41_DSPARK_WINDOW) return true;
+    if (!dw->stage[0].main_proj || !dw->stage[0].main_norm) return true;
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t concat = (uint64_t)d->target_layer_count * DS4_N_EMBD;
+    bool ok = true;
+    for (uint32_t r = 0; ok && r < committed; r++)
+        for (uint32_t i = 0; ok && i < d->target_layer_count; i++)
+            ok = ds4_gpu_tensor_copy(d->seed_concat,
+                    ((uint64_t)r * concat + (uint64_t)i * DS4_N_EMBD) * sizeof(float),
+                    r == 0u ? d->target_slot[i] : d->verify_layer[i],
+                    r == 0u ? 0u : (uint64_t)(r - 1u) * embd_bytes,
+                    embd_bytes) != 0;
+    if (ok) ok = ds41_dspark_seed_push(g, dm, dw, committed, first_pos - 1u, d->seeded);
+    if (ok) d->seeded += committed;
+    return ok;
+}
+
+/*
+ * 3.7 stage 5: seed every stage's private window from the target's last
+ * prompt positions (spec 1.8, model.py:1044-1051), once, at the end of the
+ * prompt.  Each stage runs its OWN main_proj -> main_norm -> wkv -> kv_norm
+ * -> RoPE -> FP8 over the captured hidden, which is what the reference seeds
+ * with and what ds41_dspark_block_forward computes for the single decode row.
+ *
+ * The seeded rows land in window slots 0..n-1 and d->seeded is set to n, so
+ * the first decode call writes slot n and attends to n+1 window rows: the
+ * ring's rotation carries no meaning (attention over the window is a set, the
+ * position is already in the RoPE), which is what makes that legal and what
+ * turns the store into one copy per stage instead of n.
+ *
+ * Exactness: these rows only steer which tokens the draft PROPOSES.  Every
+ * emitted token is still the target's own argmax, so seeding cannot change
+ * the output stream -- only the acceptance rate.  That is also why the rows
+ * may come from a batched prefill rather than from serial decode.
+ */
+static bool ds41_dspark_seed_prefill(ds41_gpu_graph *g, const ds4_model *dm,
+                                     const ds4_dspark_weights *dw) {
+    ds41_dspark *d = g ? g->dspark : NULL;
+    if (!d || !d->seed_win || !g->valid || g->tp_world != 1 || !dm || !dw) return true;
+    if (d->stages != dw->n_stages) return true;
+    const ds4_dspark_stage_weights *first = &dw->stage[0];
+    if (!first->main_proj || !first->main_norm) return true;
+    uint32_t base = 0;
+    for (uint32_t i = 0; i < d->target_layer_count; i++)
+        if (d->seed_from[i] > base) base = d->seed_from[i];
+    if (base >= d->seed_win) return true;
+    const uint32_t n = d->seed_win - base;
+    const double t0 = now_sec();
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t concat = (uint64_t)d->target_layer_count * DS4_N_EMBD;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    /* [layer][row] -> [row][layer]: main_proj reads the three target layers'
+     * means concatenated, exactly as d->target_hidden holds them at decode. */
+    for (uint32_t r = 0; ok && r < n; r++)
+        for (uint32_t i = 0; ok && i < d->target_layer_count; i++)
+            ok = ds4_gpu_tensor_copy(d->seed_concat,
+                    ((uint64_t)r * concat + (uint64_t)i * DS4_N_EMBD) * sizeof(float),
+                    d->seed_layer[i], (uint64_t)(base + r) * embd_bytes,
+                    embd_bytes) != 0;
+    if (ok) ok = ds41_dspark_seed_push(g, dm, dw, n, d->seed_base + base, 0u);
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (ok) {
+        d->seeded = n;
+        d->seeded_rows = n;
+        d->seed_ms += (now_sec() - t0) * 1000.0;
+        if (d->timing)
+            fprintf(stderr, "ds4: V4.1 DSpark seeded %u window rows from prompt "
+                            "positions %u..%u in %.3f ms\n",
+                    n, d->seed_base + base, d->seed_base + base + n - 1u,
+                    (now_sec() - t0) * 1000.0);
+    } else {
+        fprintf(stderr, "ds4: V4.1 DSpark prefill seeding failed; the draft "
+                        "windows fill from decode instead\n");
+    }
+    d->seed_win = 0;
+    return true;   /* a failed seed costs acceptance, never correctness */
+}
+
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
  * routes take precedence over the rest of the prompt's popular experts. */
 static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
@@ -43331,6 +44047,18 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     bool engram_prefetched = overlap_engram &&
         ds41_engram_prefetch_start(&engram_prefetch, &g->table[0], g->prefill_ids[0][0], total_count,
                                    ds4_gpu_tensor_contents(g->engram_prefetch));
+    /* 3.7 stage 5: this prompt's trailing seed window.  Reset per sweep, so a
+     * second prompt on the same session re-seeds from its own tail and a
+     * decoder-suffix sweep that cannot reach every late layer over every row
+     * simply seeds fewer rows (seed_from below is the intersection). */
+    if (g->dspark && !encoder_only && ds41_dspark_seed_enabled()) {
+        ds41_dspark *dsp = g->dspark;
+        const uint32_t end = initial_start + total_count;
+        dsp->seed_win = end < DS41_DSPARK_WINDOW ? end : DS41_DSPARK_WINDOW;
+        dsp->seed_base = end - dsp->seed_win;
+        for (uint32_t i = 0; i < dsp->target_layer_count; i++)
+            dsp->seed_from[i] = dsp->seed_win;
+    }
     bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
     metal_graph_stream_prepare_slot prepare = {0};
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -43483,6 +44211,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds4_gpu_tensor_copy(g->batch.engram_rows, 0, g->engram_prefetch,
                                          off * bytes, count * bytes) != 0;
             }
+            /* 3.7 stage 5: the same capture point as the decode loop -- the
+             * attention INPUT of the DSpark target layers -- for this chunk's
+             * rows.  g->batch.residual is where both the batched and the
+             * per-row prefill front keep them. */
+            if (ok && g->dspark) ok = ds41_dspark_capture_prefill(g, il, start, count);
             if (ok && batch_hc)
                 ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count, active.engram_rows);
             DS41_STAGE("hc/engram");
@@ -44188,8 +44921,34 @@ static int ds41_attention_rows(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs,
 }
 #endif
 
+/* 3.7 stage 5: point one verify row at its pair of the carry chain.  A row
+ * whose slot is UINT32_MAX (row 0 of a block starting at an odd position)
+ * keeps the session's own buffer, which is exactly the frontier value it must
+ * read; no row of the block ever writes that buffer, which is what lets a
+ * full rejection need no snapshot. */
+static void ds41_spec_row_carry(ds41_gpu_graph *row, const ds41_spec_verify *spec,
+                                uint32_t index) {
+    if (!spec) return;
+    const uint32_t slot = ds4_v41_spec_carry_slot(spec->first_pos, index);
+    if (slot >= DS41_SPEC_CARRY_SLOTS) return;
+    for (uint32_t o = 0; o < DS41_SPEC_CARRY_OWNERS; o++) {
+        if (spec->carry_kv[o][slot]) row->previous_kv[o] = spec->carry_kv[o][slot];
+        if (spec->carry_score[o][slot]) row->previous_score[o] = spec->carry_score[o][slot];
+    }
+}
+
+/* 3.7 stage 5: `spec` is NULL for every pre-existing caller and every field
+ * it carries is read only under that test, so the batched decode step is
+ * unchanged for mixed session batches and for short prefill.  When it is set,
+ * the rows are one session's consecutive speculative positions: they chain
+ * positions and Engram history like prefill rows (prefill_rows == count), but
+ * every row publishes a head, each row's compressor pair carry comes from the
+ * block's own slots instead of the session's buffer, each row's target hidden
+ * is captured for the next proposal, and all the logits come back in one
+ * slab. */
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
+                                   const ds41_spec_verify *spec,
                                    const ds4_model *model, const ds4_weights *weights) {
     if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
         prefill_rows > (uint32_t)count) return false;
@@ -44198,7 +44957,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
     if (!g) return false;
     const uint32_t rows = (uint32_t)count;
-    const bool prefill_only = prefill_rows == rows;
+    /* A verify block chains like prefill rows but publishes every head. */
+    const bool prefill_only = prefill_rows == rows && !spec;
+    /* 3.6d's same-session exclusion is conservative rather than necessary, so
+     * a verify block opts back into it.  3.6a's and 3.6c's are NOT: both keep
+     * seeing prefill_rows (see ds41_dspark_verify_batch_enabled). */
+    const uint32_t output_gate_rows =
+        (spec && ds41_dspark_verify_batch_enabled()) ? 0u : prefill_rows;
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     /* 3.6d: one out_a dispatch and one out_b dispatch for all rows, decided once.
@@ -44206,7 +44971,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
      * them instead of once per row. */
     bool batch_output_mv_ext = false, batch_output_rows = false;
     const bool batch_output =
-        ds41_batch_attention_output_enabled(g, weights, prefill_rows, rows,
+        ds41_batch_attention_output_enabled(g, weights, output_gate_rows, rows,
                                             &batch_output_mv_ext, &batch_output_rows);
     /* 3.6c: and one flash dispatch with ne03 = N for all rows, between the per-row front (RoPE,
      * quantize, window store, publish, indexer select) and the per-row tail (BF16 + inverse RoPE).
@@ -44350,6 +45115,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     sizeof(s->rows[table]));
             }
         }
+        /* 3.7 stage 5: every verify row's target hidden, at the attention
+         * INPUT of the DSpark target layers -- the same point and the same HC
+         * mean the single-token loop captures, one dispatch per target layer
+         * for the whole block.  The committed row's slice becomes the next
+         * proposal's input, so a speculative commit costs no extra target
+         * step to re-capture. */
+        if (ok && spec && spec->capture)
+            ok = ds41_dspark_capture_rows(spec->capture, il, active.residual, 0, rows,
+                                          spec->capture->verify_layer,
+                                          spec->capture->verify_weights, 0);
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows,
                 queued && il == 14u ? engram_rows_tab1 : active.engram_rows) &&
             ds41_attention_project_batch(g, model, l, rows);
@@ -44386,6 +45161,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
             DS41_PREFILL_ROWS(DS41_SESSION_ROW)
 #undef DS41_SESSION_ROW
+            ds41_spec_row_carry(&row, spec, (uint32_t)i);
             row.q = queries[i];
             row.heads = heads[i];
             /* 3.6c: with the flash batched this is ds41_attention()'s front only; the flash and
@@ -44426,6 +45202,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
                 DS41_PREFILL_ROWS(DS41_SESSION_ROW)
 #undef DS41_SESSION_ROW
+                ds41_spec_row_carry(&row, spec, (uint32_t)i);
                 row.q = queries[i];
                 row.heads = heads[i];
                 ok = ds41_attention_flash_tail(&row, model, l, il, staged > 0) &&
@@ -44484,7 +45261,21 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     /* The final FFN intermediates are dead. Reuse that storage for the head
      * rather than allocating another vocabulary-sized buffer per session. */
     ds4_gpu_tensor *batch_logits = NULL;
-    if (ok && !prefill_only && !getenv("DS4_METAL_DISABLE_V41_BATCH_HEAD") &&
+    /* 3.7 stage 5: a verify block needs EVERY row's logits back, and the rows
+     * share one session, so s->logits (one buffer) cannot hold them; they go
+     * to the block's own slab instead.  By DEFAULT the head is still projected
+     * one row at a time, into that row's slice of the slab: the batched head
+     * is the one stage of ds41_graph_step_batch that ds4.c itself refuses to
+     * call row-exact (ds41_matmul_batch_q8_row_exact excludes DS4_N_VOCAB), so
+     * batching it would decide acceptance -- and hand the caller its next
+     * token -- on logits serial decode never computes.  See
+     * ds41_dspark_verify_batch_head_enabled(). */
+    if (ok && spec) {
+        if (ds41_dspark_verify_batch_head_enabled()) {
+            batch_logits = ds4_gpu_tensor_view(spec->logits, 0, rows * logits_bytes);
+            if (!batch_logits) ok = false;
+        }
+    } else if (ok && !prefill_only && !getenv("DS4_METAL_DISABLE_V41_BATCH_HEAD") &&
         ds4_gpu_tensor_bytes(g->batch.mid) >= rows * logits_bytes)
         batch_logits = ds4_gpu_tensor_view(g->batch.mid, 0, rows * logits_bytes);
     /* Pure prefill publishes only its final row; the caller computes the head
@@ -44511,7 +45302,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #endif
             ds4_gpu_hc_weighted_sum_tensor(s->x, s->residual, s->pre, DS4_N_EMBD, DS4_N_HC)) &&
             ds41_bf16(s->x, DS4_N_EMBD) && ds41_norm(s->norm, s->x, model, weights->output_norm);
-        if (ok) ok = batch_logits ?
+        /* 3.7 stage 5: every verify row projects its OWN head, with the
+         * single-row dispatch serial decode uses, straight into its slice of
+         * the block's slab.  s (== graphs[i]) is the one session all the rows
+         * share, so its g->logits must not be written here at all: it would
+         * end the block holding the LAST row's logits, i.e. a position the
+         * commit may have rejected. */
+        if (ok && spec && !batch_logits) {
+            ds4_gpu_tensor *row_logits = ds4_gpu_tensor_view(spec->logits,
+                (uint64_t)i * logits_bytes, logits_bytes);
+            ok = row_logits != NULL &&
+                 ds41_output_projection(s, row_logits, model, weights, s->norm, 1);
+            ds4_gpu_tensor_free(row_logits);
+        } else if (ok) ok = batch_logits ?
             ds4_gpu_tensor_copy(g->rows_view[i].norm, 0, s->norm, 0, DS4_N_EMBD * sizeof(float)) :
             ds41_output_projection(s, s->tp_logits_half ? s->tp_logits_half : s->logits,
                                     model, weights, s->norm, 1);
@@ -44520,7 +45323,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = ds41_output_projection(g, batch_logits, model, weights, active.norm, rows);
     for (int i = first_output; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
-        if (batch_logits)
+        /* A verify block's rows all ARE this session, and their logits already
+         * live in the block's own slab; copying them into s->logits would only
+         * leave the last row's there (see the head above). */
+        if (batch_logits && !spec)
             ok = ds4_gpu_tensor_copy(s->tp_logits_half ? s->tp_logits_half : s->logits,
                 0, batch_logits, (uint64_t)i * logits_bytes, logits_bytes);
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
@@ -44542,6 +45348,191 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     return ok;
 }
 
+
+/* =========================================================================
+ * 3.7 stage 5: one speculative verify block, and the rewind that follows it.
+ * ========================================================================= */
+
+/*
+ * The one piece of V4.1 decode state a rejected row destroys rather than
+ * appends to, besides the compressor pair carry.
+ *
+ * spec 1.7 argues that g->window[il] needs no rewind because it is an
+ * append-only ring whose readers derive their range from pos, and that a
+ * block shorter than 128 cannot wrap over live rows.  The first half is
+ * right and the second is not.  ds41_quantize_kv_store writes slot
+ * pos % 128, and once the ring is full the reader's range is n_raw = 128
+ * starting at (pos + 1) % 128 -- ALL 128 slots.  A rejected row at position
+ * P + j therefore writes the slot that, at frontier P, still holds the key
+ * for position P + j - 128, which is inside the very next token's range.
+ * The token would attend to a future key in place of a 128-old one, its
+ * argmax could move, and the emitted stream would stop being serial greedy
+ * decode.  Below 128 positions the ring is not yet full and nothing is
+ * evicted, which is why this only bites on real prompts.
+ *
+ * So the block's slots are copied out before it runs and the rejected ones
+ * are copied back on commit: DS4_N_LAYER * rows rows of 512 floats, 40 blits
+ * a row each way, ~0.2 ms against a ~100 ms cycle.  compressed[owner] and
+ * index_cache[owner] need none of this -- they are linear caches sized for
+ * the whole context, only odd positions publish, and a rejected publisher's
+ * slot is at or past the one the next real token writes first, so spec 1.7's
+ * argument does hold for them.
+ */
+static bool ds41_spec_window_copy(ds41_gpu_graph *g, uint32_t first_pos,
+                                  uint32_t first_row, uint32_t rows, bool save) {
+    ds41_dspark *d = g->dspark;
+    const uint64_t row_bytes = (uint64_t)DS41_SPEC_RAW_WIDTH * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        for (uint32_t i = first_row; i < rows; i++) {
+            const uint64_t slot =
+                (uint64_t)ds4_v41_spec_window_slot(first_pos, i) * row_bytes;
+            const uint64_t keep = ((uint64_t)il * d->rows + i) * row_bytes;
+            const int ok = save ?
+                ds4_gpu_tensor_copy(d->window_save, keep, g->window[il], slot, row_bytes) :
+                ds4_gpu_tensor_copy(g->window[il], slot, d->window_save, keep, row_bytes);
+            if (!ok) return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Run `rows` proposals as consecutive positions of this session in one
+ * batched step and bring every row's logits back to the host.
+ *
+ * On return g->pos and g->history stand at the END of the block, i.e. as if
+ * every proposal had been accepted; ds41_graph_spec_commit() moves them to
+ * the prefix the target actually agreed with.  Between the two calls the
+ * graph is deliberately inconsistent with the session's token history, so
+ * nothing may run in between.
+ */
+static bool ds41_graph_spec_verify(ds41_gpu_graph *g, const ds4_model *m,
+                                   const ds4_weights *w,
+                                   const int *tokens, uint32_t rows) {
+    ds41_dspark *d = g ? g->dspark : NULL;
+    if (!d || !g->valid || rows < 2u || rows > d->rows ||
+        rows > (uint32_t)DS4_TP_BATCH_MAX_ROWS || g->tp_world != 1) return false;
+    if (g->pos > g->ctx || rows > g->ctx - g->pos) return false;
+    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
+    ds41_spec_verify spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.logits = d->verify_logits;
+    spec.capture = d;
+    spec.first_pos = g->pos;
+    for (uint32_t o = 0; o < DS41_SPEC_CARRY_OWNERS; o++)
+        for (uint32_t k = 0; k < DS41_SPEC_CARRY_SLOTS; k++) {
+            spec.carry_kv[o][k] = d->carry_kv[o][k];
+            spec.carry_score[o][k] = d->carry_score[o][k];
+        }
+    for (uint32_t i = 0; i < rows; i++) graphs[i] = g;
+    uint32_t window_first = 0u;
+    const bool window_save =
+        ds4_v41_spec_window_range(1, 0u, rows, &window_first) != 0;
+    const double t0 = now_sec();
+    bool ok = ds4_gpu_begin_commands() != 0 && window_save &&
+              ds41_spec_window_copy(g, spec.first_pos, window_first, rows, true) &&
+              ds41_graph_step_batch(graphs, tokens, (int)rows, rows, &spec, m, w);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) ok = ds4_gpu_tensor_read(d->verify_logits, 0, d->host_verify_logits,
+                                     (uint64_t)rows * DS4_N_VOCAB * sizeof(float)) != 0;
+    d->verify_calls++;
+    d->verify_rows = rows;
+    d->verify_last_ms = (now_sec() - t0) * 1000.0;
+    d->verify_ms += d->verify_last_ms;
+    if (d->timing)
+        fprintf(stderr, "ds4: V4.1 DSpark verify %u rows at pos %u %.3f ms\n",
+                rows, spec.first_pos, d->verify_last_ms);
+    if (!ok) {
+        g->valid = false;
+        fprintf(stderr, "ds4: V4.1 DSpark verify block failed at position %u\n",
+                spec.first_pos);
+    }
+    return ok;
+}
+
+/*
+ * Commit `committed` of the block's rows (1 .. rows) and undo the rest.
+ *
+ * spec 1.7, item by item:
+ *   g->pos            set to the committed frontier; every other extent is
+ *                     derived from it.
+ *   window[il]        a 128-slot RING, so a rejected row at position P + j
+ *                     evicts the still-live key for P + j - 128.  The block
+ *                     saved those slots before it ran; the rejected ones are
+ *                     copied back here (see ds41_spec_window_copy).
+ *   compressed[o],    linear caches sized for the whole context: a publishing
+ *   index_cache[o]    row writes slot n_comp-1 with n_comp derived from its
+ *                     own position, and only odd positions publish, so a
+ *                     rejected publisher's slot is at or past the one the next
+ *                     real token writes first -- and the next token publishes
+ *                     before it attends.  No copy.
+ *   previous_kv[o],   the one buffer a rejected row would have overwritten --
+ *   previous_score[o] handled by the carry chain, so committing is one copy
+ *                     from the prefix's slot (or nothing, when the session
+ *                     buffer already holds it).
+ *   history.tail      re-derived from the truncated token history, exactly as
+ *                     ds41_load_payload does.
+ *   s->logits         the committed row's, read out of the block's slab.
+ *   draft windows     not a rewind but its mirror: the committed positions are
+ *                     APPENDED to the draft's private windows here
+ *                     (ds41_dspark_seed_commit), because the one draft call a
+ *                     cycle makes adds only one row and the frontier moved by
+ *                     1 + committed.  The rejected positions are simply never
+ *                     added.
+ *
+ * The caller has already truncated s->checkpoint to the committed frontier.
+ */
+static bool ds41_graph_spec_commit(ds41_gpu_graph *g, const ds4_model *dm,
+                                   const ds4_dspark_weights *dw, uint32_t first_pos,
+                                   uint32_t committed, const int *tokens,
+                                   uint32_t token_count) {
+    ds41_dspark *d = g ? g->dspark : NULL;
+    if (!d || committed == 0u || committed > d->verify_rows) return false;
+    g->pos = first_pos + committed;
+    bool ok = true;
+    const uint32_t slot = ds4_v41_spec_restore_slot(first_pos, committed);
+    const uint64_t carry_bytes = (uint64_t)DS41_SPEC_CARRY_WIDTH * sizeof(float);
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    uint32_t window_first = 0u;
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (ok && ds4_v41_spec_window_range(0, committed, d->verify_rows, &window_first))
+        ok = ds41_spec_window_copy(g, first_pos, window_first, d->verify_rows, false);
+    if (ok && slot < DS41_SPEC_CARRY_SLOTS) {
+        for (uint32_t o = 0; ok && o < DS41_SPEC_CARRY_OWNERS; o++) {
+            if (!d->carry_kv[o][slot] || !g->previous_kv[o]) continue;
+            ok = ds4_gpu_tensor_copy(g->previous_kv[o], 0, d->carry_kv[o][slot], 0,
+                                     carry_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(g->previous_score[o], 0, d->carry_score[o][slot], 0,
+                                     carry_bytes) != 0;
+        }
+    }
+    /* Every committed position joins the draft's private windows -- BEFORE the
+     * target_slot below is replaced, because row 0 of that seeding is the
+     * cycle's own target step, which is what target_slot still holds.  Purely
+     * an acceptance matter, so a failure costs the window (seeded = 0 rebuilds
+     * it from the next decode rows) and never the commit. */
+    if (ok && !ds41_dspark_seed_commit(g, dm, dw, first_pos, committed))
+        d->seeded = 0;
+    /* The committed row's captured hidden becomes the next proposal's input,
+     * so the cycle needs no extra target step to re-capture it. */
+    for (uint32_t i = 0; ok && i < d->target_layer_count; i++)
+        ok = ds4_gpu_tensor_copy(d->target_slot[i], 0, d->verify_layer[i],
+                                 (uint64_t)(committed - 1u) * embd_bytes,
+                                 embd_bytes) != 0;
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (!ok) {
+        g->valid = false;
+        return false;
+    }
+    d->capture_mask = d->target_layer_count >= 32u ? UINT32_MAX :
+        (1u << d->target_layer_count) - 1u;
+    d->capture_valid = true;
+    d->capture_pos = g->pos - 1u;
+    ds4_v41_spec_history_tail(g->token_map, tokens, token_count, g->history.tail);
+    return true;
+}
+
 static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_weights *w, const int *tokens, uint32_t count) {
     if (!g->valid || count < 2u || count > DS4_TP_BATCH_MAX_ROWS ||
@@ -44549,7 +45540,7 @@ static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     for (uint32_t i = 0; i < count; i++) graphs[i] = g;
     bool ok = ds4_gpu_begin_commands() && ds41_graph_step_batch(graphs, tokens,
-        (int)count, count, m, w);
+        (int)count, count, NULL, m, w);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (!ok) g->valid = false;
@@ -62579,6 +63570,11 @@ typedef struct ds4_dspark_spec_stats {
     uint64_t verifier_fused_head;
     double replay_ms;
     double total_ms;
+    /* 3.7 stage 5: what the plan's gate row asks for -- tokens per step, and
+     * the per-call draft cost the follow-up that batches the draft graph's
+     * dispatches has to beat. */
+    uint64_t emitted_tokens;
+    uint64_t draft_calls;
 } ds4_dspark_spec_stats;
 
 #endif
@@ -63604,9 +64600,19 @@ static bool ds4_session_is_ds41(const ds4_session *s) {
  * stay shut for V4.1 until they land: --dspark then costs one extra mapped
  * support model and decodes exactly like an engine without one.
  */
+static bool ds4_engine_v41_dspark_verify_ready(const ds4_engine *e);
+
+/* 3.7 stage 5: V4.1 answers yes exactly when the verify cycle can run, which
+ * is what makes ds4_engine_mtp_draft_tokens() report a block size and every
+ * front end (ds4-bench, ds4-server, the CLI) take the speculative path.  Any
+ * configuration the cycle cannot serve -- TP, quality, strict, exact
+ * sampling, the rollback env -- stays no, so it keeps decoding through the
+ * serial V4.1 branch stage 3 installed instead of falling into V4's DSpark
+ * machinery, which lives on s->graph and a V4.1 session never initialises. */
 static bool ds4_engine_dspark_draft_available(const ds4_engine *e) {
-    return e && e->support_kind == DS4_SUPPORT_DSPARK &&
-           DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41;
+    if (!e || e->support_kind != DS4_SUPPORT_DSPARK) return false;
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) return true;
+    return ds4_engine_v41_dspark_verify_ready(e);
 }
 
 /*
@@ -63631,6 +64637,22 @@ static bool ds4_engine_v41_dspark_draft_ready(const ds4_engine *e) {
            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
            ds4_backend_uses_graph(e->backend) && !e->tp.active &&
            ds41_dspark_enabled();
+#else
+    (void)e;
+    return false;
+#endif
+}
+
+/* 3.7 stage 5: and whether the verify CYCLE can serve this engine, which is
+ * strictly narrower.  --quality and --dspark-strict ask for the target model
+ * alone; --mtp-exact-sampling is V4's stochastic verifier and has no V4.1
+ * implementation; a block of one cannot pay (verifying one proposal costs the
+ * step that decoding it would).  Each of those keeps the serial V4.1 path. */
+static bool ds4_engine_v41_dspark_verify_ready(const ds4_engine *e) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    return ds4_engine_v41_dspark_draft_ready(e) && ds41_dspark_verify_enabled() &&
+           !e->quality && !e->dspark_strict && !e->dspark_exact_sampling &&
+           e->dspark_weights.block_size >= 2u;
 #else
     (void)e;
     return false;
@@ -73625,12 +74647,28 @@ static int ds4_engine_open_internal(ds4_engine **out,
             if (e->dspark && !ds4_engine_dspark_draft_available(e)) {
                 fprintf(stderr,
                         "ds4: V4.1 DSpark support model bound (experts=%u/%u%s); "
-                        "the V4.1 draft path is not implemented yet, "
-                        "decoding serially\n",
+                        "the V4.1 speculative verify loop is not available for "
+                        "this configuration, decoding serially\n",
                         e->dspark_weights.n_expert,
                         e->dspark_weights.n_expert_used,
                         e->dspark_weights.head_mix_from_last_ffn ?
                             ", head mix from the last block's ffn_pre" : "");
+            } else if (e->dspark && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+                /* 3.7 stage 5.  NOT V4's warning below: a V4.1 verify row's
+                 * head is projected one row at a time, with the single-token
+                 * kernel, so the argmax that accepts a proposal and the logits
+                 * the caller reads are the ones serial decode produces.  The
+                 * temperature note is the one user-visible change: with
+                 * --dspark and a sampler this adopts V4's opportunistic
+                 * semantics -- the cycle's FIRST token is sampled, the
+                 * verified continuation is greedy. */
+                fprintf(stderr,
+                        "ds4: V4.1 DSpark speculative verify loop enabled "
+                        "(up to %u proposals a cycle, head projected per row); "
+                        "every emitted token is the target model's own argmax "
+                        "at its position; with a sampling temperature only the "
+                        "first token of each cycle is sampled\n",
+                        ds41_dspark_max_drafts());
             } else if (e->dspark && !e->quality && !e->dspark_strict) {
                 fprintf(stderr,
                         "ds4: DSpark direct verifier-state commits enabled; "
@@ -75215,7 +76253,9 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             "verify_layer=%.3f verify_head=%.3f verify_read=%.3f "
             "verify_fused_head=%llu replay=%.3f spec_total=%.3f "
             "target=%.3f saved=%.3f net_saved=%s "
-            "draft_len_hist=%s accepted_len_hist=%s\n",
+            "draft_len_hist=%s accepted_len_hist=%s "
+            "emitted=%llu tokens_per_cycle=%.3f draft_calls=%llu "
+            "draft_ms_per_call=%.3f\n",
             (unsigned long long)st->cycles,
             (unsigned long long)st->first_tokens,
             (unsigned long long)st->proposed_tokens,
@@ -75259,7 +76299,11 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             st->saved_ms,
             net_saved,
             draft_hist,
-            accept_hist);
+            accept_hist,
+            (unsigned long long)st->emitted_tokens,
+            st->cycles ? (double)st->emitted_tokens / (double)st->cycles : 0.0,
+            (unsigned long long)st->draft_calls,
+            st->draft_calls ? st->propose_ms / (double)st->draft_calls : 0.0);
 }
 #endif
 
@@ -77971,6 +79015,18 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             if (s->progress)
                 s->progress(s->progress_ud, "prefill_chunk", s->checkpoint.len, prompt->len);
         }
+        /* 3.7 stage 5: the draft blocks' private windows, from the target
+         * hidden the sweep captured.  After the head, so a cancelled or
+         * failed prompt never seeds, and here rather than inside the sweep
+         * because this is where the support model is in scope. */
+        if (g->dspark) {
+            /* Whatever the previous generation proposed belongs to a frontier
+             * this prompt has just replaced. */
+            s->dspark_draft_valid = false;
+            s->dspark_draft_len = 0;
+        }
+        if (!interrupted && g->valid && g->dspark)
+            (void)ds41_dspark_seed_prefill(g, &e->mtp_model, &e->dspark_weights);
         if (interrupted) {
             snprintf(err, errlen, "interrupted");
             return DS4_SESSION_SYNC_INTERRUPTED;
@@ -79756,6 +80812,10 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
         (void)ds4_session_prepare_legacy_mtp_draft(s, token, pos, mtp_probe_log);
         break;
     case DS4_SUPPORT_DSPARK:
+        /* 3.7 stage 5: the V4.1 proposal is made by the V4.1 verify cycle
+         * itself (ds41_session_dspark_prepare), from ds41_gpu_graph.  This
+         * capture path is V4's and addresses s->graph. */
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) break;
         if (!ds4_session_dspark_draft_available(s)) break;
         (void)ds4_session_prepare_dspark_draft(s, token, pos);
         break;
@@ -79779,18 +80839,46 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
  * .forward, model.py:1281-1284); a sampler with a temperature would feed a
  * different token, but nothing here reaches the session's sampling.
  */
-static void ds41_session_dspark_shadow(ds4_session *s) {
+/*
+ * 3.7 stage 5.  The proposal for the NEXT cycle, made from the target hidden
+ * captured at the current frontier and the token the target has just chosen
+ * there (model.py:1281-1284).
+ *
+ * `from_eval` is true when an ordinary decode step called this rather than
+ * the verify cycle.  With the verify loop live the cycle owns the proposal --
+ * it makes exactly one per cycle, after the commit, so the drafts are always
+ * conditioned on the position the next cycle starts from and none is thrown
+ * away.  With the verify loop rolled back the draft still runs here after
+ * every token and its proposal is discarded, which is stage 4's shadow mode.
+ */
+static void ds41_session_dspark_prepare(ds4_session *s, bool from_eval) {
     if (!s || !s->ds41_graph.dspark || !s->engine) return;
     ds4_engine *e = s->engine;
     if (e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark) return;
-    if (!ds41_dspark_shadow_enabled()) return;
-    if (s->ds41_graph.pos == 0) return;
-    const uint32_t pos = s->ds41_graph.pos - 1u;
+    if (from_eval && ds41_dspark_verify_enabled() && !ds41_dspark_shadow_enabled()) return;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_dspark *d = g->dspark;
+    s->dspark_draft_valid = false;
+    s->dspark_draft_len = 0;
+    if (!g->valid || g->pos == 0u) return;
+    const uint32_t pos = g->pos - 1u;
     const int draft_input = (int)dspark_argmax_f32(s->logits, DS4_N_VOCAB);
-    (void)ds41_graph_dspark_step(&s->ds41_graph, &e->model, &e->weights,
-                                 &e->mtp_model, &e->dspark_weights,
-                                 draft_input, pos);
+    if (!ds41_graph_dspark_step(g, &e->model, &e->weights, &e->mtp_model,
+                                &e->dspark_weights, draft_input, pos)) return;
+    s->dspark_last_propose_ms = d->last_ms;
+    if (ds4_dspark_stats_enabled()) {
+        s->dspark_stats.propose_ms += d->last_ms;
+        s->dspark_stats.draft_calls++;
+    }
+    const uint32_t len = ds4_v41_spec_draft_len(d->host_conf, d->rows,
+        e->dspark_confidence_threshold, ds41_dspark_max_drafts());
+    for (uint32_t i = 0; i < len; i++)
+        s->dspark_draft_tokens[i] = d->draft_ids[i + 1u];
+    d->draft_pos = g->pos;
+    s->dspark_draft_len = len;
+    s->dspark_draft_valid = len > 0u;
 }
+
 #endif
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
@@ -79849,7 +80937,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
-        ds41_session_dspark_shadow(s);
+        ds41_session_dspark_prepare(s, true);
         return 0;
     }
 #endif
@@ -81985,7 +83073,7 @@ static int ds4_sessions_eval_batch_native(
             tokens[prefill_rows + i] = items[i].token;
         }
         ok = ok && ds41_graph_step_batch(graphs, tokens, count + (int)prefill_rows,
-                                          prefill_rows, &e->model, &e->weights);
+                                          prefill_rows, NULL, &e->model, &e->weights);
 #else
         ok = false;
 #endif
@@ -86653,6 +87741,235 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
     return rc;
 }
 
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+/* Whether this session may run the V4.1 verify cycle at all.  Mirrors
+ * ds4_engine_v41_dspark_verify_ready() and adds the per-session state, so a
+ * configuration this refuses falls through to the serial V4.1 branch that
+ * stage 3 installed rather than into V4's DSpark machinery, which lives on
+ * s->graph and is never initialised for a V4.1 session. */
+static bool ds41_session_dspark_verify_ready(const ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    /* image_count: every 3.6 gate refuses an image session outright, and this
+     * one must too, for a reason of its own.  The Engram tail the commit
+     * re-derives (ds4_v41_spec_history_tail) applies token_map to every token,
+     * while the real decode path masks image positions to DS4_ENGRAM_DEAD
+     * (ds41_hash_tokens -> ds41_text_mask, ds4_engram.c:63).  On a prompt whose
+     * last tokens are inside an image span the commit would install a tail
+     * serial decode never had -- a different Engram row set for the next
+     * tokens and hence different logits.  ds41_load_payload makes the same
+     * simplification, but that runs at a checkpoint boundary the user chose,
+     * not on every decode cycle. */
+    return s && s->engine && !s->distributed && !ds4_session_is_cpu(s) &&
+           ds4_session_is_ds41(s) && s->ds41_graph_ready && s->ds41_graph.valid &&
+           s->ds41_graph.dspark && s->ds41_graph.tp_world == 1 &&
+           s->ds41_graph.image_count == 0 &&
+           s->checkpoint_valid &&
+           s->ds41_graph.pos == (uint32_t)s->checkpoint.len &&
+           ds4_engine_v41_dspark_verify_ready(s->engine);
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+/*
+ * One V4.1 DSpark cycle.  The shape is V4's (ds4.c:82650), with V4's two-part
+ * acceptance rule (spec 1.6.2) unchanged:
+ *
+ *   - the target token the caller sampled is evaluated as usual and returned
+ *     as accepted[0];
+ *   - the first proposal is checked against the target's OWN argmax at the
+ *     new frontier, which that step has just produced -- free, and a miss
+ *     ends the cycle without any speculative work;
+ *   - the remaining proposals become the rows of one batched step, and
+ *     proposal i is accepted while the target's argmax at row i-1 equals it;
+ *   - everything past the first rejection is rewound.
+ *
+ * So the emitted stream is, token for token, greedy decode of the target
+ * model: every returned token is either the caller's own or one the target's
+ * argmax reproduced at the position it occupies.  That is the plan's
+ * exactness gate, and it holds however wrong the draft is -- a bad draft
+ * costs throughput, never a different token.
+ *
+ * Returns the number of tokens written to accepted[], or -1.
+ */
+static int ds41_session_dspark_spec_cycle(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        bool ignore_eos, ds4_think_mode think_mode,
+        int *accepted, int accepted_cap, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_dspark *d = g->dspark;
+    const bool stats = ds4_dspark_stats_enabled();
+    const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
+    const double t0 = stats ? now_sec() : 0.0;
+    int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
+    int draft_n = 0;
+
+    /* Copy the proposal out before the target step, which replaces it. */
+    /* The proposal applies only at the frontier it was made for and only to
+     * the token it was conditioned on (model.py:1281-1284): a sampler with a
+     * temperature, or any decode that did not come through this cycle, breaks
+     * one of the two. */
+    if (s->dspark_draft_valid && d->draft_ids[0] == first_token &&
+        d->draft_pos == (uint32_t)s->checkpoint.len) {
+        draft_n = (int)s->dspark_draft_len;
+        if (draft_n > max_tokens - 1) draft_n = max_tokens - 1;
+        if (draft_n > accepted_cap - 1) draft_n = accepted_cap - 1;
+        {
+            const int room = s->ctx_size - s->checkpoint.len;
+            if (draft_n > room - 2) draft_n = room - 2;
+        }
+        if (draft_n > (int)d->rows) draft_n = (int)d->rows;
+        for (int i = 0; i < draft_n; i++) {
+            drafts[i] = s->dspark_draft_tokens[i];
+            if (drafts[i] < 0 || drafts[i] >= (int)DS4_N_VOCAB) {
+                if (stats) s->dspark_stats.invalid_draft++;
+                draft_n = 0;
+                break;
+            }
+        }
+        /* A stop token truncates the block before verification (spec 1.6.4).
+         * V4 keeps an EOS proposal as the last one of the block and emits it;
+         * V4.1 DROPS it, for the gate's sake.  The caller's own sampler owns
+         * the EOS boundary and they do not agree on it: ds4-bench picks its
+         * next token with ds4_session_argmax_excluding(eos) and so can never
+         * emit EOS at all, while a block that verified one would.  That is a
+         * divergence from serial greedy decode -- rare, since EOS is seldom
+         * the argmax mid-document, but real, and this stage's whole claim is
+         * that there is none.  Dropping it costs at most one cycle's
+         * acceleration at the very end of a generation: the caller samples the
+         * boundary token itself on the next cycle and every path -- stop on
+         * EOS, exclude EOS, ignore EOS -- then behaves exactly as it does with
+         * --dspark off.  It also keeps EOS out of the block interior, so the
+         * emitted tokens and the committed frontier are the same length by
+         * construction. */
+        for (int i = 0; i < draft_n; i++)
+            if (drafts[i] == eos_token) { draft_n = i; break; }
+        if (ignore_eos) {
+            for (int i = 0; i < draft_n; i++)
+                if (ds4_token_is_stop_for_think_mode(e, drafts[i], think_mode)) {
+                    draft_n = i;
+                    break;
+                }
+        }
+    }
+    s->dspark_draft_valid = false;
+    s->dspark_draft_len = 0;
+    if (stats) {
+        s->dspark_stats.cycles++;
+        s->dspark_stats.first_tokens++;
+        if (draft_n > 0) {
+            s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
+            ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, (uint32_t)draft_n);
+        } else {
+            s->dspark_stats.no_draft++;
+        }
+    }
+
+    /* The target step.  probe_mtp stays false: this cycle makes its own
+     * proposal below, at the frontier the commit leaves behind. */
+    if (ds4_session_eval_probe_tp(s, first_token, false, err, errlen) != 0) return -1;
+    int n_accept = 0;
+    accepted[n_accept++] = first_token;
+    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap ||
+        draft_n < 2) {
+        /* Fewer than two proposals can never pay: verifying one costs exactly
+         * the step that decoding it serially would. */
+        if (stats && draft_n > 0) {
+            s->dspark_stats.no_room++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        } else if (stats) {
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        /* Session batching asks for one or two tokens a call and does not
+         * combine with DSpark (spec 5.9); a proposal such a caller can never
+         * verify is 13 ms thrown away, so do not make one. */
+        if (max_tokens > 1 && accepted_cap > 1 && first_token != eos_token)
+            ds41_session_dspark_prepare(s, false);
+        if (stats) {
+            s->dspark_stats.emitted_tokens += (uint64_t)n_accept;
+            s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
+        }
+        return n_accept;
+    }
+
+    const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
+    if (target_top != drafts[0]) {
+        if (stats) {
+            s->dspark_stats.first_misses++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+            s->dspark_stats.emitted_tokens += (uint64_t)n_accept;
+        }
+        if (spec_log)
+            fprintf(stderr, "ds4: V4.1 DSpark miss first draft=%d target=%d\n",
+                    drafts[0], target_top);
+        ds41_session_dspark_prepare(s, false);
+        if (stats) s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
+        return n_accept;
+    }
+
+    const uint32_t first_pos = g->pos;
+    const int start = s->checkpoint.len;
+    const double verify_t0 = stats ? now_sec() : 0.0;
+    for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
+    s->checkpoint_valid = false;
+    if (!ds41_graph_spec_verify(g, &e->model, &e->weights, drafts, (uint32_t)draft_n)) {
+        s->checkpoint.len = start;
+        if (stats) s->dspark_stats.verifier_errors++;
+        ds4_session_invalidate(s);
+        payload_set_err(err, errlen, "V4.1 DSpark verify block failed");
+        return -1;
+    }
+    if (stats) s->dspark_stats.verify_ms += (now_sec() - verify_t0) * 1000.0;
+
+    int commit = 1;
+    for (int i = 1; i < draft_n; i++) {
+        const uint32_t top = dspark_argmax_f32(
+            d->host_verify_logits + (size_t)(i - 1) * DS4_N_VOCAB, DS4_N_VOCAB);
+        if ((int)top != drafts[i]) break;
+        commit++;
+    }
+
+    s->checkpoint.len = start + commit;
+    if (!ds41_graph_spec_commit(g, &e->mtp_model, &e->dspark_weights,
+                                first_pos, (uint32_t)commit,
+                                s->checkpoint.v, (uint32_t)s->checkpoint.len)) {
+        s->checkpoint.len = start;
+        if (stats) s->dspark_stats.verifier_errors++;
+        ds4_session_invalidate(s);
+        payload_set_err(err, errlen, "V4.1 DSpark rewind failed");
+        return -1;
+    }
+    memcpy(s->logits, d->host_verify_logits + (size_t)(commit - 1) * DS4_N_VOCAB,
+           (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    s->checkpoint_valid = true;
+    /* commit <= draft_n <= accepted_cap - 1 and the block holds no EOS, so
+     * this emits every committed token: the returned count and the committed
+     * frontier cannot come apart. */
+    for (int i = 0; i < commit; i++) accepted[n_accept++] = drafts[i];
+    if (stats) {
+        s->dspark_stats.accepted_draft_tokens += (uint64_t)commit;
+        if (commit == draft_n) {
+            s->dspark_stats.full_accepts++;
+            s->dspark_stats.direct_full_commits++;
+        } else {
+            s->dspark_stats.partial_accepts++;
+            s->dspark_stats.direct_partial_commits++;
+        }
+        ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, (uint32_t)commit);
+        s->dspark_stats.emitted_tokens += (uint64_t)n_accept;
+    }
+    if (spec_log)
+        fprintf(stderr, "ds4: V4.1 DSpark cycle drafted=%d accepted=%d emitted=%d\n",
+                draft_n, commit, n_accept);
+    ds41_session_dspark_prepare(s, false);
+    if (stats) s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
+    return n_accept;
+}
+#endif
+
+
 static int ds4_session_eval_speculative_argmax_impl(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
         bool ignore_eos, ds4_think_mode think_mode,
@@ -86749,10 +88066,26 @@ static int ds4_session_eval_speculative_argmax_impl(
     return -1;
 #else
     ds4_engine *e = s->engine;
+#if defined(DS4_HAS_DEEPSEEK41_GPU)
+    /* 3.7 stage 5: the V4.1 DSpark cycle owns the whole cycle, including the
+     * ordinary target step, exactly as V4's does. */
+    if (accepted && accepted_cap > 0 && ds41_session_dspark_verify_ready(s))
+        return ds41_session_dspark_spec_cycle(s, first_token, max_tokens, eos_token,
+                                              ignore_eos, think_mode, accepted,
+                                              accepted_cap, err, errlen);
+#endif
+    /* 3.7 stage 5: and ANY other V4.1 engine with a support file decodes one
+     * serial token, exactly as it did at stage 3.  Without the family test a
+     * configuration the cycle declines for a per-session reason -- a frontier
+     * the graph has not caught up with, say -- would walk into the V4 DSpark
+     * machinery below, which addresses s->graph and s->dspark_draft_* state a
+     * V4.1 session never initialises. */
     if (e && e->support_kind == DS4_SUPPORT_DSPARK &&
-        !ds4_session_dspark_draft_available(s)) {
-        /* V4.1 with a bound support file but no draft path yet: one serial
-         * token, the same as an engine that was started without --dspark. */
+        (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+         !ds4_session_dspark_draft_available(s))) {
+        /* V4.1 whose configuration the verify cycle above cannot serve:
+         * one serial token, the same as an engine that was started without
+         * --dspark. */
         if (!accepted || accepted_cap <= 0) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;

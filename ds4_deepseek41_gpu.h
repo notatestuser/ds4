@@ -188,6 +188,46 @@ int ds4_v41_dspark_capture_selftest(void);
  * rows, or 0 past the last slot.  `name` may be NULL to ask only the count. */
 uint64_t ds4_v41_dspark_dump_slot(unsigned index, uint32_t stage, uint32_t rows,
                                   char *name, uint64_t cap);
+
+/* 3.7 stage 5 test oracle: the DS4_*_V41_DSPARK_VERIFY* switch state ds4.c
+ * actually read.  Bit 0 the verify loop (DS4_DISABLE_V41_DSPARK_VERIFY clears
+ * it), 1 the batched attention-output projection for the verify rows
+ * (DS4_DISABLE_V41_DSPARK_VERIFY_BATCH), 2 prefill seeding
+ * (DS4_DISABLE_V41_DSPARK_PREFILL_SEED), 3 the EXACT per-row head for the
+ * verify rows (DS4_V41_DSPARK_VERIFY_BATCH_HEAD clears it, which forfeits the
+ * stage's token-identity gate); bits 4+ hold DS4_V41_DSPARK_MAX_DRAFTS.  A
+ * separate word from the stage-4 gates so that adding a switch cannot move a
+ * stage-4 assertion. */
+int ds4_v41_dspark_verify_gates(void);
+
+/* 3.7 stage 5: the pure arithmetic of the speculative rewind, exported so the
+ * model-free battery can check it without a device.  carry_slot says which
+ * pair-carry buffer row `row` of a block starting at `first_pos` uses
+ * (UINT32_MAX = the session's own); restore_slot says which one holds the
+ * state after `committed` rows; history_tail rebuilds the Engram tail from a
+ * token history; draft_len is the confidence prefix capped by k;
+ * window_slot is the raw-KV ring slot a block row writes, which is what the
+ * save/restore of the rejected rows is indexed by, and window_range is the
+ * row range one such pass copies -- [0, rows) for the save before the block,
+ * the rejected tail [committed, rows) for the restore a commit performs, zero
+ * when the pass is a no-op because the block was fully accepted.  Both of
+ * ds41_spec_window_copy's callers take the range from it, so the oracle can
+ * drive the same ranges the graph does. */
+uint32_t ds4_v41_spec_carry_slot(uint32_t first_pos, uint32_t row);
+uint32_t ds4_v41_spec_window_slot(uint32_t first_pos, uint32_t row);
+int ds4_v41_spec_window_range(int save, uint32_t committed, uint32_t rows,
+                              uint32_t *first_row);
+uint32_t ds4_v41_spec_restore_slot(uint32_t first_pos, uint32_t committed);
+void ds4_v41_spec_history_tail(const uint32_t *token_map, const int *tokens,
+                               uint32_t len, int32_t *tail);
+uint32_t ds4_v41_spec_draft_len(const float *confidence, uint32_t rows,
+                                float threshold, uint32_t cap);
+
+/* 3.7 stage 5 test oracle: simulates the compressor pair-carry chain over
+ * every block width, both starting parities and every committed prefix
+ * against a serial reference, checks the Engram tail re-derivation against
+ * ds4_engram_hash and the proposal-length rule.  Non-zero on success. */
+int ds4_v41_spec_rewind_selftest(void);
 #endif /* __APPLE__ */
 int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *kv,
