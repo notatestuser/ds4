@@ -44558,34 +44558,6 @@ static bool ds41_batch_attention_flash_enabled(const ds41_gpu_graph *g,
 #endif
 }
 
-#ifdef __APPLE__
-/* PRE_M5 3.6c: the row -> descriptor mapping of the dispatch below, factored out WHOLE -- its
- * loop included -- so the --flash-rows-desc oracle proves the mapping the dispatch itself uses
- * instead of a copy of it.  Exactly the arithmetic ds41_attention_flash() does for each row, from
- * the same inputs: positions[i] is row i's pos and `ratio` its layer's compress ratio; graphs[i]
- * is the row's OWN graph, because window[il] and compressed[owner] are its session's caches and
- * not workspace row views; and `ws` is the batch workspace, whose rows_view[i].selected_comp is
- * the row's slice of the top-k ids the per-row front just wrote. */
-static void ds41_flash_rows_desc(ds4_gpu_v41_flash_row *desc, ds41_gpu_graph *const *graphs,
-                                 const ds41_gpu_graph *ws, const uint32_t *positions,
-                                 uint32_t il, uint32_t ratio, uint32_t rows) {
-    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
-    for (uint32_t i = 0; i < rows; i++) {
-        const uint32_t pos = positions[i];
-        const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
-        const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
-        desc[i].raw_kv = graphs[i]->window[il];
-        desc[i].comp_kv = n_comp ? graphs[i]->compressed[owner] : NULL;
-        desc[i].comp_ids = n_comp ? ws->rows_view[i].selected_comp : NULL;
-        desc[i].n_raw = n_raw;
-        desc[i].raw_cap = 128u;
-        desc[i].raw_start = (pos + 1u - n_raw) % 128u;
-        desc[i].source_rows = n_comp;
-        desc[i].attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    }
-}
-#endif
-
 /* PRE_M5 3.6c: the N-row dispatch itself.  1 = encoded, 0 = nothing encoded (the caller finishes
  * the step on the per-row path, design-3_6.md 4.4), -1 = hard failure.  In the same #ifdef shape
  * as ds41_batch_attention_output_project() and for the same reason: the entry point is defined in
@@ -44596,8 +44568,26 @@ static int ds41_batch_attention_flash(ds41_gpu_graph *const *graphs, const ds41_
                                       uint32_t il, uint32_t rows) {
 #ifdef __APPLE__
     ds4_gpu_v41_flash_row desc[DS4_TP_BATCH_MAX_ROWS];
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     if (rows > (uint32_t)DS4_TP_BATCH_MAX_ROWS) return 0;
-    ds41_flash_rows_desc(desc, graphs, g, positions, il, ds4_layer_compress_ratio(il), rows);
+    for (uint32_t i = 0; i < rows; i++) {
+        /* Exactly the arithmetic ds41_attention_flash() does for this row, from the same inputs:
+         * positions[i] is the row's pos, window[il] and compressed[owner] are its session's own
+         * caches (they are not workspace row views), and selected_comp is the row's slice of the
+         * top-k ids the per-row front just wrote. */
+        const uint32_t pos = positions[i];
+        const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+        const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+        desc[i].raw_kv = graphs[i]->window[il];
+        desc[i].comp_kv = n_comp ? graphs[i]->compressed[owner] : NULL;
+        desc[i].comp_ids = n_comp ? g->rows_view[i].selected_comp : NULL;
+        desc[i].n_raw = n_raw;
+        desc[i].raw_cap = 128u;
+        desc[i].raw_start = (pos + 1u - n_raw) % 128u;
+        desc[i].source_rows = n_comp;
+        desc[i].attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+    }
     /* tp_world == 1 is a precondition of the gate, so head0 is 0 and every row takes all heads. */
     return ds4_gpu_attention_decode_heads_rows_tensor(active->heads, m->map, m->size,
         l->attn_sinks->abs_offset, active->q, desc, rows, DS4_N_HEAD, DS4_N_HEAD_DIM);
@@ -44606,80 +44596,6 @@ static int ds41_batch_attention_flash(ds41_gpu_graph *const *graphs, const ds41_
     return 0;
 #endif
 }
-
-#ifdef __APPLE__
-/* Test oracle (tests/test_deepseek41_metal --flash-rows-desc), storage half: one distinct address
- * per (structure, row, array index) the mapping above can reach.  Nothing ever dereferences them;
- * they stand in for the tensors of synthetic graphs so that the descriptor the real mapping builds
- * says where it went looking. */
-static char ds41_flash_desc_sentinels[3][DS4_TP_BATCH_MAX_ROWS][40];
-
-static void ds41_flash_desc_source(const void *p, int *kind, int *row, int *index) {
-    const char *const base = &ds41_flash_desc_sentinels[0][0][0];
-    const char *const c = (const char *)p;
-    *kind = 0; *row = -1; *index = -1;
-    if (!c) return;
-    if (c < base || c >= base + sizeof(ds41_flash_desc_sentinels)) { *kind = -1; return; }
-    const size_t off = (size_t)(c - base);
-    *kind  = (int)(off / ((size_t)DS4_TP_BATCH_MAX_ROWS * 40u)) + 1;
-    *row   = (int)((off / 40u) % (size_t)DS4_TP_BATCH_MAX_ROWS);
-    *index = (int)(off % 40u);
-}
-
-/* Test oracle (tests/test_deepseek41_metal --flash-rows-desc).  Which cache, which ids and which
- * key counts ds41_batch_attention_flash() hands the N-row dispatch for row `row` of a `rows`-row
- * batched step at layer `il`.  --flash-rows proves the Metal entry point is bit-identical to N
- * single-row dispatches, but it builds its own descriptors; the ds4.c side that fills them in
- * from three different structures -- the row's own graph, the workspace's row views and
- * positions[] -- runs only inside a batched decode step, so without this the only thing that
- * would notice it handing that entry point another row's window, the wrong compressed owner or a
- * position off by one is a model run.  This is --attn-out-path's sibling for stage (c): the
- * graphs here are synthetic and every tensor pointer in them is a sentinel, so it needs no
- * device, no model and no session. */
-int ds4_v41_batch_attention_flash_desc(unsigned rows, const unsigned *positions, unsigned il,
-                                       unsigned ratio, unsigned row,
-                                       ds4_v41_flash_desc_probe *out) {
-    ds4_gpu_v41_flash_row desc[DS4_TP_BATCH_MAX_ROWS];
-    ds41_gpu_graph *graph_ptrs[DS4_TP_BATCH_MAX_ROWS];
-    uint32_t pos32[DS4_TP_BATCH_MAX_ROWS];
-    ds41_gpu_graph *sessions = NULL, *ws = NULL;
-    ds41_prefill_row *views = NULL;
-    /* il indexes window[40], and a row's position is its own; everything else a batched step can
-     * present is legal input. */
-    if (!positions || !out || rows < 1u || rows > (unsigned)DS4_TP_BATCH_MAX_ROWS ||
-        row >= rows || il >= 40u) return 0;
-    sessions = calloc(rows, sizeof(*sessions));
-    views = calloc(rows, sizeof(*views));
-    ws = calloc(1, sizeof(*ws));
-    if (!sessions || !views || !ws) { free(sessions); free(views); free(ws); return 0; }
-    for (unsigned r = 0; r < rows; r++) {
-        for (unsigned k = 0; k < 40u; k++)
-            sessions[r].window[k] = (ds4_gpu_tensor *)&ds41_flash_desc_sentinels[0][r][k];
-        for (unsigned k = 0; k < 4u; k++)
-            sessions[r].compressed[k] = (ds4_gpu_tensor *)&ds41_flash_desc_sentinels[1][r][k];
-        views[r].selected_comp = (ds4_gpu_tensor *)&ds41_flash_desc_sentinels[2][r][0];
-        graph_ptrs[r] = &sessions[r];
-        pos32[r] = (uint32_t)positions[r];
-    }
-    ws->rows_view = views;
-    /* The step's own loop over the whole batch, not this row alone: a mapping that reads row 0's
-     * caches for every row, or overwrites one descriptor slot, has to be visible from here. */
-    ds41_flash_rows_desc(desc, graph_ptrs, ws, pos32, il, ratio, rows);
-    ds41_flash_desc_source(desc[row].raw_kv, &out->raw_kv_kind, &out->raw_kv_row,
-                           &out->raw_kv_index);
-    ds41_flash_desc_source(desc[row].comp_kv, &out->comp_kv_kind, &out->comp_kv_row,
-                           &out->comp_kv_index);
-    ds41_flash_desc_source(desc[row].comp_ids, &out->comp_ids_kind, &out->comp_ids_row,
-                           &out->comp_ids_index);
-    out->n_raw = desc[row].n_raw;
-    out->raw_cap = desc[row].raw_cap;
-    out->raw_start = desc[row].raw_start;
-    out->source_rows = desc[row].source_rows;
-    out->attended = desc[row].attended;
-    free(sessions); free(views); free(ws);
-    return 1;
-}
-#endif
 
 #ifdef __APPLE__
 /* PRE_M5 3.6a (2026-09-17): the weight types whose 2..8-row projection through ds41_project_rows

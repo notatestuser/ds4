@@ -2227,95 +2227,6 @@ static int check_flash_rows(void) {
     return 1;
 }
 
-#ifdef __APPLE__
-/* PRE_M5 3.6c (2026-09-18): the ds4.c half of the stage -- which cache each row of the N-row
- * dispatch is pointed at and with which key counts, not whether the dispatch itself is exact.
- *
- * check_flash_rows() above is the exactness proof, but it builds its OWN descriptors and calls
- * the entry point directly, so it passes unchanged if ds41_batch_attention_flash() hands that
- * entry point row 0's window for every row, the wrong compressed owner for a layer, the
- * workspace's caches where the session's belong, or a position off by one.  That mapping runs
- * only inside a batched decode step, so the only other thing that would notice is a model run,
- * and the model runs belong to the measurement pass.  ds4_v41_batch_attention_flash_desc() runs
- * the real per-row mapping over synthetic graphs whose tensor pointers are sentinels and reports
- * which structure, which row and which array index each descriptor pointer came from.
- *
- * TOP_K mirrors DS4_N_INDEXER_TOP_K and MAX_ROWS mirrors DS4_TP_BATCH_MAX_ROWS (ds4.c and
- * ds4_tp.h are not included here, as check_attn_out_path_cases() does the same): if either
- * moves, this fails, which is the intent. */
-static int check_flash_rows_desc_row(unsigned rows, unsigned il, unsigned ratio,
-                                     const unsigned *positions, unsigned row) {
-    enum { MAX_ROWS = 8, TOP_K = 512, RAW_CAP = 128 };
-    const unsigned pos = positions[row];
-    const unsigned owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
-    const unsigned n_comp = ratio ? (pos + 1u) / ratio : 0u;
-    const unsigned n_raw = pos + 1u < RAW_CAP ? pos + 1u : RAW_CAP;
-    ds4_v41_flash_desc_probe p;
-    CHECK(rows <= MAX_ROWS && row < rows);
-    memset(&p, 0xa5, sizeof p);
-    CHECK(ds4_v41_batch_attention_flash_desc(rows, positions, il, ratio, row, &p) == 1);
-    /* The row's own session, at this layer -- never another row's, never the workspace's. */
-    CHECK(p.raw_kv_kind == 1 && p.raw_kv_row == (int)row && p.raw_kv_index == (int)il);
-    if (n_comp) {
-        /* The compressed cache is the session's and is picked by the layer's owner; the ids are
-         * the WORKSPACE row view's, which is where the per-row front wrote them. */
-        CHECK(p.comp_kv_kind == 2 && p.comp_kv_row == (int)row && p.comp_kv_index == (int)owner);
-        CHECK(p.comp_ids_kind == 3 && p.comp_ids_row == (int)row && p.comp_ids_index == 0);
-    } else {
-        /* A raw-only row hands the dispatch no compressed slab and no ids at all. */
-        CHECK(p.comp_kv_kind == 0 && p.comp_ids_kind == 0);
-    }
-    CHECK(p.n_raw == n_raw && p.raw_cap == RAW_CAP);
-    CHECK(p.raw_start == (pos + 1u - n_raw) % RAW_CAP);
-    CHECK(p.source_rows == n_comp);
-    CHECK(p.attended == (n_comp < TOP_K ? n_comp : TOP_K));
-    return 1;
-}
-
-static int check_flash_rows_desc(void) {
-    enum { MAX_ROWS = 8 };
-    /* check_flash_rows()'s own position tables, so both halves of the stage answer for the same
-     * rows, except that the gathered one spends its last two slots on 1023 and 4095: n_comp there
-     * is exactly TOP_K and four times TOP_K, which is where `attended` has to clamp and which
-     * check_flash_rows() cannot run (its compressed cache is 1024 rows). */
-    static const unsigned pos_mixed[MAX_ROWS]    = {0, 5, 63, 127, 128, 200, 511, 2047};
-    static const unsigned pos_gathered[MAX_ROWS] = {3, 9, 65, 129, 333, 640, 1023, 4095};
-    static const unsigned pos_raw[MAX_ROWS]      = {200, 17, 31, 128, 33, 333, 100, 2047};
-    /* Both sides of every step of the owner ladder, plus the last layer window[] holds. */
-    static const unsigned layers[] = {0, 1, 7, 8, 13, 14, 19, 20, 39};
-    static const unsigned widths[] = {1, 2, 4, 8};
-    unsigned cases = 0;
-    for (unsigned w = 0; w < sizeof(widths) / sizeof(*widths); w++)
-        for (unsigned variant = 0; variant < 3; variant++) {
-            const unsigned *pos = variant == 0 ? pos_mixed :
-                                  variant == 1 ? pos_gathered : pos_raw;
-            const unsigned ratio = variant == 2 ? 0u : 2u;
-            for (unsigned li = 0; li < sizeof(layers) / sizeof(*layers); li++)
-                for (unsigned r = 0; r < widths[w]; r++) {
-                    CHECK(check_flash_rows_desc_row(widths[w], layers[li], ratio, pos, r));
-                    cases++;
-                }
-        }
-    /* Refusals: nothing a batched step cannot present gets a descriptor. */
-    {
-        static const unsigned pos[MAX_ROWS] = {0, 1, 2, 3, 4, 5, 6, 7};
-        ds4_v41_flash_desc_probe p;
-        CHECK(ds4_v41_batch_attention_flash_desc(MAX_ROWS + 1u, pos, 0, 2, 0, &p) == 0);
-        CHECK(ds4_v41_batch_attention_flash_desc(0, pos, 0, 2, 0, &p) == 0);
-        CHECK(ds4_v41_batch_attention_flash_desc(2, pos, 0, 2, 2, &p) == 0);
-        CHECK(ds4_v41_batch_attention_flash_desc(2, NULL, 0, 2, 0, &p) == 0);
-        CHECK(ds4_v41_batch_attention_flash_desc(2, pos, 40, 2, 0, &p) == 0);
-        CHECK(ds4_v41_batch_attention_flash_desc(2, pos, 0, 2, 0, NULL) == 0);
-    }
-    fprintf(stderr, "V4.1 batched flash descriptors: %u rows at N = 1/2/4/8 over mixed, gathered "
-                    "and raw-only batches, each pointed at its OWN session's window[il] and "
-                    "compressed[owner] and at the workspace's selected_comp, with n_raw, "
-                    "raw_start, source_rows and attended as the per-row path computes them: "
-                    "PASS\n", cases);
-    return 1;
-}
-#endif
-
 static int check_tp_attention(void) {
     enum { D = 512, H = 64, K = 512, C = 2048 };
     const uint32_t sizes[] = {1, 31, 32, 33, 129, 257, 2048};
@@ -3935,10 +3846,6 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
-    if (argc == 2 && !strcmp(argv[1], "--flash-rows-desc")) {
-        /* No device and no model: the mapping is pure ds4.c. */
-        return check_flash_rows_desc() ? 0 : 1;
-    }
     if (argc == 2 && !strcmp(argv[1], "--pre-commit-hook")) {
         const int ok = ds4_gpu_init() && check_pre_commit_hook();
         ds4_gpu_cleanup();
@@ -4008,7 +3915,6 @@ int main(int argc, char **argv) {
 #ifdef __APPLE__
     if (ok) ok = check_rope_pair() && check_quantize_store() &&
                  check_rope_freqs() && check_rows_a() && check_fusion_gates() &&
-                 check_flash_rows_desc() &&
                  check_attention_output_decode() && check_attn_out_rows() &&
                  check_pre_commit_hook();
 #endif

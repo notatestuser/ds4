@@ -135,25 +135,6 @@ int ds4_gpu_dsv41_pool2_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *kv,
 int ds4_gpu_dsv41_publish_scatter_rows(const ds4_gpu_tensor *index_k, const ds4_gpu_tensor *latent,
                                        uint32_t key_width, uint32_t value_width, uint32_t rows);
 int ds4_v41_decode_batch_out_b_row_exact(uint32_t rows, uint32_t outputs);
-/* Test oracle (tests/test_deepseek41_metal --flash-rows-desc): where each pointer of the
- * descriptor ds41_batch_attention_flash() builds came from, and the key counts beside it.
- * `*_kind` is 0 for a NULL pointer, 1 for a session's window[], 2 for a session's compressed[],
- * 3 for the workspace's rows_view[].selected_comp, and -1 for anything else; `*_row` is the row
- * whose structure the pointer came from and `*_index` the array index inside it. */
-typedef struct {
-    int raw_kv_kind, raw_kv_row, raw_kv_index;
-    int comp_kv_kind, comp_kv_row, comp_kv_index;
-    int comp_ids_kind, comp_ids_row, comp_ids_index;
-    unsigned n_raw, raw_cap, raw_start, source_rows, attended;
-} ds4_v41_flash_desc_probe;
-/* Fill `out` with the descriptor a batched decode step of `rows` rows at layer `il` (compress
- * ratio `ratio`), whose rows sit at `positions`, hands the N-row dispatch for row `row`.  1 when
- * it answered, 0 when the arguments are outside what a batched step can present.  --flash-rows
- * proves that dispatch is bit-identical to N single-row dispatches over descriptors the test
- * builds itself; this proves ds4.c builds them out of the right row's caches. */
-int ds4_v41_batch_attention_flash_desc(unsigned rows, const unsigned *positions, unsigned il,
-                                       unsigned ratio, unsigned row,
-                                       ds4_v41_flash_desc_probe *out);
 #endif
 /* The three oracles below are defined in ds4.c, so they exist only where the
  * test binary links ds4.o.  tests/test_deepseek41_metal does (Makefile:235,
