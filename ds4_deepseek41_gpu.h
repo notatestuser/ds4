@@ -135,12 +135,6 @@ int ds4_gpu_dsv41_pool2_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *kv,
 int ds4_gpu_dsv41_publish_scatter_rows(const ds4_gpu_tensor *index_k, const ds4_gpu_tensor *latent,
                                        uint32_t key_width, uint32_t value_width, uint32_t rows);
 int ds4_v41_decode_batch_out_b_row_exact(uint32_t rows, uint32_t outputs);
-/* Which attention-output projection a batched decode step of `rows` eligible rows selects: 0 the
- * per-row loop, 1 3.6d's out_a+out_b pair, 2 the opt-in mv_ext out_b, 3 3.6d2's rows<R> kernels.
- * The fusion-gates oracle above proves the rollback names are read; this proves they route, which
- * for a stage whose two sides are bit-identical is the only model-free way to show that its
- * rollback does anything at all. */
-int ds4_v41_batch_attention_output_path(unsigned rows);
 /* Test oracle (tests/test_deepseek41_metal --flash-rows-desc): where each pointer of the
  * descriptor ds41_batch_attention_flash() builds came from, and the key counts beside it.
  * `*_kind` is 0 for a NULL pointer, 1 for a session's window[], 2 for a session's compressed[],

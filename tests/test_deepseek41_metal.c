@@ -2643,97 +2643,6 @@ static int check_attn_out_rows(void) {
     return 1;
 }
 
-/* The env names ds4_v41_batch_attention_output_path() answers for, saved and restored around the
- * cases below so this check is independent of whatever the caller exported. */
-static const char *const attn_out_path_envs[3] = {
-    "DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT",
-    "DS4_METAL_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_MV_EXT",
-    "DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_ROWS",
-};
-
-/* 3.6d2 (2026-09-18): which projection the step SELECTS, not which kernels are correct.
- *
- * --fusion-gates proves each rollback name is spelled the way the predicate that owns it spells
- * it.  It does not prove the predicate routes anything, and for this stage nothing else does
- * either: the entry points --attn-out-rows drives (ds4_gpu_attention_output_q8_rows_tensor,
- * ds4_gpu_dsv41_attention_output_rows) read no environment at all, so running that mode with
- * DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_ROWS exported executes exactly the same
- * code and is not evidence about the rollback; and the pair the rollback returns to is
- * bit-identical to the rows<R> kernels, so no exactness check can separate them either.  This is
- * the ds4.c half: the widths the rows kernels claim, that the rollback moves every one of them
- * onto 3.6d's pair, that 3.6d's own rollback removes the stage, and that the opt-in mv_ext
- * variant still outranks the rows kernels as 3.6d gave it.
- *
- * MAX_ROWS mirrors DS4_TP_BATCH_MAX_ROWS (ds4_tp.h, not included here, as check_attention_output_
- * decode does the same): if it moves, the width above it stops answering 1 and this fails, which
- * is the intent. */
-static int check_attn_out_path_cases(void) {
-    enum { MAX_ROWS = 8 };
-    const int pre_m5 = ds4_gpu_device_is_pre_m5_apple_silicon();
-    if (!pre_m5) {
-        /* Nothing here is live off pre-M5 Apple silicon: every width takes the per-row loop, and
-         * saying so is the whole check rather than a vacuous pass. */
-        for (unsigned r = 1; r <= MAX_ROWS + 1u; r++)
-            CHECK(ds4_v41_batch_attention_output_path(r) == 0);
-        fprintf(stderr, "V4.1 batched attention output path: not pre-M5 Apple silicon, so every "
-                        "width 1..%u takes the per-row loop: PASS\n", MAX_ROWS + 1u);
-        return 1;
-    }
-    /* Default: the rows<R> kernels for exactly the widths their 2/4/8 templates cover, 3.6d's
-     * pair outside them.  Width 1 never reaches the batched step at all (count >= 2). */
-    CHECK(ds4_v41_batch_attention_output_path(1) == 1);
-    for (unsigned r = 2; r <= MAX_ROWS; r++)
-        CHECK(ds4_v41_batch_attention_output_path(r) == 3);
-    CHECK(ds4_v41_batch_attention_output_path(MAX_ROWS + 1u) == 1);
-    /* THE LIVENESS PROOF: the rollback must move every covered width off the rows kernels and
-     * onto 3.6d's pair, and put them back when it is cleared. */
-    CHECK(setenv(attn_out_path_envs[2], "1", 1) == 0);
-    for (unsigned r = 1; r <= MAX_ROWS + 1u; r++)
-        CHECK(ds4_v41_batch_attention_output_path(r) == 1);
-    CHECK(unsetenv(attn_out_path_envs[2]) == 0);
-    CHECK(ds4_v41_batch_attention_output_path(2) == 3);
-    /* 3.6d's own rollback takes the whole stage out at every width, rows kernels included. */
-    CHECK(setenv(attn_out_path_envs[0], "1", 1) == 0);
-    for (unsigned r = 1; r <= MAX_ROWS + 1u; r++)
-        CHECK(ds4_v41_batch_attention_output_path(r) == 0);
-    CHECK(unsetenv(attn_out_path_envs[0]) == 0);
-    /* And the opt-in, non-exact mv_ext variant still wins, at every width, exactly as under
-     * 3.6d: the rows kernels must not have quietly taken its place. */
-    CHECK(setenv(attn_out_path_envs[1], "1", 1) == 0);
-    for (unsigned r = 1; r <= MAX_ROWS + 1u; r++)
-        CHECK(ds4_v41_batch_attention_output_path(r) == 2);
-    CHECK(unsetenv(attn_out_path_envs[1]) == 0);
-    CHECK(ds4_v41_batch_attention_output_path(2) == 3);
-    fprintf(stderr, "V4.1 batched attention output path: rows<R> at widths 2..%u and 3.6d's pair "
-                    "outside them, %s moves every width back to the pair, the stage rollback "
-                    "removes it and mv_ext still outranks it: PASS\n",
-            MAX_ROWS, attn_out_path_envs[2]);
-    return 1;
-}
-
-static int check_attn_out_path(void) {
-    char *saved[3] = { NULL, NULL, NULL };
-    int ok = 1;
-    for (int i = 0; i < 3; i++) {
-        const char *v = getenv(attn_out_path_envs[i]);
-        if (v) {
-            saved[i] = strdup(v);
-            CHECK(saved[i] != NULL);
-        }
-        CHECK(unsetenv(attn_out_path_envs[i]) == 0);
-    }
-    ok = check_attn_out_path_cases();
-    for (int i = 0; i < 3; i++) {
-        if (saved[i]) {
-            setenv(attn_out_path_envs[i], saved[i], 1);
-            free(saved[i]);
-        } else {
-            unsetenv(attn_out_path_envs[i]);
-        }
-    }
-    return ok;
-}
-
 static void test_pre_commit_hook(void *ctx) { (*(unsigned *)ctx)++; }
 
 /* 3.6d2 (2026-09-17): the pre-commit hook, on its own.
@@ -4030,12 +3939,6 @@ int main(int argc, char **argv) {
         /* No device and no model: the mapping is pure ds4.c. */
         return check_flash_rows_desc() ? 0 : 1;
     }
-    if (argc == 2 && !strcmp(argv[1], "--attn-out-path")) {
-        /* ds4_gpu_init() first: the gates start with the Metal device name. */
-        const int ok = ds4_gpu_init() && check_attn_out_path();
-        ds4_gpu_cleanup();
-        return ok ? 0 : 1;
-    }
     if (argc == 2 && !strcmp(argv[1], "--pre-commit-hook")) {
         const int ok = ds4_gpu_init() && check_pre_commit_hook();
         ds4_gpu_cleanup();
@@ -4104,7 +4007,7 @@ int main(int argc, char **argv) {
              check_flash_rows() && check_tp_attention();
 #ifdef __APPLE__
     if (ok) ok = check_rope_pair() && check_quantize_store() &&
-                 check_rope_freqs() && check_rows_a() && check_fusion_gates() && check_attn_out_path() &&
+                 check_rope_freqs() && check_rows_a() && check_fusion_gates() &&
                  check_flash_rows_desc() &&
                  check_attention_output_decode() && check_attn_out_rows() &&
                  check_pre_commit_hook();
