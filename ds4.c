@@ -40181,6 +40181,34 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
     return true;
 }
 
+/* The two DSpark env readers a build without the V4.1 GPU graph still needs.
+ *
+ * Every other 3.7 switch is read from inside the DS4_HAS_DEEPSEEK41_GPU block
+ * below, and each of its call sites outside that block is guarded the way
+ * ds4_engine_v41_dspark_draft_ready() and ds4_engine_v41_dspark_verify_ready()
+ * are.  ds41_dspark_max_drafts() is the exception: it is spelled in the
+ * --dspark banner ds4_engine_open() prints, which is ordinary front-end code
+ * that a -DDS4_NO_GPU build compiles like any other, so the helper -- and the
+ * uint parser it calls -- live out here where that build can see them.
+ * Neither touches an accelerator; both are pure getenv().  The banner itself
+ * stays unreachable without the graph: with DS4_HAS_DEEPSEEK41_GPU undefined
+ * ds4_engine_v41_dspark_verify_ready() returns false, so the branch above it
+ * ("decoding serially") is the one that fires. */
+static uint32_t ds41_dspark_env_u32(const char *name, uint32_t fallback) {
+    const char *value = getenv(name);
+    if (!value || !*value) return fallback;
+    char *end = NULL;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (!end || *end || parsed > UINT32_MAX) return fallback;
+    return (uint32_t)parsed;
+}
+
+/* How many of the block's proposals to verify.  The confidence rule of spec
+ * 1.6.1 trims first; this is the ceiling the plan's k sweep moves. */
+static uint32_t ds41_dspark_max_drafts(void) {
+    return ds41_dspark_env_u32("DS4_V41_DSPARK_MAX_DRAFTS", 3u);
+}
+
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 /* =========================================================================
  * DeepSeek V4.1 GPU Graph.
@@ -40812,15 +40840,6 @@ static bool ds41_dspark_enabled(void) {
     return getenv("DS4_DISABLE_V41_DSPARK_DRAFT") == NULL;
 }
 
-static uint32_t ds41_dspark_env_u32(const char *name, uint32_t fallback) {
-    const char *value = getenv(name);
-    if (!value || !*value) return fallback;
-    char *end = NULL;
-    const unsigned long parsed = strtoul(value, &end, 10);
-    if (!end || *end || parsed > UINT32_MAX) return fallback;
-    return (uint32_t)parsed;
-}
-
 static bool ds41_dspark_shadow_enabled(void) {
     return getenv("DS4_V41_DSPARK_SHADOW") != NULL;
 }
@@ -40892,12 +40911,6 @@ static bool ds41_dspark_verify_enabled(void) {
  * per-row attention. */
 static bool ds41_dspark_verify_batch_enabled(void) {
     return getenv("DS4_DISABLE_V41_DSPARK_VERIFY_BATCH") == NULL;
-}
-
-/* How many of the block's proposals to verify.  The confidence rule of spec
- * 1.6.1 trims first; this is the ceiling the plan's k sweep moves. */
-static uint32_t ds41_dspark_max_drafts(void) {
-    return ds41_dspark_env_u32("DS4_V41_DSPARK_MAX_DRAFTS", 3u);
 }
 
 static bool ds41_dspark_seed_enabled(void) {
