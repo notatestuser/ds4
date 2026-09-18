@@ -3358,6 +3358,423 @@ static int check_v41_parallel_ffn_slots(void) {
 }
 #endif
 
+
+/*
+ * 3.7 stage 4: the capture, and the GPU shapes the V4.1 DSpark draft graph
+ * introduces that no other V4.1 path exercises.
+ *
+ *  0. ds41_dspark_capture() itself, through ds4_v41_dspark_capture_selftest()
+ *     (ds4.c): the HC mean's weights, the slot ordering and the target-layer
+ *     mask over a synthetic residual.
+ *  1. Non-causal attention of DRAFT query rows over a partly filled
+ *     (WINDOW + DRAFT)-row raw ring with attention sinks: every draft row sees
+ *     every live window row and every draft row, itself and its successors
+ *     included (model.py:1021, get_dspark_topk_idxs).  The oracle is the same
+ *     FP64 softmax check_tp_attention uses, over BF16 inputs so the kernel's
+ *     F16 key staging is lossless.
+ *  2. Router selection at the DRAFT's expert geometry -- 128 experts top-3,
+ *     not the target model's 384/6: sqrt(softplus(logit)) scores, the bias
+ *     steering selection only, weights renormalised over the raw scores and
+ *     scaled by 1.5.
+ *
+ * Apple-only, like every other check in this file that reaches into ds4.c.
+ * ds4_v41_dspark_draft_gates(), ds4_v41_dspark_capture_selftest() and
+ * ds4_v41_dspark_dump_slot() are defined in ds4.c, and tests/test_deepseek41_cuda
+ * builds this same source without ds4.o on its link line (Makefile:474), so
+ * outside this guard that target would stop at three undefined symbols.
+ * check_fusion_gates() and check_attention_output_decode() sit behind the same
+ * guard for the same reason.
+ */
+#ifdef __APPLE__
+static int check_dspark_gates(void) {
+    static const char *const names[] = {"DS4_V41_DSPARK_SHADOW",
+        "DS4_V41_DSPARK_DUMP_DIR", "DS4_V41_DSPARK_TIMING",
+        "DS4_V41_DSPARK_DUMP_CALLS", "DS4_DISABLE_V41_DSPARK_DRAFT"};
+    for (unsigned i = 0; i < sizeof(names) / sizeof(*names); i++) unsetenv(names[i]);
+    CHECK(ds4_v41_dspark_draft_gates() == (1 | (4 << 4)));
+    setenv("DS4_DISABLE_V41_DSPARK_DRAFT", "1", 1);
+    CHECK(ds4_v41_dspark_draft_gates() == (4 << 4));
+    unsetenv("DS4_DISABLE_V41_DSPARK_DRAFT");
+    setenv("DS4_V41_DSPARK_SHADOW", "1", 1);
+    CHECK(ds4_v41_dspark_draft_gates() == (1 | 2 | (4 << 4)));
+    /* An empty directory name is "not dumping" to the allocator, so bit 2
+     * must stay clear for it; the oracle and the consumer share one helper
+     * precisely so that this cannot drift. */
+    setenv("DS4_V41_DSPARK_DUMP_DIR", "", 1);
+    CHECK(ds4_v41_dspark_draft_gates() == (1 | 2 | (4 << 4)));
+    setenv("DS4_V41_DSPARK_DUMP_DIR", "/tmp", 1);
+    setenv("DS4_V41_DSPARK_TIMING", "1", 1);
+    setenv("DS4_V41_DSPARK_DUMP_CALLS", "9", 1);
+    CHECK(ds4_v41_dspark_draft_gates() == (1 | 2 | 4 | 8 | (9 << 4)));
+    setenv("DS4_V41_DSPARK_DUMP_CALLS", "not-a-number", 1);
+    CHECK(ds4_v41_dspark_draft_gates() == (1 | 2 | 4 | 8 | (4 << 4)));
+    for (unsigned i = 0; i < sizeof(names) / sizeof(*names); i++) unsetenv(names[i]);
+    CHECK(ds4_v41_dspark_draft_gates() == (1 | (4 << 4)));
+    fprintf(stderr, "DSpark draft switches (shadow/dump/timing/rollback): PASS\n");
+    return 1;
+}
+
+/*
+ * 3.7 stage 4 (fix): the three HC primitives scratchpad/dspark_ref.py
+ * re-implements by hand, pinned against a double-precision host oracle.
+ *
+ *   hc_split_sinkhorn   (metal/dsv4_hc.metal:113, kernel.py hc_split_sinkhorn)
+ *   hc_pre              (kernel_dsv4_hc_weighted_sum_bf16, model.py:957)
+ *   hc_post             (kernel_dsv4_hc_expand4_bf16,      model.py:962)
+ *
+ * The NumPy gate stands or falls on these: the Sinkhorn's normalisation order
+ * and where its `+ eps` lands, and above all hc_post's comb index order --
+ * the kernel's strides read that matrix transposed, and a reference that got
+ * it the other way round still produces plausible-looking hidden states.  The
+ * oracle runs the kernels' own arithmetic in double over the GPU's OWN split,
+ * so hc_pre/hc_post are compared to within one BF16 ulp of the unrounded
+ * value rather than to a second f32 evaluation.
+ */
+static int check_dspark_hc(void) {
+    enum { HC = 4, MIX = 2 * HC + HC * HC, DIM = 640, ROWS = 5, ITERS = 20 };
+    const float eps = 1.0e-6f;
+    const size_t page = (size_t)getpagesize();
+    float *params = NULL;
+    CHECK(page >= (8 + MIX) * sizeof(float));
+    CHECK(posix_memalign((void **)&params, page, page) == 0);
+    memset(params, 0, page);
+    float *const scale = params;             /* 3 floats at offset 0    */
+    float *const base = params + 8;          /* MIX floats at offset 32 */
+    for (int i = 0; i < 3; i++) scale[i] = 0.5f + 0.25f * i;
+    for (int i = 0; i < MIX; i++) base[i] = random_value() / 4;
+    CHECK(ds4_gpu_set_model_map(params, page));
+
+    static float mix[ROWS * MIX], split[ROWS * MIX];
+    static float res[ROWS * HC * DIM], block[ROWS * DIM];
+    static float pre_got[ROWS * DIM], post_got[ROWS * HC * DIM];
+    for (int i = 0; i < ROWS * MIX; i++) mix[i] = random_value();
+    for (int i = 0; i < ROWS * HC * DIM; i++) res[i] = bf16(random_value());
+    for (int i = 0; i < ROWS * DIM; i++) block[i] = bf16(random_value());
+
+    ds4_gpu_tensor *mix_t = upload(mix, sizeof(mix));
+    ds4_gpu_tensor *split_t = upload(NULL, sizeof(split));
+    ds4_gpu_tensor *res_t = upload(res, sizeof(res));
+    ds4_gpu_tensor *block_t = upload(block, sizeof(block));
+    ds4_gpu_tensor *pre_t = upload(NULL, sizeof(pre_got));
+    ds4_gpu_tensor *post_t = upload(NULL, sizeof(post_got));
+    CHECK(mix_t && split_t && res_t && block_t && pre_t && post_t);
+    CHECK(ds4_gpu_hc_split_sinkhorn_tensor(split_t, mix_t, params, page,
+              (uint64_t)((char *)scale - (char *)params),
+              (uint64_t)((char *)base - (char *)params), HC, ITERS, eps));
+#ifdef __APPLE__
+    /* The draft path takes the fused-rounding pair on this device and the
+     * producer + rounding pair anywhere else; both are compared against the
+     * same unrounded double, to within one BF16 ulp. */
+    CHECK(ds4_gpu_hc_weighted_sum_split_bf16_tensor(pre_t, res_t, split_t, DIM, HC));
+    CHECK(ds4_gpu_hc_expand_split_bf16_tensor(post_t, block_t, res_t, split_t, DIM, HC));
+#else
+    CHECK(ds4_gpu_hc_weighted_sum_split_tensor(pre_t, res_t, split_t, DIM, HC));
+    CHECK(ds4_gpu_hc_expand_split_tensor(post_t, block_t, res_t, split_t, DIM, HC));
+#endif
+    CHECK(ds4_gpu_synchronize());
+    CHECK(ds4_gpu_tensor_read(split_t, 0, split, sizeof(split)));
+    CHECK(ds4_gpu_tensor_read(pre_t, 0, pre_got, sizeof(pre_got)));
+    CHECK(ds4_gpu_tensor_read(post_t, 0, post_got, sizeof(post_got)));
+
+    double split_err = 0, pre_ulps = 0, post_ulps = 0;
+    for (int r = 0; r < ROWS; r++) {
+        const float *m = mix + r * MIX;
+        const float *sp = split + r * MIX;
+        double want[MIX], c[HC][HC];
+        for (int j = 0; j < HC; j++) {
+            want[j] = 1.0 / (1.0 + exp(-((double)m[j] * scale[0] + base[j]))) + eps;
+            want[HC + j] = 2.0 / (1.0 + exp(-((double)m[HC + j] * scale[1] +
+                                              base[HC + j])));
+        }
+        for (int i = 0; i < HC; i++) {
+            double row_max = -INFINITY, sum = 0;
+            for (int j = 0; j < HC; j++) {
+                c[i][j] = (double)m[2 * HC + i * HC + j] * scale[2] +
+                          base[2 * HC + i * HC + j];
+                if (c[i][j] > row_max) row_max = c[i][j];
+            }
+            for (int j = 0; j < HC; j++) { c[i][j] = exp(c[i][j] - row_max); sum += c[i][j]; }
+            for (int j = 0; j < HC; j++) c[i][j] = c[i][j] / sum + eps;
+        }
+        /* iteration 0 is the softmax above, and normalises columns only */
+        for (int it = 0; it < ITERS; it++) {
+            if (it) {
+                for (int i = 0; i < HC; i++) {
+                    double sum = eps;
+                    for (int j = 0; j < HC; j++) sum += c[i][j];
+                    for (int j = 0; j < HC; j++) c[i][j] /= sum;
+                }
+            }
+            for (int j = 0; j < HC; j++) {
+                double sum = eps;
+                for (int i = 0; i < HC; i++) sum += c[i][j];
+                for (int i = 0; i < HC; i++) c[i][j] /= sum;
+            }
+        }
+        for (int i = 0; i < HC; i++)
+            for (int j = 0; j < HC; j++) want[2 * HC + i * HC + j] = c[i][j];
+        for (int i = 0; i < MIX; i++) {
+            const double err = fabs((double)sp[i] - want[i]) / (1.0 + fabs(want[i]));
+            if (err > split_err) split_err = err;
+            CHECK(err <= 1e-5);
+        }
+        /* hc_pre: the pre weights are the split's first HC entries. */
+        for (int d = 0; d < DIM; d++) {
+            double acc = 0;
+            for (int h = 0; h < HC; h++)
+                acc += (double)res[((size_t)r * HC + h) * DIM + d] * sp[h];
+            const double ulp = ldexp(fabs(acc), -8) + 1e-30;
+            const double err = fabs((double)pre_got[(size_t)r * DIM + d] - acc);
+            if (err / ulp > pre_ulps) pre_ulps = err / ulp;
+            CHECK(err <= ulp);
+        }
+        /* hc_post: out[j] = post[j]*block + sum_i comb[i][j]*residual[i] --
+         * comb summed over its FIRST index, which is what model.py:962 does
+         * and what the kernel's comb strides express. */
+        for (int j = 0; j < HC; j++) {
+            for (int d = 0; d < DIM; d++) {
+                double acc = (double)sp[HC + j] * block[(size_t)r * DIM + d];
+                for (int i = 0; i < HC; i++)
+                    acc += (double)sp[2 * HC + i * HC + j] *
+                           res[((size_t)r * HC + i) * DIM + d];
+                const double ulp = ldexp(fabs(acc), -8) + 1e-30;
+                const double err =
+                    fabs((double)post_got[((size_t)r * HC + j) * DIM + d] - acc);
+                if (err / ulp > post_ulps) post_ulps = err / ulp;
+                CHECK(err <= ulp);
+            }
+        }
+    }
+    ds4_gpu_tensor_free(post_t); ds4_gpu_tensor_free(pre_t);
+    ds4_gpu_tensor_free(block_t); ds4_gpu_tensor_free(res_t);
+    ds4_gpu_tensor_free(split_t); ds4_gpu_tensor_free(mix_t);
+    ds4_gpu_cleanup();
+    free(params);
+    CHECK(ds4_gpu_init());
+    fprintf(stderr, "DSpark HC: %d-iteration Sinkhorn split (max rel %g), hc_pre and "
+            "hc_post vs a double oracle (max %g / %g BF16 ulp): PASS\n",
+            ITERS, split_err, pre_ulps, post_ulps);
+    return 1;
+}
+
+/* The per-stage dump layout the NumPy gate parses, straight out of ds4.c's
+ * own table (ds4_v41_dspark_dump_slot): names, order, and element counts that
+ * scale with the draft row count.  dspark_ref.py reads the same six names in
+ * the same order; a rename on either side fails here rather than silently
+ * turning the gate's sub-block checks into skips. */
+static int check_dspark_dump_layout(void) {
+    static const char *const want[] = { "attn_split", "ffn_split", "attn_hc",
+                                        "attn_o", "ffn_x", "moe" };
+    const unsigned slots = (unsigned)(sizeof(want) / sizeof(*want));
+    uint64_t one[6];
+    for (unsigned i = 0; i < slots; i++) {
+        char name[64], expect[64];
+        const uint64_t n = ds4_v41_dspark_dump_slot(i, 2u, 5u, name, sizeof(name));
+        CHECK(n > 0);
+        CHECK(snprintf(expect, sizeof(expect), "stage2_%s.f32", want[i]) > 0);
+        CHECK(!strcmp(name, expect));
+        one[i] = n;
+        /* linear in the row count, and the count is asked for without a name */
+        CHECK(ds4_v41_dspark_dump_slot(i, 2u, 10u, NULL, 0) == 2u * n);
+        CHECK(ds4_v41_dspark_dump_slot(i, 2u, 0u, name, sizeof(name)) == 0);
+    }
+    CHECK(one[0] == one[1]);                 /* the two Sinkhorn splits  */
+    CHECK(one[4] == one[5]);                 /* MoE input and MoE output */
+    CHECK(one[2] >= 2u * one[4] && one[2] % one[4] == 0);   /* HC copies  */
+    CHECK(ds4_v41_dspark_dump_slot(slots, 0u, 5u, NULL, 0) == 0);
+    {
+        char tiny[8];
+        CHECK(ds4_v41_dspark_dump_slot(0, 0u, 5u, tiny, sizeof(tiny)) == 0);
+    }
+    fprintf(stderr, "DSpark dump layout: %u per-stage slots, names and sizes: PASS\n",
+            slots);
+    return 1;
+}
+
+static int check_dspark_draft(void) {
+    enum { HEADS = 64, DIM = 512, DRAFT = 5, WINDOW = 128, CAP = WINDOW + DRAFT };
+    enum { EXPERTS = 128, USED = 3, N_WIN = 37 };
+    CHECK(check_dspark_gates());
+    CHECK(check_dspark_dump_layout());
+    CHECK(check_dspark_hc());
+    /* 0. The capture, driven directly inside ds4.c over a synthetic residual
+     *    whose HC copies differ: the only check of scope item 1 that does not
+     *    need a model, and the only one that is not downstream of ds4's own
+     *    main_hidden. */
+    CHECK(ds4_v41_dspark_capture_selftest());
+    fprintf(stderr, "DSpark capture: HC mean, raw slots, slot order, "
+                    "target-layer mask: PASS\n");
+    const size_t page = (size_t)getpagesize();
+    float *params = NULL;
+    CHECK(page >= 1024);
+    CHECK(posix_memalign((void **)&params, page, page) == 0);
+    memset(params, 0, page);
+    float *const sinks = params;            /* offset 0   : HEADS floats */
+    float *const bias = params + 128;       /* offset 512 : EXPERTS floats */
+    for (int i = 0; i < HEADS; i++) sinks[i] = bf16(random_value());
+    for (int i = 0; i < EXPERTS; i++) bias[i] = (i % 7) * 0.125f;
+    CHECK(ds4_gpu_set_model_map(params, page));
+
+    float *q = malloc((size_t)DRAFT * HEADS * DIM * sizeof(float));
+    float *kv = malloc((size_t)CAP * DIM * sizeof(float));
+    float *out = malloc((size_t)DRAFT * HEADS * DIM * sizeof(float));
+    CHECK(q && kv && out);
+    for (size_t i = 0; i < (size_t)DRAFT * HEADS * DIM; i++) q[i] = bf16(random_value() / 4);
+    for (size_t i = 0; i < (size_t)CAP * DIM; i++) kv[i] = bf16(random_value() / 4);
+
+    ds4_gpu_tensor *qt = upload(q, (size_t)DRAFT * HEADS * DIM * sizeof(float));
+    ds4_gpu_tensor *kvt = upload(kv, (size_t)CAP * DIM * sizeof(float));
+    ds4_gpu_tensor *ot = upload(NULL, (size_t)DRAFT * HEADS * DIM * sizeof(float));
+    CHECK(qt && kvt && ot);
+    /* n_win live window rows at ring index 0 followed by the DRAFT rows the
+     * block just wrote: exactly the key set ds41_dspark_block_forward builds. */
+    CHECK(ds4_gpu_attention_noncausal_raw_batch_heads_tensor(ot, params, page, 0,
+              qt, kvt, DRAFT, N_WIN + DRAFT, CAP, 0, HEADS, DIM));
+    CHECK(ds4_gpu_synchronize());
+    CHECK(ds4_gpu_tensor_read(ot, 0, out, (size_t)DRAFT * HEADS * DIM * sizeof(float)));
+
+    double max_err = 0;
+    for (int r = 0; r < DRAFT; r++) {
+        for (int h = 0; h < HEADS; h += 7) {
+            const float *query = q + ((size_t)r * HEADS + h) * DIM;
+            double logits[N_WIN + DRAFT + 1];
+            double top = -INFINITY;
+            for (int k = 0; k < N_WIN + DRAFT; k++) {
+                const float *key = kv + (size_t)k * DIM;
+                double dot = 0;
+                for (int d = 0; d < DIM; d++) dot += (double)query[d] * key[d];
+                logits[k] = dot / sqrt(512.0);
+                if (logits[k] > top) top = logits[k];
+            }
+            logits[N_WIN + DRAFT] = sinks[h];
+            if (logits[N_WIN + DRAFT] > top) top = logits[N_WIN + DRAFT];
+            double den = 0;
+            double weight[N_WIN + DRAFT + 1];
+            for (int k = 0; k <= N_WIN + DRAFT; k++) {
+                weight[k] = exp(logits[k] - top);
+                den += weight[k];
+            }
+            for (int col = (r * 71 + h * 19) % DIM; col < DIM; col += 173) {
+                double num = 0;
+                for (int k = 0; k < N_WIN + DRAFT; k++)
+                    num += weight[k] * kv[(size_t)k * DIM + col];
+                const double want = num / den;
+                const double err = fabs((double)out[((size_t)r * HEADS + h) * DIM + col] - want);
+                if (err > max_err) max_err = err;
+                CHECK(err < 1e-4 * (1 + fabs(want)));
+            }
+        }
+    }
+    ds4_gpu_tensor_free(ot); ds4_gpu_tensor_free(kvt); ds4_gpu_tensor_free(qt);
+    free(out); free(kv); free(q);
+
+    float logits[EXPERTS];
+    for (int i = 0; i < EXPERTS; i++) logits[i] = random_value() * 8;
+    ds4_gpu_tensor *lt = upload(logits, sizeof(logits));
+    ds4_gpu_tensor *st = upload(NULL, USED * sizeof(int32_t));
+    ds4_gpu_tensor *wt = upload(NULL, USED * sizeof(float));
+    ds4_gpu_tensor *pt = upload(NULL, EXPERTS * sizeof(float));
+    CHECK(lt && st && wt && pt);
+    CHECK(ds4_gpu_router_select_tensor(st, wt, pt, params, page,
+                                       (uint64_t)(bias - params) * sizeof(float),
+                                       0, 0, 0, EXPERTS, USED, 1.5f, 0, 0,
+                                       true, false, lt));
+    CHECK(ds4_gpu_synchronize());
+    const int32_t *selected = ds4_gpu_tensor_contents(st);
+    const float *weights = ds4_gpu_tensor_contents(wt);
+    const float *probs = ds4_gpu_tensor_contents(pt);
+    CHECK(selected && weights && probs);
+    double ref[EXPERTS];
+    int best[USED];
+    for (int k = 0; k < USED; k++) best[k] = -1;
+    for (int e = 0; e < EXPERTS; e++) {
+        const float v = logits[e];
+        ref[e] = sqrtf(v > 20 ? v : logf(1.0f + expf(v)));
+        CHECK(fabs(probs[e] - ref[e]) <= 3e-6 * (1 + ref[e]));
+        const double score = ref[e] + bias[e];
+        for (int k = 0; k < USED; k++) {
+            if (best[k] < 0 || score > ref[best[k]] + bias[best[k]]) {
+                for (int j = USED - 1; j > k; j--) best[j] = best[j - 1];
+                best[k] = e;
+                break;
+            }
+        }
+    }
+    double sum = 0;
+    for (int k = 0; k < USED; k++) {
+        const int id = selected[k];
+        CHECK(id >= 0 && id < EXPERTS);
+        for (int j = 0; j < k; j++) CHECK(id != selected[j]);
+        /* Bitonic selection makes no promise about ties, only about scores. */
+        CHECK(fabs((ref[id] + bias[id]) - (ref[best[k]] + bias[best[k]])) < 3e-6);
+        sum += ref[id];
+    }
+    for (int k = 0; k < USED; k++)
+        CHECK(fabs(weights[k] - 1.5 * ref[selected[k]] / fmax(sum, 0x1p-14)) < 3e-6);
+    ds4_gpu_tensor_free(pt); ds4_gpu_tensor_free(wt);
+    ds4_gpu_tensor_free(st); ds4_gpu_tensor_free(lt);
+
+    double rope_err = 0;
+#ifdef __APPLE__
+    /* 3. The draft's RoPE: DRAFT rows at *advancing* positions, adjacent pairs
+     * of the last 64 dims, BF16 at the store.  scratchpad/dspark_ref.py rebuilds
+     * exactly this in NumPy, and a digest cannot pin it -- Metal's precise::cos
+     * and the host libm's cosf are not required to agree to the last ulp -- so
+     * pin it here against a host reference with a two-BF16-ulp tolerance, which
+     * a wrong frequency, a wrong position or a swapped pair blows through by
+     * orders of magnitude. */
+    {
+        enum { RPOS = 2048 };
+        const size_t n = (size_t)DRAFT * HEADS * DIM;
+        float *rin = malloc(n * sizeof(float));
+        float *rgot = malloc(n * sizeof(float));
+        CHECK(rin && rgot);
+        for (size_t i = 0; i < n; i++) rin[i] = bf16(random_value() / 4);
+        ds4_gpu_tensor *rt = upload(rin, n * sizeof(float));
+        CHECK(rt);
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_rope(rt, DIM, HEADS, DRAFT, RPOS, false, false));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(ds4_gpu_tensor_read(rt, 0, rgot, n * sizeof(float)));
+        const float *fr = ds4_gpu_dsv41_rope_frequencies(false);
+        CHECK(fr);
+        for (int r = 0; r < DRAFT; r++) {
+            for (int h = 0; h < HEADS; h++) {
+                for (int lane = 0; lane < 32; lane++) {
+                    const float theta = (float)(RPOS + r) * fr[lane];
+                    const float c = cosf(theta), sn = sinf(theta);
+                    const size_t i = ((size_t)r * HEADS + h) * DIM + DIM - 64 + 2 * lane;
+                    const float re = rin[i], im = rin[i + 1];
+                    const double scale = fabs(re) + fabs(im) + 1e-12;
+                    const double e0 = fabs((double)rgot[i] - bf16(re * c - im * sn));
+                    const double e1 = fabs((double)rgot[i + 1] - bf16(re * sn + im * c));
+                    if (e0 / scale > rope_err) rope_err = e0 / scale;
+                    if (e1 / scale > rope_err) rope_err = e1 / scale;
+                    CHECK(e0 <= 0.02 * scale && e1 <= 0.02 * scale);
+                }
+            }
+        }
+        /* Every dimension the rotation does not own must come back untouched. */
+        for (int r = 0; r < DRAFT; r++)
+            for (int h = 0; h < HEADS; h++)
+                CHECK(!memcmp(rin + ((size_t)r * HEADS + h) * DIM,
+                              rgot + ((size_t)r * HEADS + h) * DIM,
+                              (DIM - 64) * sizeof(float)));
+        ds4_gpu_tensor_free(rt);
+        free(rgot); free(rin);
+    }
+#endif
+
+    ds4_gpu_cleanup();
+    free(params);
+    CHECK(ds4_gpu_init());
+    fprintf(stderr, "DSpark draft shapes: %d-row non-causal attention over %d+%d keys "
+            "(max err %g), %d/%d routing, %d-row advancing RoPE (max rel %g): PASS\n",
+            DRAFT, N_WIN, DRAFT, max_err, EXPERTS, USED, DRAFT, rope_err);
+    return 1;
+}
+#endif /* __APPLE__ */
+
 int main(int argc, char **argv) {
 #ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--fused-bf16")) {
@@ -3503,10 +3920,20 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+#ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--dspark-draft")) {
+        const int ok = ds4_gpu_init() && check_dspark_draft();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+#endif
     if (argc != 1) return 2;
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
+#ifdef __APPLE__
+             check_dspark_draft() &&
+#endif
              check_flash_rows() && check_tp_attention();
 #ifdef __APPLE__
     if (ok) ok = check_rope_pair() && check_quantize_store() &&

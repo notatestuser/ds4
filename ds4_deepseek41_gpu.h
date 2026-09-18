@@ -161,6 +161,34 @@ int ds4_v41_batch_attention_flash_desc(unsigned rows, const unsigned *positions,
                                        unsigned ratio, unsigned row,
                                        ds4_v41_flash_desc_probe *out);
 #endif
+/* The three oracles below are defined in ds4.c, so they exist only where the
+ * test binary links ds4.o.  tests/test_deepseek41_metal does (Makefile:235,
+ * $(CORE_OBJS)); tests/test_deepseek41_cuda compiles this same header and the
+ * same test source but links ds4_cuda.o, ds4_image.o and $(MMQ_OBJS) only
+ * (Makefile:474).  Declaring them there would invite exactly the link failure
+ * ds4_v41_decode_fusion_gates avoids by living inside this guard.
+ */
+#ifdef __APPLE__
+/* 3.7 stage 4 test oracle: the DS4_V41_DSPARK_* switch state ds4.c actually
+ * read.  Bit 0 draft allocated (DS4_DISABLE_V41_DSPARK_DRAFT clears it),
+ * 1 DS4_V41_DSPARK_SHADOW, 2 a non-empty DS4_V41_DSPARK_DUMP_DIR,
+ * 3 DS4_V41_DSPARK_TIMING; bits 4+ hold DS4_V41_DSPARK_DUMP_CALLS.  Each name
+ * is spelled once in ds4.c, in the helper both this and the real consumer
+ * call, so a typo cannot pass here and fail there. */
+int ds4_v41_dspark_draft_gates(void);
+
+/* 3.7 stage 4 test oracle: drives ds41_dspark_capture() over a synthetic
+ * residual and checks the HC mean, the slot ordering and the target-layer
+ * mask without a model.  Non-zero on success. */
+int ds4_v41_dspark_capture_selftest(void);
+
+/* 3.7 stage 4 test oracle AND the writer's own table: the per-stage dump
+ * layout scratchpad/dspark_ref.py parses.  Fills `name` with the file suffix
+ * for slot `index` of `stage` and returns its element count for `rows` draft
+ * rows, or 0 past the last slot.  `name` may be NULL to ask only the count. */
+uint64_t ds4_v41_dspark_dump_slot(unsigned index, uint32_t stage, uint32_t rows,
+                                  char *name, uint64_t cap);
+#endif /* __APPLE__ */
 int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *kv,
                            const ds4_gpu_tensor *q_weight,

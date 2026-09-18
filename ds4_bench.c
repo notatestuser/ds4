@@ -991,6 +991,13 @@ int main(int argc, char **argv) {
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
+            /* Ids first: the decoded text below carries embedded newlines, so
+             * it cannot be compared a line at a time between two runs. */
+            fprintf(stderr, "ds4-bench: gen[ctx=%d] token ids (%d):", frontier,
+                    gen_token_count);
+            for (int i = 0; i < gen_token_count; i++)
+                fprintf(stderr, " %d", gen_token_buf[i]);
+            fprintf(stderr, "\n");
             fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
             for (int i = 0; i < gen_token_count; i++) {
                 size_t tlen = 0;

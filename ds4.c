@@ -40287,6 +40287,76 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
 
+/* =========================================================================
+ * 3.7 stage 4: V4.1 DSpark draft state.
+ * =========================================================================
+ * V4's DSpark lives on ds4_gpu_graph and has no counterpart here (spec 5.1),
+ * so the draft gets its own object, allocated only when the engine opened a
+ * DSpark support file and --dspark was given.  A graph without one carries a
+ * NULL pointer and every decode branch that mentions it is a NULL test.
+ *
+ * The block geometry is the SUPPORT FILE's, never the target model's: 128
+ * routed experts top-3 against the target's 384/6 (spec 5.2, model.py:142).
+ */
+#define DS41_DSPARK_WINDOW 128u
+
+typedef struct ds41_dspark {
+    uint32_t stages, block_size, rows;
+    uint32_t markov_rank, noise_token_id;
+    uint32_t n_expert, n_expert_used;
+    uint32_t target_layer_count;
+    uint32_t target_layers[DS4_DSPARK_MAX_TARGET_LAYERS];
+    uint32_t capture_mask, capture_pos;
+    bool capture_valid;
+    /* Rows ever written to each stage's private window; the three stages run
+     * the identical schedule, so one counter covers all of them. */
+    uint32_t seeded;
+    uint32_t calls, dumped, dump_limit;
+    char *dump_dir;
+    bool timing;
+    double last_ms, total_ms;
+    /* Host-side working set: the Markov chain is five sequential argmaxes, so
+     * the base logits and each slot's bias come back to the CPU anyway. */
+    float *host_logits;      /* rows * DS4_N_VOCAB */
+    float *host_bias;        /* DS4_N_VOCAB */
+    float *host_embed;       /* rows * markov_rank */
+    float *host_head_x;      /* rows * DS4_N_EMBD */
+    float *host_conf;        /* rows */
+    int32_t draft_ids[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    ds4_gpu_tensor *hc_mean;             /* DS4_N_HC floats, all 1/HC */
+    ds4_gpu_tensor *target_hidden;       /* target_layer_count * DS4_N_EMBD */
+    ds4_gpu_tensor *target_slot[DS4_DSPARK_MAX_TARGET_LAYERS];
+    /* Dump-only: the untouched HC residual at each capture point, so the
+     * NumPy gate can take the mean itself instead of trusting ds4's.  Each
+     * copy is lifted out with a one-hot weight row through the same
+     * hc_weighted_sum entry point the mean uses -- exact (1*x + 0*x + ...),
+     * and the only call there that is safe whether or not the layer loop
+     * happens to have a command batch open. */
+    ds4_gpu_tensor *target_raw;          /* count * DS4_N_HC * DS4_N_EMBD */
+    ds4_gpu_tensor *raw_slot[DS4_DSPARK_MAX_TARGET_LAYERS * DS4_MAX_HC];
+    ds4_gpu_tensor *hc_pick_all;         /* DS4_N_HC rows of DS4_N_HC */
+    ds4_gpu_tensor *hc_pick[DS4_MAX_HC];
+    ds4_gpu_tensor *identity_pre;        /* rows * DS4_N_HC one-hot on copy 0 */
+    ds4_gpu_tensor *main_x, *main_kv;
+    ds4_gpu_tensor *window[DS4_DSPARK_MAX_STAGES];
+    ds4_gpu_tensor *window_main[DS4_DSPARK_MAX_STAGES];   /* one-row slot view */
+    ds4_gpu_tensor *window_draft[DS4_DSPARK_MAX_STAGES];  /* draft-row view */
+    ds4_gpu_tensor *in_hc, *after_attn_hc, *out_hc, *flat_norm;
+    ds4_gpu_tensor *mix, *attn_split, *ffn_split;
+    ds4_gpu_tensor *x, *norm, *block, *qr, *q, *kv, *heads, *low;
+    ds4_gpu_tensor *route_logits, *route_probs, *selected, *route_weights;
+    ds4_gpu_tensor *gate, *up, *mid, *experts, *routed;
+    ds4_gpu_tensor *shared, *shared_gate, *shared_up, *shared_mid;
+    ds4_gpu_tensor *logits, *markov_embed, *markov_bias;
+    ds4_gpu_tensor *row_in_hc[DS4_DSPARK_MAX_BLOCK_SIZE];
+    ds4_gpu_tensor *row_norm[DS4_DSPARK_MAX_BLOCK_SIZE];
+    ds4_gpu_tensor *row_block[DS4_DSPARK_MAX_BLOCK_SIZE];
+    ds4_gpu_tensor *row_heads[DS4_DSPARK_MAX_BLOCK_SIZE];
+    ds4_gpu_tensor *row_low[DS4_DSPARK_MAX_BLOCK_SIZE];
+    ds4_gpu_tensor *row_logits[DS4_DSPARK_MAX_BLOCK_SIZE];
+    ds4_gpu_tensor *row_embed[DS4_DSPARK_MAX_BLOCK_SIZE];
+} ds41_dspark;
+
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
@@ -40326,10 +40396,81 @@ typedef struct {
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
+    /* 3.7 stage 4: NULL unless the engine bound a DSpark support file. */
+    ds41_dspark *dspark;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
 } ds41_gpu_graph;
+
+static void ds41_dspark_free(ds41_dspark *d) {
+    if (!d) return;
+    for (uint32_t i = 0; i < DS4_DSPARK_MAX_BLOCK_SIZE; i++) {
+        ds4_gpu_tensor_free(d->row_embed[i]);
+        ds4_gpu_tensor_free(d->row_logits[i]);
+        ds4_gpu_tensor_free(d->row_low[i]);
+        ds4_gpu_tensor_free(d->row_heads[i]);
+        ds4_gpu_tensor_free(d->row_block[i]);
+        ds4_gpu_tensor_free(d->row_norm[i]);
+        ds4_gpu_tensor_free(d->row_in_hc[i]);
+    }
+    for (uint32_t i = 0; i < DS4_DSPARK_MAX_STAGES; i++) {
+        ds4_gpu_tensor_free(d->window_draft[i]);
+        ds4_gpu_tensor_free(d->window_main[i]);
+        ds4_gpu_tensor_free(d->window[i]);
+    }
+    for (uint32_t i = 0; i < DS4_DSPARK_MAX_TARGET_LAYERS * DS4_MAX_HC; i++)
+        ds4_gpu_tensor_free(d->raw_slot[i]);
+    for (uint32_t i = 0; i < DS4_MAX_HC; i++)
+        ds4_gpu_tensor_free(d->hc_pick[i]);
+    for (uint32_t i = 0; i < DS4_DSPARK_MAX_TARGET_LAYERS; i++)
+        ds4_gpu_tensor_free(d->target_slot[i]);
+    ds4_gpu_tensor_free(d->hc_pick_all);
+    ds4_gpu_tensor_free(d->target_raw);
+    ds4_gpu_tensor_free(d->markov_bias);
+    ds4_gpu_tensor_free(d->markov_embed);
+    ds4_gpu_tensor_free(d->logits);
+    ds4_gpu_tensor_free(d->shared_mid);
+    ds4_gpu_tensor_free(d->shared_up);
+    ds4_gpu_tensor_free(d->shared_gate);
+    ds4_gpu_tensor_free(d->shared);
+    ds4_gpu_tensor_free(d->routed);
+    ds4_gpu_tensor_free(d->experts);
+    ds4_gpu_tensor_free(d->mid);
+    ds4_gpu_tensor_free(d->up);
+    ds4_gpu_tensor_free(d->gate);
+    ds4_gpu_tensor_free(d->route_weights);
+    ds4_gpu_tensor_free(d->selected);
+    ds4_gpu_tensor_free(d->route_probs);
+    ds4_gpu_tensor_free(d->route_logits);
+    ds4_gpu_tensor_free(d->low);
+    ds4_gpu_tensor_free(d->heads);
+    ds4_gpu_tensor_free(d->kv);
+    ds4_gpu_tensor_free(d->q);
+    ds4_gpu_tensor_free(d->qr);
+    ds4_gpu_tensor_free(d->block);
+    ds4_gpu_tensor_free(d->norm);
+    ds4_gpu_tensor_free(d->x);
+    ds4_gpu_tensor_free(d->ffn_split);
+    ds4_gpu_tensor_free(d->attn_split);
+    ds4_gpu_tensor_free(d->mix);
+    ds4_gpu_tensor_free(d->flat_norm);
+    ds4_gpu_tensor_free(d->out_hc);
+    ds4_gpu_tensor_free(d->after_attn_hc);
+    ds4_gpu_tensor_free(d->in_hc);
+    ds4_gpu_tensor_free(d->main_kv);
+    ds4_gpu_tensor_free(d->main_x);
+    ds4_gpu_tensor_free(d->identity_pre);
+    ds4_gpu_tensor_free(d->target_hidden);
+    ds4_gpu_tensor_free(d->hc_mean);
+    free(d->host_conf);
+    free(d->host_head_x);
+    free(d->host_embed);
+    free(d->host_bias);
+    free(d->host_logits);
+    free(d->dump_dir);
+    free(d);
+}
 
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
                             uint64_t count, void *out, size_t bytes) {
@@ -40372,6 +40513,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
 #define DS41_FREE(name, count) ds4_gpu_tensor_free(g->name);
     DS41_SCRATCH(DS41_FREE)
 #undef DS41_FREE
+    ds41_dspark_free(g->dspark);
+    g->dspark = NULL;
     free(g->token_map);
     free(g->prefill_ids);
     free(g->rows_view);
@@ -40552,6 +40695,419 @@ fail:
     return false;
 }
 #undef DS41_SCRATCH
+
+/* =========================================================================
+ * 3.7 stage 4: DSpark draft-state allocation and target capture.
+ * ========================================================================= */
+
+/* Each of the five DS4_V41_DSPARK_* names is spelled EXACTLY ONCE in ds4.c,
+ * inside one of the helpers below, and every consumer -- the allocator, the
+ * session's shadow hook and the test oracle -- goes through them.  That is
+ * what gives the oracle its meaning: with the name in two places it would
+ * only prove its own spelling, and a typo in the consumer could leave the
+ * rollback dead or a shadow run silently doing no draft work while the
+ * model-free battery still passed.  Grepping ds4.c for any of the five names
+ * as a string literal finds it in exactly one place: the helper below. */
+static bool ds41_dspark_enabled(void) {
+    return getenv("DS4_DISABLE_V41_DSPARK_DRAFT") == NULL;
+}
+
+static uint32_t ds41_dspark_env_u32(const char *name, uint32_t fallback) {
+    const char *value = getenv(name);
+    if (!value || !*value) return fallback;
+    char *end = NULL;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (!end || *end || parsed > UINT32_MAX) return fallback;
+    return (uint32_t)parsed;
+}
+
+static bool ds41_dspark_shadow_enabled(void) {
+    return getenv("DS4_V41_DSPARK_SHADOW") != NULL;
+}
+
+/* NULL or non-empty, because an empty directory name means "not dumping" --
+ * which is what the allocator does with it and therefore exactly what the
+ * oracle's bit 2 has to report. */
+static const char *ds41_dspark_dump_dir(void) {
+    const char *dir = getenv("DS4_V41_DSPARK_DUMP_DIR");
+    return (dir && *dir) ? dir : NULL;
+}
+
+static bool ds41_dspark_timing_enabled(void) {
+    return getenv("DS4_V41_DSPARK_TIMING") != NULL;
+}
+
+static uint32_t ds41_dspark_dump_limit(void) {
+    return ds41_dspark_env_u32("DS4_V41_DSPARK_DUMP_CALLS", 4u);
+}
+
+/* Test oracle (tests/test_deepseek41_metal --dspark-draft).  The switches are
+ * read by the file-static helpers above and by nothing else, so without this
+ * nothing outside ds4.c can observe them.  Bit 0 is the draft allocated at
+ * all, 1 shadow mode, 2 dumping (a non-empty directory), 3 timing; bits 4+
+ * are the dump limit. */
+int ds4_v41_dspark_draft_gates(void) {
+    return (ds41_dspark_enabled() ? 1 : 0) |
+           (ds41_dspark_shadow_enabled() ? 2 : 0) |
+           (ds41_dspark_dump_dir() ? 4 : 0) |
+           (ds41_dspark_timing_enabled() ? 8 : 0) |
+           (int)(ds41_dspark_dump_limit() << 4);
+}
+
+/* Allocate the draft state for one session's graph.  Every buffer is sized
+ * from the support file's own geometry, so a file with a different block
+ * size or expert count needs no code change.  Returns true and leaves
+ * g->dspark NULL when the draft is rolled back or the file has no usable
+ * geometry: the caller decides whether that is fatal. */
+static bool ds41_dspark_configure(ds41_gpu_graph *g, const ds4_dspark_weights *dw) {
+    if (!g || !g->valid || !dw) return false;
+    if (!ds41_dspark_enabled()) return true;
+    if (dw->n_stages == 0 || dw->n_stages > DS4_DSPARK_MAX_STAGES ||
+        dw->block_size == 0 || dw->block_size > DS4_DSPARK_MAX_BLOCK_SIZE ||
+        dw->block_size >= DS41_DSPARK_WINDOW ||
+        dw->target_layer_count == 0 ||
+        dw->target_layer_count > DS4_DSPARK_MAX_TARGET_LAYERS ||
+        dw->markov_rank == 0 || dw->n_expert == 0 || dw->n_expert_used == 0 ||
+        dw->n_expert_used > dw->n_expert) return false;
+    for (uint32_t i = 0; i < dw->target_layer_count; i++)
+        if (dw->target_layers[i] >= DS4_N_LAYER) return false;
+    /* Network tensor parallelism is an unsupported *runtime shape*, not an
+     * unusable support file: the draft graph is single-rank only, so leave
+     * g->dspark NULL and let --dspark decode serially exactly as it did at
+     * stage 3 rather than failing session creation for a configuration the
+     * V4.1 `supported` predicate admits.  ds4_engine_v41_dspark_draft_ready()
+     * already refuses e->tp.active (so the support model is not mapped
+     * either); this is the second lock on the same door. */
+    if (g->tp_world != 1) return true;
+
+    ds41_dspark *d = xcalloc(1, sizeof(*d));
+    float *identity = NULL;
+    float mean[DS4_MAX_HC];
+    d->stages = dw->n_stages;
+    d->block_size = dw->block_size;
+    d->rows = dw->block_size;
+    d->markov_rank = dw->markov_rank;
+    d->noise_token_id = dw->noise_token_id;
+    d->n_expert = dw->n_expert;
+    d->n_expert_used = dw->n_expert_used;
+    d->target_layer_count = dw->target_layer_count;
+    memcpy(d->target_layers, dw->target_layers,
+           (size_t)dw->target_layer_count * sizeof(d->target_layers[0]));
+    d->dump_limit = ds41_dspark_dump_limit();
+    const char *dump = ds41_dspark_dump_dir();
+    if (dump) d->dump_dir = ds4_strdup(dump);
+    d->timing = ds41_dspark_timing_enabled();
+
+    const uint32_t rows = d->rows;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t win_rows = DS41_DSPARK_WINDOW + rows;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+
+#define DS41_DSPARK_ALLOC(field, count) \
+    do { d->field = ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)); \
+         if (!d->field) goto fail; } while (0)
+    DS41_DSPARK_ALLOC(hc_mean, DS4_N_HC);
+    DS41_DSPARK_ALLOC(target_hidden, (uint64_t)d->target_layer_count * DS4_N_EMBD);
+    DS41_DSPARK_ALLOC(identity_pre, (uint64_t)rows * DS4_N_HC);
+    DS41_DSPARK_ALLOC(main_x, DS4_N_EMBD);
+    DS41_DSPARK_ALLOC(main_kv, DS4_N_HEAD_DIM);
+    DS41_DSPARK_ALLOC(in_hc, (uint64_t)rows * hc_dim);
+    DS41_DSPARK_ALLOC(after_attn_hc, (uint64_t)rows * hc_dim);
+    DS41_DSPARK_ALLOC(out_hc, (uint64_t)rows * hc_dim);
+    DS41_DSPARK_ALLOC(flat_norm, (uint64_t)rows * hc_dim);
+    DS41_DSPARK_ALLOC(mix, (uint64_t)rows * mix_hc);
+    DS41_DSPARK_ALLOC(attn_split, (uint64_t)rows * mix_hc);
+    DS41_DSPARK_ALLOC(ffn_split, (uint64_t)rows * mix_hc);
+    DS41_DSPARK_ALLOC(x, (uint64_t)rows * DS4_N_EMBD);
+    DS41_DSPARK_ALLOC(norm, (uint64_t)rows * DS4_N_EMBD);
+    DS41_DSPARK_ALLOC(block, (uint64_t)rows * DS4_N_EMBD);
+    DS41_DSPARK_ALLOC(qr, (uint64_t)rows * DS4_N_LORA_Q);
+    DS41_DSPARK_ALLOC(q, (uint64_t)rows * q_dim);
+    DS41_DSPARK_ALLOC(kv, (uint64_t)rows * DS4_N_HEAD_DIM);
+    DS41_DSPARK_ALLOC(heads, (uint64_t)rows * q_dim);
+    DS41_DSPARK_ALLOC(low, (uint64_t)rows * DS4_N_OUT_GROUP * DS4_N_LORA_O);
+    DS41_DSPARK_ALLOC(route_logits, d->n_expert);
+    DS41_DSPARK_ALLOC(route_probs, d->n_expert);
+    DS41_DSPARK_ALLOC(selected, d->n_expert_used);
+    DS41_DSPARK_ALLOC(route_weights, d->n_expert_used);
+    DS41_DSPARK_ALLOC(gate, (uint64_t)d->n_expert_used * DS4_N_FF_EXP);
+    DS41_DSPARK_ALLOC(up, (uint64_t)d->n_expert_used * DS4_N_FF_EXP);
+    DS41_DSPARK_ALLOC(mid, (uint64_t)d->n_expert_used * DS4_N_FF_EXP);
+    DS41_DSPARK_ALLOC(experts, (uint64_t)d->n_expert_used * DS4_N_EMBD);
+    DS41_DSPARK_ALLOC(routed, DS4_N_EMBD);
+    DS41_DSPARK_ALLOC(shared, DS4_N_EMBD);
+    DS41_DSPARK_ALLOC(shared_gate, DS4_N_FF_EXP);
+    DS41_DSPARK_ALLOC(shared_up, DS4_N_FF_EXP);
+    DS41_DSPARK_ALLOC(shared_mid, DS4_N_FF_EXP);
+    DS41_DSPARK_ALLOC(logits, (uint64_t)rows * DS4_N_VOCAB);
+    DS41_DSPARK_ALLOC(markov_embed, (uint64_t)rows * d->markov_rank);
+    DS41_DSPARK_ALLOC(markov_bias, DS4_N_VOCAB);
+#undef DS41_DSPARK_ALLOC
+
+    for (uint32_t i = 0; i < d->target_layer_count; i++) {
+        d->target_slot[i] = ds4_gpu_tensor_view(d->target_hidden,
+            (uint64_t)i * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        if (!d->target_slot[i]) goto fail;
+    }
+    /* Dumping only: 3 * 4 * 5120 floats = 240 KiB per call at V4.1's
+     * geometry, allocated only when a dump directory was given and only
+     * written while calls are still being dumped. */
+    if (d->dump_dir && d->dump_limit) {
+        float pick[DS4_MAX_HC * DS4_MAX_HC];
+        d->target_raw = ds4_gpu_tensor_alloc((uint64_t)d->target_layer_count *
+            DS4_N_HC * DS4_N_EMBD * sizeof(float));
+        d->hc_pick_all = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * DS4_N_HC *
+                                              sizeof(float));
+        if (!d->target_raw || !d->hc_pick_all) goto fail;
+        memset(pick, 0, sizeof(pick));
+        for (uint32_t c = 0; c < DS4_N_HC; c++) pick[c * DS4_N_HC + c] = 1.0f;
+        if (!ds4_gpu_tensor_write(d->hc_pick_all, 0, pick,
+                                  (uint64_t)DS4_N_HC * DS4_N_HC * sizeof(float)))
+            goto fail;
+        for (uint32_t c = 0; c < DS4_N_HC; c++) {
+            d->hc_pick[c] = ds4_gpu_tensor_view(d->hc_pick_all,
+                (uint64_t)c * DS4_N_HC * sizeof(float),
+                (uint64_t)DS4_N_HC * sizeof(float));
+            if (!d->hc_pick[c]) goto fail;
+        }
+        for (uint32_t i = 0; i < d->target_layer_count * DS4_N_HC; i++) {
+            d->raw_slot[i] = ds4_gpu_tensor_view(d->target_raw,
+                (uint64_t)i * DS4_N_EMBD * sizeof(float),
+                (uint64_t)DS4_N_EMBD * sizeof(float));
+            if (!d->raw_slot[i]) goto fail;
+        }
+    }
+    for (uint32_t s = 0; s < d->stages; s++) {
+        d->window[s] = ds4_gpu_tensor_alloc(win_rows * DS4_N_HEAD_DIM * sizeof(float));
+        if (!d->window[s] ||
+            !ds4_gpu_tensor_fill_f32(d->window[s], 0.0f, win_rows * DS4_N_HEAD_DIM))
+            goto fail;
+    }
+    for (uint32_t r = 0; r < rows; r++) {
+        d->row_in_hc[r] = ds4_gpu_tensor_view(d->in_hc,
+            (uint64_t)r * hc_dim * sizeof(float), hc_dim * sizeof(float));
+        d->row_norm[r] = ds4_gpu_tensor_view(d->norm,
+            (uint64_t)r * DS4_N_EMBD * sizeof(float), (uint64_t)DS4_N_EMBD * sizeof(float));
+        d->row_block[r] = ds4_gpu_tensor_view(d->block,
+            (uint64_t)r * DS4_N_EMBD * sizeof(float), (uint64_t)DS4_N_EMBD * sizeof(float));
+        d->row_heads[r] = ds4_gpu_tensor_view(d->heads,
+            (uint64_t)r * q_dim * sizeof(float), q_dim * sizeof(float));
+        d->row_low[r] = ds4_gpu_tensor_view(d->low,
+            (uint64_t)r * DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float),
+            (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float));
+        d->row_logits[r] = ds4_gpu_tensor_view(d->logits,
+            (uint64_t)r * DS4_N_VOCAB * sizeof(float), (uint64_t)DS4_N_VOCAB * sizeof(float));
+        d->row_embed[r] = ds4_gpu_tensor_view(d->markov_embed,
+            (uint64_t)r * d->markov_rank * sizeof(float),
+            (uint64_t)d->markov_rank * sizeof(float));
+        if (!d->row_in_hc[r] || !d->row_norm[r] || !d->row_block[r] ||
+            !d->row_heads[r] || !d->row_low[r] || !d->row_logits[r] ||
+            !d->row_embed[r]) goto fail;
+    }
+
+    const float inv_hc = 1.0f / (float)DS4_N_HC;
+    for (uint32_t i = 0; i < DS4_N_HC; i++) mean[i] = inv_hc;
+    if (!ds4_gpu_tensor_write(d->hc_mean, 0, mean,
+                              (uint64_t)DS4_N_HC * sizeof(mean[0]))) goto fail;
+    identity = xcalloc((size_t)rows * DS4_N_HC, sizeof(float));
+    for (uint32_t r = 0; r < rows; r++) identity[(size_t)r * DS4_N_HC] = 1.0f;
+    if (!ds4_gpu_tensor_write(d->identity_pre, 0, identity,
+                              (uint64_t)rows * DS4_N_HC * sizeof(float))) goto fail;
+    free(identity);
+    identity = NULL;
+
+    d->host_logits = xmalloc((size_t)rows * DS4_N_VOCAB * sizeof(float));
+    d->host_bias = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    d->host_embed = xmalloc((size_t)rows * d->markov_rank * sizeof(float));
+    d->host_head_x = xmalloc((size_t)rows * DS4_N_EMBD * sizeof(float));
+    d->host_conf = xmalloc((size_t)rows * sizeof(float));
+    g->dspark = d;
+    fprintf(stderr,
+            "ds4: V4.1 DSpark draft graph armed: %u stages, block %u, "
+            "experts %u/%u, markov rank %u, targets",
+            d->stages, d->block_size, d->n_expert, d->n_expert_used,
+            d->markov_rank);
+    for (uint32_t i = 0; i < d->target_layer_count; i++)
+        fprintf(stderr, "%s%u", i ? "," : " ", d->target_layers[i]);
+    fprintf(stderr, " (private %u-row windows, decode-seeded)\n", DS41_DSPARK_WINDOW);
+    return true;
+fail:
+    free(identity);
+    ds41_dspark_free(d);
+    return false;
+}
+
+/* The HC mean of the residual stream at this layer's attention input, into
+ * slot i of the concatenated 3*5120 target hidden.  V4.1 layers 37-39 carry
+ * no Engram (engram_layer_ids are 1 and 14), so "after the layer's Engram"
+ * and "before ds41_graph_before_attention" are the same point, and g->residual
+ * holds exactly the reference's `h` (model.py:1264-1266). */
+static bool ds41_dspark_capture(ds41_gpu_graph *g, uint32_t il) {
+    ds41_dspark *d = g->dspark;
+    for (uint32_t i = 0; i < d->target_layer_count; i++) {
+        if (d->target_layers[i] != il) continue;
+        /* While dumping, keep the residual this mean was taken from, so
+         * scratchpad/dspark_ref.py checks the capture instead of consuming
+         * its output as ground truth.  One one-hot weighted sum per HC copy:
+         * bit-exact (1*x plus zeros), and it goes through the same call that
+         * owns a command buffer when the layer loop has just drained one.
+         * Off the dump path target_raw is NULL and this is one pointer test. */
+        if (d->target_raw && d->dumped < d->dump_limit)
+            for (uint32_t c = 0; c < DS4_N_HC; c++)
+                if (!ds4_gpu_hc_weighted_sum_tensor(d->raw_slot[i * DS4_N_HC + c],
+                        g->residual, d->hc_pick[c], DS4_N_EMBD, DS4_N_HC))
+                    return false;
+        if (!ds4_gpu_hc_weighted_sum_tensor(d->target_slot[i], g->residual,
+                                            d->hc_mean, DS4_N_EMBD, DS4_N_HC))
+            return false;
+        d->capture_mask |= 1u << i;
+        d->capture_valid = d->capture_mask ==
+            (d->target_layer_count >= 32u ? UINT32_MAX :
+             (1u << d->target_layer_count) - 1u);
+        d->capture_pos = g->pos;
+        return true;
+    }
+    return true;
+}
+
+/*
+ * Model-free oracle for the capture (tests/test_deepseek41_metal
+ * --dspark-draft).  The NumPy gate feeds on ds4's own main_hidden, so by
+ * itself it cannot see a capture that read the wrong slot, weighted the HC
+ * copies unevenly or fired on the wrong layers; the raw dump above closes the
+ * first two on a real run, and this closes all three without one.
+ *
+ * It drives ds41_dspark_capture() over every layer id with a synthetic
+ * residual whose four HC copies differ from each other and whose value
+ * changes per layer, and asserts: only the target layers write anything, slot
+ * i holds the PLAIN mean of the residual that was present when
+ * target_layers[i] ran (a non-uniform weight vector or a transposed slot
+ * misses by O(1)), the dump-only raw slots hold that same residual copy for
+ * copy, non-target layers leave every slot alone, and
+ * capture_mask/capture_valid/capture_pos follow the layer loop.
+ */
+int ds4_v41_dspark_capture_selftest(void) {
+    const uint32_t count = 3u;
+    const uint32_t hc = DS4_N_HC, dim = DS4_N_EMBD;
+    const uint64_t hc_values = (uint64_t)hc * dim;
+    const uint32_t probe_pos = 4242u;
+    ds41_gpu_graph *g = NULL;
+    ds41_dspark *d = NULL;
+    float *src = NULL, *got = NULL, *want = NULL;
+    float *got_raw = NULL, *want_raw = NULL;
+    float mean[DS4_MAX_HC], pick[DS4_MAX_HC * DS4_MAX_HC];
+    uint32_t expect_mask = 0;
+    int rc = 0;
+    if (count > DS4_DSPARK_MAX_TARGET_LAYERS || hc == 0 || hc > DS4_MAX_HC ||
+        dim == 0 || DS4_N_LAYER < count) goto done;
+    g = xcalloc(1, sizeof(*g));
+    d = xcalloc(1, sizeof(*d));
+    d->target_layer_count = count;
+    d->dump_limit = 1u;                  /* arm the dump-only raw extraction */
+    for (uint32_t i = 0; i < count; i++)
+        d->target_layers[i] = DS4_N_LAYER - count + i;
+    d->hc_mean = ds4_gpu_tensor_alloc((uint64_t)hc * sizeof(float));
+    d->target_hidden = ds4_gpu_tensor_alloc((uint64_t)count * dim * sizeof(float));
+    d->target_raw = ds4_gpu_tensor_alloc((uint64_t)count * hc_values * sizeof(float));
+    d->hc_pick_all = ds4_gpu_tensor_alloc((uint64_t)hc * hc * sizeof(float));
+    if (!d->hc_mean || !d->target_hidden || !d->target_raw || !d->hc_pick_all)
+        goto done;
+    for (uint32_t i = 0; i < count; i++) {
+        d->target_slot[i] = ds4_gpu_tensor_view(d->target_hidden,
+            (uint64_t)i * dim * sizeof(float), (uint64_t)dim * sizeof(float));
+        if (!d->target_slot[i]) goto done;
+    }
+    for (uint32_t i = 0; i < count * hc; i++) {
+        d->raw_slot[i] = ds4_gpu_tensor_view(d->target_raw,
+            (uint64_t)i * dim * sizeof(float), (uint64_t)dim * sizeof(float));
+        if (!d->raw_slot[i]) goto done;
+    }
+    memset(pick, 0, sizeof(pick));
+    for (uint32_t i = 0; i < hc; i++) {
+        mean[i] = 1.0f / (float)hc;
+        pick[i * hc + i] = 1.0f;
+        d->hc_pick[i] = ds4_gpu_tensor_view(d->hc_pick_all,
+            (uint64_t)i * hc * sizeof(float), (uint64_t)hc * sizeof(float));
+        if (!d->hc_pick[i]) goto done;
+    }
+    if (!ds4_gpu_tensor_write(d->hc_mean, 0, mean, (uint64_t)hc * sizeof(float)) ||
+        !ds4_gpu_tensor_write(d->hc_pick_all, 0, pick,
+                              (uint64_t)hc * hc * sizeof(float)) ||
+        !ds4_gpu_tensor_fill_f32(d->target_hidden, -7.5f, (uint64_t)count * dim) ||
+        !ds4_gpu_tensor_fill_f32(d->target_raw, -7.5f, (uint64_t)count * hc_values))
+        goto done;
+    g->valid = true;
+    g->pos = probe_pos;
+    g->dspark = d;
+    g->residual = ds4_gpu_tensor_alloc(hc_values * sizeof(float));
+    if (!g->residual) goto done;
+    src = xmalloc((size_t)hc_values * sizeof(float));
+    got = xmalloc((size_t)count * dim * sizeof(float));
+    want = xmalloc((size_t)count * dim * sizeof(float));
+    got_raw = xmalloc((size_t)count * hc_values * sizeof(float));
+    want_raw = xmalloc((size_t)count * hc_values * sizeof(float));
+    for (uint32_t i = 0; i < count * dim; i++) want[i] = -7.5f;
+    for (uint32_t i = 0; i < count * hc_values; i++) want_raw[i] = -7.5f;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        /* Dyadic values, so the f32 mean is exact and a tolerance of 1e-5 is
+         * a real bound rather than a rounding allowance. */
+        for (uint32_t c = 0; c < hc; c++)
+            for (uint32_t j = 0; j < dim; j++)
+                src[(size_t)c * dim + j] = (float)(il + 1u) * 0.25f +
+                    (float)c * 0.5f + (float)(j & 15u) * 0.0625f;
+        if (!ds4_gpu_tensor_write(g->residual, 0, src, hc_values * sizeof(float)))
+            goto done;
+        for (uint32_t i = 0; i < count; i++) {
+            if (d->target_layers[i] != il) continue;
+            expect_mask |= 1u << i;
+            for (uint32_t j = 0; j < dim; j++) {
+                double acc = 0.0;
+                for (uint32_t c = 0; c < hc; c++)
+                    acc += (double)src[(size_t)c * dim + j] / (double)hc;
+                want[(size_t)i * dim + j] = (float)acc;
+            }
+            memcpy(want_raw + (size_t)i * hc_values, src,
+                   (size_t)hc_values * sizeof(float));
+        }
+        if (!ds4_gpu_begin_commands()) goto done;
+        const bool ok = ds41_dspark_capture(g, il);
+        if (!ds4_gpu_end_commands() || !ok || !ds4_gpu_synchronize()) goto done;
+        if (d->capture_mask != expect_mask) goto done;
+        if (d->capture_valid != (expect_mask == (1u << count) - 1u)) goto done;
+        if (expect_mask && d->capture_pos != probe_pos) goto done;
+        if (!ds4_gpu_tensor_read(d->target_hidden, 0, got,
+                                 (uint64_t)count * dim * sizeof(float)) ||
+            !ds4_gpu_tensor_read(d->target_raw, 0, got_raw,
+                                 (uint64_t)count * hc_values * sizeof(float)))
+            goto done;
+        for (uint32_t i = 0; i < count * dim; i++)
+            if (fabsf(got[i] - want[i]) > 1e-5f * (1.0f + fabsf(want[i]))) goto done;
+        /* The raw slots are lifted with one-hot weights, so they must be
+         * bit-identical to what was written, copy for copy and in the same
+         * slot order as the means. */
+        if (memcmp(got_raw, want_raw, (size_t)count * hc_values * sizeof(float)))
+            goto done;
+    }
+    rc = d->capture_valid && d->capture_mask == (1u << count) - 1u;
+done:
+    free(want_raw);
+    free(got_raw);
+    free(want);
+    free(got);
+    free(src);
+    if (g) {
+        ds4_gpu_tensor_free(g->residual);
+        g->residual = NULL;
+        g->dspark = NULL;
+    }
+    ds41_dspark_free(d);
+    free(g);
+    if (!rc) fprintf(stderr, "ds4: V4.1 DSpark capture self-test failed\n");
+    return rc;
+}
 
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
@@ -41910,6 +42466,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     }
     if (rows_t0) ds41_engram_rows_account((now_sec() - rows_t0) * 1000.0);
     ds4_gpu_tensor *const engram_rows_scratch = g->engram_rows;
+    if (g->dspark) {
+        g->dspark->capture_mask = 0;
+        g->dspark->capture_valid = false;
+    }
     const float initial_pre[] = {1, 0, 0, 0};
 #ifdef __APPLE__
     g->pre_fused = ds41_pre_copy_fused();
@@ -41938,6 +42498,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (!ok) break;
         /* Point the consumer at this layer's own upload buffer (host-side only). */
         if (ds41_engram_layer(il)) g->engram_rows = g->engram_rows_tab[il == 1 ? 0 : 1];
+        /* 3.7 stage 4: the DSpark target hidden is the attention *input* of
+         * layers 37/38/39, so it is read here, before the layer runs. One
+         * hc_weighted_sum dispatch per target layer, three per token. */
+        if (ok && g->dspark) ok = ds41_dspark_capture(g, il);
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
             ok = ds41_graph_decode_layer(g, m, l, il, token);
@@ -41984,6 +42548,475 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->history = next_history;
     g->pos++;
     return true;
+}
+
+
+/* =========================================================================
+ * 3.7 stage 4: ds41_graph_dspark_step -- the V4.1 DSpark draft graph.
+ * =========================================================================
+ * One call proposes `block_size` draft tokens for the token the target just
+ * emitted.  It follows model.py's forward_spec (:1275) step for step:
+ *
+ *   main_x = mtp.0.main_norm(mtp.0.main_proj(main_hidden))        [1, 5120]
+ *   ids    = [input_token, noise, noise, noise, noise]
+ *   h      = embed(ids) repeated over the 4 HC copies             [5, 4, 5120]
+ *   for stage in 0..2:  h, pre = DSparkBlock(h, pos, pre, main_x)
+ *   x      = hc_pre(h, pre);  logits = head(mtp.2.norm(x))
+ *   for i in 0..4: logits[i] += markov(ids[i]); ids[i+1] = argmax(logits[i])
+ *   confidence = proj([x ; markov_embed])
+ *
+ * Differences from the V4 draft path that are structural, not stylistic:
+ * the expert counts come from the support file (128/3, not 384/6), RoPE is
+ * ds4_gpu_dsv41_rope with yarn=false and theta=10000 because ds41_rope dies
+ * on layer ids >= DS4_N_LAYER, there is no hc_head_* mix at the head (the
+ * last block's ffn_pre is used directly, model.py:1144), and each stage owns
+ * a private window cache rather than reading the target's.
+ */
+
+static bool ds41_dspark_pre(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual,
+                            const ds4_gpu_tensor *weights, bool split, uint32_t rows) {
+#ifdef __APPLE__
+    if (ds41_bf16_epilogue_enabled() &&
+        (split ? ds4_gpu_hc_weighted_sum_split_bf16_tensor(out, residual, weights,
+                                                           DS4_N_EMBD, DS4_N_HC)
+               : ds4_gpu_hc_weighted_sum_bf16_tensor(out, residual, weights,
+                                                     DS4_N_EMBD, DS4_N_HC)))
+        return true;
+#endif
+    return (split ? ds4_gpu_hc_weighted_sum_split_tensor(out, residual, weights,
+                                                         DS4_N_EMBD, DS4_N_HC)
+                  : ds4_gpu_hc_weighted_sum_tensor(out, residual, weights,
+                                                   DS4_N_EMBD, DS4_N_HC)) &&
+           ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, rows, DS4_V41_BF16);
+}
+
+static bool ds41_dspark_post(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block,
+                             const ds4_gpu_tensor *residual_hc,
+                             const ds4_gpu_tensor *split, uint32_t rows) {
+#ifdef __APPLE__
+    if (ds41_bf16_epilogue_enabled() &&
+        ds4_gpu_hc_expand_split_bf16_tensor(out_hc, block, residual_hc, split,
+                                            DS4_N_EMBD, DS4_N_HC))
+        return true;
+#endif
+    return ds4_gpu_hc_expand_split_tensor(out_hc, block, residual_hc, split,
+                                          DS4_N_EMBD, DS4_N_HC) &&
+           ds4_gpu_dsv41_quantize(out_hc, DS4_N_EMBD, rows * DS4_N_HC, DS4_V41_BF16);
+}
+
+/* hc_mixes: RMS over the flattened hc*dim stream, one projection, Sinkhorn. */
+static bool ds41_dspark_mix(ds41_dspark *d, const ds4_model *dm,
+                            const ds4_layer_weights *l, bool ffn) {
+    const ds4_gpu_tensor *in = ffn ? d->after_attn_hc : d->in_hc;
+    const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
+    const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
+    const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+    return ds4_gpu_rms_norm_plain_rows_tensor(d->flat_norm, in,
+               DS4_N_HC * DS4_N_EMBD, d->rows, DS4_RMS_EPS) &&
+           ds41_matmul_batch(d->mix, dm, fn, d->flat_norm, d->rows, false) &&
+           ds4_gpu_hc_split_sinkhorn_tensor(ffn ? d->ffn_split : d->attn_split,
+               d->mix, dm->map, dm->size, scale->abs_offset, base->abs_offset,
+               DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+}
+
+/* The 128/3 routed MoE plus the shared expert, one draft row at a time.  The
+ * counts are the block's own: metal_graph_encode_layer_ffn_batch and
+ * ds41_moe_partial both hard-wire the target model's globals. */
+static bool ds41_dspark_moe(ds41_dspark *d, const ds4_model *dm,
+                            const ds4_layer_weights *l, uint32_t stage, uint32_t r) {
+    uint64_t gate_row = 0, down_row = 0;
+    if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
+        !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
+    ds4_gpu_tensor *x = d->row_norm[r];
+    if (!ds41_matmul(d->route_logits, dm, l->ffn_gate_inp, x, false) ||
+        !ds4_gpu_router_select_tensor(d->selected, d->route_weights, d->route_probs,
+            dm->map, dm->size, l->ffn_exp_probs_b->abs_offset, 0, 0, 0,
+            d->n_expert, d->n_expert_used, DS4_EXPERT_WEIGHT_SCALE, 0, 0,
+            true, false, d->route_logits)) return false;
+    if (!ds41_matmul(d->shared_gate, dm, l->ffn_gate_shexp, x, true) ||
+        !ds41_matmul(d->shared_up, dm, l->ffn_up_shexp, x, true) ||
+        !ds41_swiglu_round(d->shared_mid, d->shared_gate, d->shared_up, DS4_N_FF_EXP) ||
+        !ds41_matmul(d->shared, dm, l->ffn_down_shexp, d->shared_mid, true)) return false;
+    if (!ds4_gpu_routed_moe_one_tensor(d->routed, d->gate, d->up, d->mid, d->experts,
+            dm->map, dm->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, d->selected, d->route_weights,
+            d->n_expert, d->n_expert_used, DS4_SWIGLU_CLAMP_EXP, x, NULL,
+            DS4_N_LAYER + stage, true)) return false;
+    return ds41_add_round(d->row_block[r], d->routed, d->shared, DS4_N_EMBD);
+}
+
+/* One draft block.  `pos` is the target position that produced main_hidden;
+ * the draft rows sit at pos+1 .. pos+block_size (model.py:1054). */
+static bool ds41_dspark_block_forward(ds41_dspark *d, const ds4_model *dm,
+                                      const ds4_dspark_weights *dw, uint32_t stage,
+                                      uint32_t pos, const ds4_gpu_tensor *pre,
+                                      bool pre_is_split) {
+    const ds4_layer_weights *l = &dw->stage[stage].block;
+    const uint32_t rows = d->rows;
+    const uint32_t slot = d->seeded % DS41_DSPARK_WINDOW;
+    const uint32_t n_win = d->seeded + 1u < DS41_DSPARK_WINDOW ?
+        d->seeded + 1u : DS41_DSPARK_WINDOW;
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+
+    if (!ds41_dspark_mix(d, dm, l, false) ||
+        !ds41_dspark_pre(d->x, d->in_hc, pre, pre_is_split, rows) ||
+        !ds41_norm_batch(d->norm, d->x, dm, l->attn_norm, rows)) return false;
+
+    /* q: low-rank, per-head-dim RoPE tail only, no per-head norm (V4.1). */
+    if (!ds41_matmul_batch(d->qr, dm, l->attn_q_a, d->norm, rows, true) ||
+        !ds41_norm_batch(d->qr, d->qr, dm, l->attn_q_a_norm, rows) ||
+        !ds41_matmul_batch(d->q, dm, l->attn_q_b, d->qr, rows, true) ||
+        !ds4_gpu_dsv41_rope(d->q, DS4_N_HEAD_DIM, DS4_N_HEAD, rows,
+                            pos + 1u, false, false)) return false;
+
+    /* The target row: this block's own wkv/kv_norm over main_x, at `pos`,
+     * appended to the private window (model.py:1040, :1065). */
+    if (!ds41_matmul(d->main_kv, dm, l->attn_kv, d->main_x, true) ||
+        !ds41_norm(d->main_kv, d->main_kv, dm, l->attn_kv_a_norm) ||
+        !ds4_gpu_dsv41_rope(d->main_kv, DS4_N_HEAD_DIM, 1, 1, pos, false, false) ||
+        !ds4_gpu_dsv41_quantize(d->main_kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
+        !ds4_gpu_tensor_copy(d->window[stage], (uint64_t)slot * row_bytes,
+                             d->main_kv, 0, row_bytes)) return false;
+
+    /* The draft rows' own KV, written just past the live window rows so the
+     * kernel's [raw_start, raw_start + n_raw) range is exactly the
+     * reference's cat([window[:n_win]], draft) key set. */
+    if (!ds41_matmul_batch(d->kv, dm, l->attn_kv, d->norm, rows, true) ||
+        !ds41_norm_batch(d->kv, d->kv, dm, l->attn_kv_a_norm, rows) ||
+        !ds4_gpu_dsv41_rope(d->kv, DS4_N_HEAD_DIM, 1, rows, pos + 1u, false, false) ||
+        !ds4_gpu_dsv41_quantize(d->kv, DS4_N_HEAD_DIM, rows, DS4_V41_FP8_E8M0) ||
+        !ds4_gpu_tensor_copy(d->window[stage], (uint64_t)n_win * row_bytes,
+                             d->kv, 0, (uint64_t)rows * row_bytes)) return false;
+
+    if (!ds4_gpu_attention_noncausal_raw_batch_heads_tensor(d->heads,
+            dm->map, dm->size, l->attn_sinks->abs_offset, d->q, d->window[stage],
+            rows, n_win + rows, DS41_DSPARK_WINDOW + rows, 0,
+            DS4_N_HEAD, DS4_N_HEAD_DIM) ||
+        !ds4_gpu_dsv41_quantize(d->heads, DS4_N_HEAD_DIM, rows * DS4_N_HEAD,
+                                DS4_V41_BF16) ||
+        !ds4_gpu_dsv41_rope(d->heads, DS4_N_HEAD_DIM, DS4_N_HEAD, rows,
+                            pos + 1u, false, true)) return false;
+
+    for (uint32_t r = 0; r < rows; r++) {
+        if (!ds4_gpu_attention_output_low_q8_tensor(d->row_low[r], dm->map, dm->size,
+                l->attn_output_a->abs_offset,
+                (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP),
+                DS4_N_LORA_O, DS4_N_OUT_GROUP, d->row_heads[r]) ||
+            !ds4_gpu_dsv41_quantize(d->row_low[r], DS4_N_OUT_GROUP * DS4_N_LORA_O,
+                                    1, DS4_V41_BF16) ||
+            !ds41_matmul(d->row_block[r], dm, l->attn_output_b, d->row_low[r], true))
+            return false;
+    }
+
+    if (!ds41_dspark_post(d->after_attn_hc, d->block, d->in_hc, d->attn_split, rows) ||
+        !ds41_dspark_mix(d, dm, l, true) ||
+        !ds41_dspark_pre(d->x, d->after_attn_hc, d->attn_split, true, rows) ||
+        !ds41_norm_batch(d->norm, d->x, dm, l->ffn_norm, rows)) return false;
+
+    for (uint32_t r = 0; r < rows; r++)
+        if (!ds41_dspark_moe(d, dm, l, stage, r)) return false;
+
+    return ds41_dspark_post(d->out_hc, d->block, d->after_attn_hc, d->ffn_split, rows);
+}
+
+static void ds41_dspark_dump(ds41_dspark *d, const char *name, uint32_t call,
+                             const void *data, size_t bytes) {
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s/call%03u_%s", d->dump_dir, call, name) >=
+        (int)sizeof(path)) return;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    if (bytes && fwrite(data, 1, bytes, fp) != bytes)
+        fprintf(stderr, "ds4: DSpark dump %s truncated\n", path);
+    fclose(fp);
+}
+
+static bool ds41_dspark_read(const ds4_gpu_tensor *t, float *out, uint64_t count) {
+    return ds4_gpu_tensor_read(t, 0, out, count * sizeof(float)) != 0;
+}
+
+/* Dump-only: one draft block's SUB-BLOCK boundaries, so the NumPy gate can
+ * start each check from ds4's own input instead of its own three-stage chain.
+ *
+ * Why that matters, and why the first revision's end-to-end 1e-3 gate could
+ * not be met by any correct reference.  ds4 and a NumPy re-implementation
+ * disagree only in the order of their f32 reductions, i.e. by ~1e-7 relative.
+ * A BF16 boundary turns a disagreement d into about sqrt(d * q), q = 2^-8
+ * being the BF16 quantum: a fraction d/q of the elements sits on the other
+ * side of a rounding boundary and moves a whole quantum.  Iterating that from
+ * 1e-7 gives 2e-5 -> 3e-4 -> 1e-3 -> 2e-3 ..., with q itself as the fixed
+ * point, and one draft block applies ten such boundaries.  So an end-to-end
+ * per-stage hidden comparison saturates near a quarter of a BF16 quantum
+ * (measured: 2.2e-3 .. 3.9e-3 rel-RMS) however correct both sides are, and it
+ * cannot distinguish a defect from the boundary noise.  Cutting the chain --
+ * every check one or two boundaries deep, from ds4's own inputs -- puts the
+ * numbers back at 1e-6..1e-3, where a defect is visible again.
+ *
+ * The six tensors below are the ones still live when
+ * ds41_dspark_block_forward() returns, and they cover every stage of the
+ * block: the two Sinkhorn splits, the attention sub-block's output hidden and
+ * the attention output it was built from, the MoE's input and its output.
+ * The writer and the test oracle read this one table, so the layout
+ * dspark_ref.py parses cannot drift away from the layout ds4 writes. */
+static uint64_t ds41_dspark_dump_slot(unsigned index, uint32_t stage, uint32_t rows,
+                                      char *name, uint64_t cap) {
+    static const char *const names[] = { "attn_split", "ffn_split", "attn_hc",
+                                         "attn_o", "ffn_x", "moe" };
+    const uint32_t mix_hc = 2u * DS4_N_HC + DS4_N_HC * DS4_N_HC;
+    const uint64_t counts[] = {
+        (uint64_t)rows * mix_hc,
+        (uint64_t)rows * mix_hc,
+        (uint64_t)rows * DS4_N_HC * DS4_N_EMBD,
+        (uint64_t)rows * DS4_N_HEAD * DS4_N_HEAD_DIM,
+        (uint64_t)rows * DS4_N_EMBD,
+        (uint64_t)rows * DS4_N_EMBD,
+    };
+    if (index >= sizeof(names) / sizeof(*names) || rows == 0) return 0;
+    if (name && snprintf(name, (size_t)cap, "stage%u_%s.f32", stage,
+                         names[index]) >= (int)cap) return 0;
+    return counts[index];
+}
+
+/* Test oracle for the table above (tests/test_deepseek41_metal --dspark-draft). */
+uint64_t ds4_v41_dspark_dump_slot(unsigned index, uint32_t stage, uint32_t rows,
+                                  char *name, uint64_t cap) {
+    return ds41_dspark_dump_slot(index, stage, rows, name, cap);
+}
+
+static bool ds41_dspark_dump_stage(ds41_dspark *d, uint32_t stage) {
+    const ds4_gpu_tensor *tensors[] = { d->attn_split, d->ffn_split,
+                                        d->after_attn_hc, d->heads,
+                                        d->norm, d->block };
+    const unsigned slots = (unsigned)(sizeof(tensors) / sizeof(*tensors));
+    uint64_t most = 0;
+    for (unsigned i = 0; i < slots; i++) {
+        const uint64_t n = ds41_dspark_dump_slot(i, stage, d->rows, NULL, 0);
+        if (n > most) most = n;
+    }
+    if (!most) return false;
+    float *scratch = xmalloc((size_t)most * sizeof(float));
+    bool ok = true;
+    for (unsigned i = 0; ok && i < slots; i++) {
+        char name[64];
+        const uint64_t n = ds41_dspark_dump_slot(i, stage, d->rows, name, sizeof(name));
+        ok = n != 0 && tensors[i] && ds41_dspark_read(tensors[i], scratch, n);
+        if (ok) ds41_dspark_dump(d, name, d->dumped, scratch,
+                                 (size_t)n * sizeof(float));
+    }
+    free(scratch);
+    return ok;
+}
+
+/* Propose one draft block for `token` at target position `pos`.  The result
+ * is left in d->draft_ids / d->host_conf; stage 4 never consumes it. */
+static DS4_MAYBE_UNUSED bool ds41_graph_dspark_step(ds41_gpu_graph *g,
+        const ds4_model *m, const ds4_weights *w, const ds4_model *dm,
+        const ds4_dspark_weights *dw, int token, uint32_t pos) {
+    ds41_dspark *d = g ? g->dspark : NULL;
+    if (!d || !g->valid || !m || !w || !dm || !dw || token < 0 ||
+        (uint32_t)token >= DS4_N_VOCAB || !d->capture_valid ||
+        d->capture_pos != pos || d->stages != dw->n_stages ||
+        dw->noise_token_id >= DS4_N_VOCAB || g->tp_world != 1) return false;
+    const uint32_t rows = d->rows;
+    const double t0 = now_sec();
+    const ds4_dspark_stage_weights *first = &dw->stage[0];
+    const ds4_dspark_stage_weights *final = &dw->stage[dw->n_stages - 1u];
+    if (!first->main_proj || !first->main_norm || !final->norm ||
+        !final->markov_w1 || !final->markov_w2 || !final->confidence_proj)
+        return false;
+
+    if (!ds4_gpu_begin_commands()) return false;
+    bool ok = ds41_matmul(d->main_x, dm, first->main_proj, d->target_hidden, true) &&
+              ds41_norm(d->main_x, d->main_x, dm, first->main_norm);
+    d->draft_ids[0] = token;
+    for (uint32_t r = 0; ok && r < rows; r++) {
+        const uint32_t id = r == 0 ? (uint32_t)token : d->noise_token_id;
+        ok = ds4_gpu_embed_token_hc_tensor(d->row_in_hc[r], m->map, m->size,
+                 w->token_embd->abs_offset, DS4_N_VOCAB, id,
+                 DS4_N_EMBD, DS4_N_HC) != 0;
+    }
+    const ds4_gpu_tensor *pre = d->identity_pre;
+    bool pre_is_split = false;
+    for (uint32_t stage = 0; ok && stage < d->stages; stage++) {
+        ok = ds41_dspark_block_forward(d, dm, dw, stage, pos, pre, pre_is_split);
+        if (!ok) break;
+        if (d->dump_dir && d->dumped < d->dump_limit) {
+            char name[64];
+            snprintf(name, sizeof(name), "block%u_out.f32", stage);
+            if (!ds4_gpu_end_commands()) { ok = false; break; }
+            float *scratch = xmalloc((size_t)rows * DS4_N_HC * DS4_N_EMBD * sizeof(float));
+            if (ds41_dspark_read(d->out_hc, scratch,
+                                 (uint64_t)rows * DS4_N_HC * DS4_N_EMBD))
+                ds41_dspark_dump(d, name, d->dumped, scratch,
+                                 (size_t)rows * DS4_N_HC * DS4_N_EMBD * sizeof(float));
+            free(scratch);
+            /* ... and this stage's sub-block boundaries, at the same sync. */
+            ok = ds41_dspark_dump_stage(d, stage);
+            if (!ok) break;
+            if (!ds4_gpu_begin_commands()) { ok = false; break; }
+        }
+        ds4_gpu_tensor *swap = d->in_hc;
+        d->in_hc = d->out_hc;
+        d->out_hc = swap;
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_tensor_free(d->row_in_hc[r]);
+            d->row_in_hc[r] = ds4_gpu_tensor_view(d->in_hc,
+                (uint64_t)r * DS4_N_HC * DS4_N_EMBD * sizeof(float),
+                (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
+            if (!d->row_in_hc[r]) ok = false;
+        }
+        pre = d->ffn_split;
+        pre_is_split = true;
+    }
+
+    /* The head: hc_pre with the LAST block's ffn_pre -- V4.1 has no
+     * mtp.*.hc_head_* (spec 0/5.7) -- then mtp.2.norm and the main model's
+     * output head (model.py:1213). */
+    if (ok) ok = ds41_dspark_pre(d->x, d->in_hc, d->ffn_split, true, rows) &&
+                 ds41_norm_batch(d->norm, d->x, dm, final->norm, rows) &&
+                 ds41_matmul_batch(d->logits, m, w->output, d->norm, rows, false);
+    /* A failed dump boundary can leave the loop with no open buffer. */
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (ok) ok = ds41_dspark_read(d->logits, d->host_logits,
+                                  (uint64_t)rows * DS4_N_VOCAB) &&
+                 ds41_dspark_read(d->x, d->host_head_x, (uint64_t)rows * DS4_N_EMBD);
+    if (ok && d->dump_dir && d->dumped < d->dump_limit)
+        ds41_dspark_dump(d, "base_logits.f32", d->dumped, d->host_logits,
+                         (size_t)rows * DS4_N_VOCAB * sizeof(float));
+
+    /* The Markov chain: slot i's bias is a rank-256 bigram of the token
+     * chosen at slot i-1, so the five slots are sequential (model.py:1137). */
+    float *bias_dump = NULL;
+    if (ok && d->dump_dir && d->dumped < d->dump_limit)
+        bias_dump = xmalloc((size_t)rows * DS4_N_VOCAB * sizeof(float));
+    const float *proj = ok ? tensor_data(dm, final->confidence_proj) : NULL;
+    if (ok && (!proj || final->confidence_proj->type != DS4_TENSOR_F32 ||
+               final->confidence_proj->dim[0] != (uint64_t)DS4_N_EMBD + d->markov_rank))
+        ok = false;
+    for (uint32_t i = 0; ok && i < rows; i++) {
+        float *embed = d->host_embed + (size_t)i * d->markov_rank;
+        ok = dspark_dense_row_to_f32(embed, dm, final->markov_w1,
+                                     (uint32_t)d->draft_ids[i]) &&
+             ds4_gpu_tensor_write(d->row_embed[i], 0, embed,
+                                  (uint64_t)d->markov_rank * sizeof(float)) &&
+             ds4_gpu_begin_commands() &&
+             ds41_matmul(d->markov_bias, dm, final->markov_w2, d->row_embed[i], false);
+        if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+        if (!ok) break;
+        ok = ds41_dspark_read(d->markov_bias, d->host_bias, DS4_N_VOCAB);
+        if (!ok) break;
+        float *row = d->host_logits + (size_t)i * DS4_N_VOCAB;
+        for (uint32_t v = 0; v < DS4_N_VOCAB; v++) row[v] += d->host_bias[v];
+        if (bias_dump)
+            memcpy(bias_dump + (size_t)i * DS4_N_VOCAB, d->host_bias,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+        d->draft_ids[i + 1u] = (int32_t)dspark_argmax_f32(row, DS4_N_VOCAB);
+        /* proj is [dim + rank] f32; the reference computes it in fp32 from
+         * the concatenated hidden and this slot's markov embedding. */
+        double sum = 0.0;
+        const float *hidden = d->host_head_x + (size_t)i * DS4_N_EMBD;
+        for (uint32_t j = 0; j < DS4_N_EMBD; j++) sum += (double)proj[j] * hidden[j];
+        for (uint32_t j = 0; j < d->markov_rank; j++)
+            sum += (double)proj[DS4_N_EMBD + j] * embed[j];
+        d->host_conf[i] = (float)sum;
+    }
+
+    bool raw_dumped = false;
+    if (ok && d->dump_dir && d->dumped < d->dump_limit) {
+        float *hidden = xmalloc((size_t)d->target_layer_count * DS4_N_EMBD * sizeof(float));
+        float *mainx = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        if (ds41_dspark_read(d->target_hidden, hidden,
+                             (uint64_t)d->target_layer_count * DS4_N_EMBD) &&
+            ds41_dspark_read(d->main_x, mainx, DS4_N_EMBD)) {
+            ds41_dspark_dump(d, "main_hidden.f32", d->dumped, hidden,
+                             (size_t)d->target_layer_count * DS4_N_EMBD * sizeof(float));
+            ds41_dspark_dump(d, "main_x.f32", d->dumped, mainx,
+                             (size_t)DS4_N_EMBD * sizeof(float));
+        }
+        free(mainx);
+        free(hidden);
+        /* The residual the capture averaged, untouched.  Without it the NumPy
+         * gate would take main_hidden as its own input and could not see a
+         * wrong slot, a wrong weighting or a wrong layer at all. */
+        if (d->target_raw) {
+            const uint64_t raw_count =
+                (uint64_t)d->target_layer_count * DS4_N_HC * DS4_N_EMBD;
+            float *raw = xmalloc((size_t)raw_count * sizeof(float));
+            if (ds41_dspark_read(d->target_raw, raw, raw_count)) {
+                ds41_dspark_dump(d, "main_hidden_raw.f32", d->dumped, raw,
+                                 (size_t)raw_count * sizeof(float));
+                raw_dumped = true;
+            }
+            free(raw);
+        }
+        ds41_dspark_dump(d, "head_x.f32", d->dumped, d->host_head_x,
+                         (size_t)rows * DS4_N_EMBD * sizeof(float));
+        ds41_dspark_dump(d, "markov_embed.f32", d->dumped, d->host_embed,
+                         (size_t)rows * d->markov_rank * sizeof(float));
+        if (bias_dump)
+            ds41_dspark_dump(d, "markov_bias.f32", d->dumped, bias_dump,
+                             (size_t)rows * DS4_N_VOCAB * sizeof(float));
+        ds41_dspark_dump(d, "logits.f32", d->dumped, d->host_logits,
+                         (size_t)rows * DS4_N_VOCAB * sizeof(float));
+        ds41_dspark_dump(d, "confidence.f32", d->dumped, d->host_conf,
+                         (size_t)rows * sizeof(float));
+        ds41_dspark_dump(d, "draft_ids.i32", d->dumped, d->draft_ids,
+                         (size_t)(rows + 1u) * sizeof(int32_t));
+        char path[4096];
+        if (snprintf(path, sizeof(path), "%s/call%03u.json", d->dump_dir, d->dumped) <
+            (int)sizeof(path)) {
+            FILE *fp = fopen(path, "w");
+            if (fp) {
+                fprintf(fp,
+                    "{\"call\":%u,\"pos\":%u,\"input_token\":%d,\"rows\":%u,"
+                    "\"stages\":%u,\"n_embd\":%u,\"n_hc\":%u,\"n_vocab\":%u,"
+                    "\"markov_rank\":%u,\"noise_token_id\":%u,\"n_expert\":%u,"
+                    "\"n_expert_used\":%u,\"n_head\":%u,\"n_head_dim\":%u,"
+                    "\"n_out_group\":%u,\"n_lora_o\":%u,\"n_ff_exp\":%u,"
+                    "\"rms_eps\":%.17g,\"hc_eps\":%.17g,\"sinkhorn_iters\":%u,"
+                    "\"swiglu_clamp\":%.9g,\"expert_weight_scale\":%.9g,"
+                    "\"stage_dumps\":true,"
+                    "\"raw_hidden\":%s,\"window\":%u,"
+                    "\"window_rows\":%u,\"seeded\":%u,\"draft_ids\":[",
+                    d->dumped, pos, token, rows, d->stages, (unsigned)DS4_N_EMBD,
+                    (unsigned)DS4_N_HC, (unsigned)DS4_N_VOCAB, d->markov_rank,
+                    d->noise_token_id, d->n_expert, d->n_expert_used,
+                    (unsigned)DS4_N_HEAD, (unsigned)DS4_N_HEAD_DIM,
+                    (unsigned)DS4_N_OUT_GROUP, (unsigned)DS4_N_LORA_O,
+                    (unsigned)DS4_N_FF_EXP, (double)DS4_RMS_EPS, (double)DS4_HC_EPS,
+                    (unsigned)DS4_N_HC_SINKHORN_ITER, (double)DS4_SWIGLU_CLAMP_EXP,
+                    (double)DS4_EXPERT_WEIGHT_SCALE,
+                    raw_dumped ? "true" : "false",
+                    DS41_DSPARK_WINDOW,
+                    d->seeded + 1u < DS41_DSPARK_WINDOW ? d->seeded + 1u :
+                        DS41_DSPARK_WINDOW,
+                    d->seeded);
+                for (uint32_t i = 0; i <= rows; i++)
+                    fprintf(fp, "%s%d", i ? "," : "", d->draft_ids[i]);
+                fprintf(fp, "],\"target_layers\":[");
+                for (uint32_t i = 0; i < d->target_layer_count; i++)
+                    fprintf(fp, "%s%u", i ? "," : "", d->target_layers[i]);
+                fprintf(fp, "]}\n");
+                fclose(fp);
+            }
+        }
+        d->dumped++;
+    }
+    free(bias_dump);
+
+    /* The window advances once per accepted target token, for all stages. */
+    if (ok) d->seeded++;
+    d->calls++;
+    d->last_ms = (now_sec() - t0) * 1000.0;
+    d->total_ms += d->last_ms;
+    if (d->timing)
+        fprintf(stderr, "ds4: V4.1 DSpark draft call %u pos=%u %.3f ms "
+                        "(mean %.3f over %u)\n",
+                d->calls, pos, d->last_ms, d->total_ms / (double)d->calls, d->calls);
+    if (!ok) fprintf(stderr, "ds4: V4.1 DSpark draft failed at position %u\n", pos);
+    return ok;
 }
 
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
@@ -62576,6 +63609,34 @@ static bool ds4_engine_dspark_draft_available(const ds4_engine *e) {
            DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41;
 }
 
+/*
+ * 3.7 stage 4: the V4.1 draft graph exists and dispatches from the support
+ * file's tensors, so the support model needs its accelerator views back --
+ * stage 3 withheld them precisely because nothing read them.  This stays
+ * separate from ds4_engine_dspark_draft_available(), which is the *session
+ * loop's* question ("may I propose drafts from this engine?") and answers no
+ * for V4.1 until the verify loop lands in stage 5.  The rollback env closes
+ * both: with it set, ds41_dspark_configure allocates nothing and the support
+ * weights go back to being bound, reported and unmapped.
+ *
+ * e->tp.active is refused here rather than at session creation: the draft
+ * graph is single-rank only, the V4.1 `supported` predicate admits --dspark
+ * with network tensor parallelism, and that combination decoded serially
+ * before stage 4.  It still does, and it does not pay the support model's
+ * 7.8 GiB of accelerator views for a draft that would never run.
+ */
+static bool ds4_engine_v41_dspark_draft_ready(const ds4_engine *e) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    return e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+           ds4_backend_uses_graph(e->backend) && !e->tp.active &&
+           ds41_dspark_enabled();
+#else
+    (void)e;
+    return false;
+#endif
+}
+
 static DS4_MAYBE_UNUSED bool ds4_session_dspark_draft_available(
         const ds4_session *s) {
     return s && ds4_engine_dspark_draft_available(s->engine);
@@ -73046,13 +74107,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                        tp_shard_rank);
         }
         /* Only a support model the decode path can actually reach is worth
-         * wrapping as GPU views: stage 3's V4.1 draft weights are bound and
-         * reported but never dispatched, and mapping them would cost 7.8 GiB
-         * of accelerator VM (and one more way for startup to fail) for
-         * nothing.  Stage 4 gets the mapping back with the draft path. */
+         * wrapping as GPU views, which is why stage 3 left the V4.1 draft
+         * weights bound and reported but unmapped.  Stage 4 dispatches from
+         * them -- every matvec, norm, sinks and router bias in
+         * ds41_graph_dspark_step addresses dm->map, and
+         * ds4_gpu_wrap_model_range only resolves ranges that have a view --
+         * so the mapping comes back with the draft, and goes away again under
+         * DS4_DISABLE_V41_DSPARK_DRAFT. */
         const bool support_model_runtime_ready =
             e->mtp_ready ||
-            (ds4_engine_dspark_draft_available(e) && e->dspark);
+            (ds4_engine_dspark_draft_available(e) && e->dspark) ||
+            ds4_engine_v41_dspark_draft_ready(e);
         bool support_uses_secondary_rocm_cache = false;
 #ifdef DS4_ROCM_BUILD
         /* The generic range cache is already keyed by model map. Keep the
@@ -74286,6 +75351,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                     return 1;
                 }
             }
+        }
+        /* 3.7 stage 4: arm the draft graph when --dspark bound a support
+         * file.  A file that cannot be armed is a hard failure, exactly as
+         * an unusable one already is at engine open: --dspark is opt-in, and
+         * silently decoding without the draft would make the shadow gate
+         * pass by doing nothing.  An unsupported runtime shape is not that:
+         * ds41_dspark_configure returns true with g->dspark left NULL for
+         * network tensor parallelism, which decodes serially as before. */
+        if (ds4_engine_v41_dspark_draft_ready(e) &&
+            !ds41_dspark_configure(&s->ds41_graph, &e->dspark_weights)) {
+            fprintf(stderr, "ds4: V4.1 DSpark draft graph could not be armed\n");
+            ds41_graph_free(&s->ds41_graph);
+            free(s);
+            return 1;
         }
         s->prefill_cap = s->ds41_graph.prefill_cap;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
@@ -78687,6 +79766,33 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 }
 #endif
 
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+/*
+ * 3.7 stage 4 shadow mode.  With DS4_V41_DSPARK_SHADOW=1 the draft graph runs
+ * after every target token and its proposal is discarded, so the emitted
+ * tokens are exactly the serial greedy ones and the only observable effects
+ * are the dumps, the timing line and the extra GPU work.  The verify loop,
+ * acceptance and rewind are stage 5.
+ *
+ * The draft's input token is the target's own argmax, which is what
+ * forward_spec is handed in the reference (`output_ids` from Transformer
+ * .forward, model.py:1281-1284); a sampler with a temperature would feed a
+ * different token, but nothing here reaches the session's sampling.
+ */
+static void ds41_session_dspark_shadow(ds4_session *s) {
+    if (!s || !s->ds41_graph.dspark || !s->engine) return;
+    ds4_engine *e = s->engine;
+    if (e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark) return;
+    if (!ds41_dspark_shadow_enabled()) return;
+    if (s->ds41_graph.pos == 0) return;
+    const uint32_t pos = s->ds41_graph.pos - 1u;
+    const int draft_input = (int)dspark_argmax_f32(s->logits, DS4_N_VOCAB);
+    (void)ds41_graph_dspark_step(&s->ds41_graph, &e->model, &e->weights,
+                                 &e->mtp_model, &e->dspark_weights,
+                                 draft_input, pos);
+}
+#endif
+
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
@@ -78743,6 +79849,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
+        ds41_session_dspark_shadow(s);
         return 0;
     }
 #endif
