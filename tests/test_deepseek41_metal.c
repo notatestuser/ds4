@@ -583,7 +583,7 @@ static int check_rope_freqs(void) {
  * ds4.c-side branches for the same reason, and the join has no kernel at all -- a typo in its name
  * would make its A/B a pure noise measurement that nothing else could detect. */
 static int check_fusion_gates(void) {
-    static const char *const names[7] = {
+    static const char *const names[8] = {
         "DS4_METAL_DISABLE_PRE_M5_V41_PRE_COPY",
         "DS4_METAL_DISABLE_PRE_M5_V41_ROPE_PAIR",
         "DS4_METAL_DISABLE_PRE_M5_V41_QUANTIZE_STORE",
@@ -594,6 +594,11 @@ static int check_fusion_gates(void) {
          * gates a ds4.c-side branch no kernel test can reach, so this is the only model-free proof
          * that the name the A/B harness exports is the name ds4.c reads. */
         "DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_FLASH",
+        /* 3.6a (2026-09-17): bit 128 is the batched RoPE/quantize/window/publish stage. Same
+         * reason as bits 8/16/32/64: it gates a ds4.c-side branch no kernel test can reach, so
+         * this is the only model-free proof that the name the A/B harness exports is the name
+         * ds4.c reads. */
+        "DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_ROWS_A",
     };
     /* ds4_gpu_init() must have run: the pre-M5 test reads the Metal device name, and without it
      * every gate reads false and this whole check would pass vacuously. */
@@ -619,6 +624,433 @@ static int check_fusion_gates(void) {
     fprintf(stderr, "V4.1 decode fusion gates: pre_m5=%d live=0x%x, each of the %zu rollback envs "
                     "disables exactly its own fusion PASS\n", pre_m5, base,
             sizeof(names) / sizeof(*names));
+    return 1;
+}
+
+/* 3.6a (2026-09-17): exactness witness for the hoisted quantizer body. patch3_6a moves the
+ * per-element code of kernel_dsv41_quantize and kernel_dsv41_quantize_store2 into
+ * dsv41_quantize_value() so the rows kernel shares it. Both of those are on the DEFAULT
+ * single-token path, and the strict schedule bench cannot see a move that affects its control and
+ * its candidate equally -- it A/Bs one binary against itself. This is the instrument that can:
+ * an FNV-1a digest over a fixed matrix of modes and magnitudes, run once with
+ * DS4_METAL_DSV41_SOURCE pointing at the pre-patch metal/dsv41.metal and once without. The two
+ * digests must be equal. (Mode 0 of ds4_gpu_dsv41_quantize takes kernel_dsv41_bf16_linear, which
+ * this patch does not touch; the store variant below covers mode 0 of the refactored body.) */
+static int check_quantize_digest(void) {
+    enum { WIDTH = 512, ROWS = 9, N = WIDTH * ROWS, SLOT = 3, SLOTS = 16, WN = SLOTS * WIDTH };
+    ds4_gpu_tensor *a = upload(NULL, N * sizeof(float));
+    ds4_gpu_tensor *w = upload(NULL, WN * sizeof(float));
+    CHECK(a && w);
+    float *x = ds4_gpu_tensor_contents(a), *window = ds4_gpu_tensor_contents(w);
+    uint64_t digest = 14695981039346656037ull;
+    seed = 7919;
+    for (int mode = 0; mode < 4; mode++) {
+        for (int magnitude = 0; magnitude < 3; magnitude++) {
+            for (int store = 0; store < 2; store++) {
+                for (size_t j = 0; j < N; j++)
+                    x[j] = random_value() * (float)(1u << (magnitude * 5));
+                for (size_t j = 0; j < WN; j++) window[j] = (float)(j % 251) - 125.0f;
+                CHECK(ds4_gpu_begin_commands());
+                CHECK(store ?
+                    ds4_gpu_dsv41_quantize_store(a, WIDTH, ROWS, (ds4_v41_activation_format)mode,
+                                                 w, (uint64_t)SLOT * WIDTH * 4u) :
+                    ds4_gpu_dsv41_quantize(a, WIDTH, ROWS, (ds4_v41_activation_format)mode));
+                CHECK(ds4_gpu_end_commands());
+                const unsigned char *bytes = (const unsigned char *)x;
+                for (size_t j = 0; j < N * sizeof(float); j++) {
+                    digest ^= bytes[j];
+                    digest *= 1099511628211ull;
+                }
+            }
+        }
+    }
+    ds4_gpu_tensor_free(w); ds4_gpu_tensor_free(a);
+    printf("quantize_digest=%016llx\n", (unsigned long long)digest);
+    fprintf(stderr, "V4.1 quantize digest over 24 fixed dispatches: %016llx\n",
+            (unsigned long long)digest);
+    return 1;
+}
+
+/* 3.6a: the four rows kernels against the per-row dispatch sequences they replace.
+ *
+ * This is the memcmp half of the exactness claim: at N in {1,2,4,8}, with the rows at different
+ * absolute positions, one rows dispatch must produce byte for byte what N single-row dispatches
+ * produce, and must touch nothing else -- not another row's slice, not another slot of a window,
+ * not the cache of a row that is not publishing. The row table is built here exactly as
+ * ds41_attention_rows builds it, so a wrong stride, a wrong slot or a missing useResource shows up
+ * as a diff (or, under MTL_SHADER_VALIDATION=1, as a fault). */
+static int check_rows_a(void) {
+    enum { WIDTH = 512, KEY = 128, HEADS = 4, MAX_ROWS = 8, SLOTS = 128, CACHE = 256 };
+    /* Positions chosen so the rows differ in every way the kernels can see: slot (pos % 128),
+     * parity (the pool2 branch), and n_comp. The largest is the last position the RoPE accepts. */
+    const uint32_t positions[MAX_ROWS] = {0, 1, 127, 128, 129, 254, 255, 1048575};
+    const uint32_t counts[] = {1, 2, 4, 8};
+    ds4_gpu_tensor *ra = upload(NULL, ((size_t)MAX_ROWS * HEADS * WIDTH + 1) * sizeof(float));
+    ds4_gpu_tensor *rb = upload(NULL, ((size_t)MAX_ROWS * HEADS * WIDTH + 1) * sizeof(float));
+    CHECK(ra && rb);
+    float *xa = ds4_gpu_tensor_contents(ra), *xb = ds4_gpu_tensor_contents(rb);
+
+    /* (1) RoPE. Both frequency tables, both directions, the head counts the decode step uses. */
+    const uint32_t head_counts[] = {1, HEADS};
+    for (uint32_t kind = 0; kind < 2; kind++) for (uint32_t inverse = 0; inverse < 2; inverse++)
+    for (size_t hi = 0; hi < sizeof(head_counts) / sizeof(*head_counts); hi++)
+    for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+        const uint32_t heads = head_counts[hi], rows = counts[ci];
+        const size_t n = (size_t)rows * heads * WIDTH;
+        for (size_t j = 0; j < n; j++) xa[j] = xb[j] = bf16(random_value());
+        xa[n] = xb[n] = 12345;
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_rope_rows(ra, WIDTH, heads, rows, positions, kind, inverse));
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_tensor *v = ds4_gpu_tensor_view(rb, (uint64_t)r * heads * WIDTH * 4u,
+                                                    (uint64_t)heads * WIDTH * 4u);
+            CHECK(v && ds4_gpu_dsv41_rope(v, WIDTH, heads, 1, positions[r], kind, inverse));
+            ds4_gpu_tensor_free(v);
+        }
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(xa, xb, (n + 1) * sizeof(float)) && xa[n] == 12345);
+    }
+    CHECK(!ds4_gpu_dsv41_rope_rows(ra, WIDTH, HEADS, 0, positions, true, false));
+    CHECK(!ds4_gpu_dsv41_rope_rows(ra, WIDTH, HEADS, MAX_ROWS + 1u, positions, true, false));
+    CHECK(!ds4_gpu_dsv41_rope_rows(ra, WIDTH, HEADS, 1, NULL, true, false));
+    CHECK(!ds4_gpu_dsv41_rope_rows(ra, 32, HEADS, 1, positions, true, false));
+    CHECK(!ds4_gpu_dsv41_rope_rows(NULL, WIDTH, HEADS, 1, positions, true, false));
+    {   const uint32_t too_far[MAX_ROWS] = {1048576, 0, 0, 0, 0, 0, 0, 0};
+        CHECK(!ds4_gpu_dsv41_rope_rows(ra, WIDTH, HEADS, 1, too_far, true, false)); }
+    fprintf(stderr, "V4.1 rows RoPE: bit-identical to per-row dispatches at N=1,2,4,8, guards PASS\n");
+
+    /* (2) Quantize + window scatter. Each row scatters into its own session's window, so both the
+     * slot it writes and every slot it must not write are compared over the whole buffer. */
+    ds4_gpu_tensor *window_a[MAX_ROWS] = {0}, *window_b[MAX_ROWS] = {0};
+    for (uint32_t r = 0; r < MAX_ROWS; r++) {
+        window_a[r] = upload(NULL, (size_t)SLOTS * WIDTH * sizeof(float));
+        window_b[r] = upload(NULL, (size_t)SLOTS * WIDTH * sizeof(float));
+        CHECK(window_a[r] && window_b[r]);
+    }
+    for (int mode = 0; mode < 4; mode++)
+    for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+        const uint32_t rows = counts[ci];
+        const int block = mode == DS4_V41_FP4_E4M3 ? 16 : 32;
+        const size_t n = (size_t)rows * WIDTH;
+        for (size_t j = 0; j < n; j++)
+            xa[j] = xb[j] = random_value() * (float)(1u << ((j / block) % 4));
+        for (uint32_t r = 0; r < rows; r++) {
+            float *pa = ds4_gpu_tensor_contents(window_a[r]);
+            float *pb = ds4_gpu_tensor_contents(window_b[r]);
+            CHECK(pa && pb);
+            for (size_t j = 0; j < (size_t)SLOTS * WIDTH; j++)
+                pa[j] = pb[j] = (float)((j + r) % 251) - 125.0f;
+        }
+        CHECK(ds4_gpu_v41_rows_begin(rows));
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_v41_row row = {0};
+            row.window = window_a[r];
+            row.pos = positions[r];
+            CHECK(ds4_gpu_v41_rows_set(r, &row));
+        }
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_quantize_window_rows(ra, WIDTH, rows,
+                                                 (ds4_v41_activation_format)mode, SLOTS));
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_tensor *v = ds4_gpu_tensor_view(rb, (uint64_t)r * WIDTH * 4u, WIDTH * 4u);
+            CHECK(v && ds4_gpu_dsv41_quantize(v, WIDTH, 1, (ds4_v41_activation_format)mode) &&
+                  ds4_gpu_tensor_copy(window_b[r], (uint64_t)(positions[r] % SLOTS) * WIDTH * 4u,
+                                      v, 0, WIDTH * 4u));
+            ds4_gpu_tensor_free(v);
+        }
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(xa, xb, n * sizeof(float)));
+        for (uint32_t r = 0; r < rows; r++)
+            CHECK(!memcmp(ds4_gpu_tensor_contents(window_a[r]),
+                          ds4_gpu_tensor_contents(window_b[r]),
+                          (size_t)SLOTS * WIDTH * sizeof(float)));
+    }
+    /* A half-built table must not reach a dispatch: begin(2) with only row 0 set is refused, and
+     * so is a 3-row dispatch against a 2-row table -- otherwise the kernel would read a stale or
+     * zero address and fault. */
+    CHECK(ds4_gpu_v41_rows_begin(2));
+    {   ds4_gpu_v41_row row = {0}; row.window = window_a[0]; row.pos = 1;
+        CHECK(ds4_gpu_v41_rows_set(0, &row));
+        CHECK(!ds4_gpu_dsv41_quantize_window_rows(ra, WIDTH, 2, DS4_V41_FP8_E8M0, SLOTS));
+        CHECK(ds4_gpu_v41_rows_set(1, &row));
+        CHECK(!ds4_gpu_v41_rows_set(2, &row));
+        CHECK(!ds4_gpu_v41_rows_set(0, NULL)); }
+    CHECK(!ds4_gpu_dsv41_quantize_window_rows(ra, WIDTH, 3, DS4_V41_FP8_E8M0, SLOTS));
+    CHECK(!ds4_gpu_dsv41_quantize_window_rows(ra, WIDTH, 2, DS4_V41_FP8_E8M0, 0));
+    CHECK(!ds4_gpu_dsv41_quantize_window_rows(ra, WIDTH, 2, (ds4_v41_activation_format)4, SLOTS));
+    CHECK(!ds4_gpu_dsv41_quantize_window_rows(ra, 24, 2, DS4_V41_FP8_E8M0, SLOTS));
+    CHECK(!ds4_gpu_dsv41_quantize_window_rows(ra, WIDTH, MAX_ROWS + 1u, DS4_V41_FP8_E8M0, SLOTS));
+    CHECK(!ds4_gpu_dsv41_quantize_window_rows(NULL, WIDTH, 2, DS4_V41_FP8_E8M0, SLOTS));
+    CHECK(!ds4_gpu_v41_rows_begin(MAX_ROWS + 1u));
+    CHECK(!ds4_gpu_v41_rows_begin(0));
+    fprintf(stderr, "V4.1 rows quantize + window scatter: bit-identical to quantize + copy in all "
+                    "four formats at N=1,2,4,8, guards PASS\n");
+
+    /* (3) Pooling. Mixed odd/even positions in one batch: the odd rows take the pair branch and
+     * read previous_*, the even rows take the carry branch and write it. */
+    ds4_gpu_tensor *pool_a = upload(NULL, (size_t)MAX_ROWS * WIDTH * sizeof(float));
+    ds4_gpu_tensor *pool_b = upload(NULL, (size_t)MAX_ROWS * WIDTH * sizeof(float));
+    ds4_gpu_tensor *scores = upload(NULL, (size_t)MAX_ROWS * WIDTH * sizeof(float));
+    ds4_gpu_tensor *prev_kv_a[MAX_ROWS] = {0}, *prev_kv_b[MAX_ROWS] = {0};
+    ds4_gpu_tensor *prev_sc_a[MAX_ROWS] = {0}, *prev_sc_b[MAX_ROWS] = {0};
+    CHECK(pool_a && pool_b && scores);
+    for (uint32_t r = 0; r < MAX_ROWS; r++) {
+        prev_kv_a[r] = upload(NULL, WIDTH * sizeof(float));
+        prev_kv_b[r] = upload(NULL, WIDTH * sizeof(float));
+        prev_sc_a[r] = upload(NULL, WIDTH * sizeof(float));
+        prev_sc_b[r] = upload(NULL, WIDTH * sizeof(float));
+        CHECK(prev_kv_a[r] && prev_kv_b[r] && prev_sc_a[r] && prev_sc_b[r]);
+    }
+    for (uint32_t ratio = 1; ratio <= 2; ratio++)
+    for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+        const uint32_t rows = counts[ci];
+        const size_t n = (size_t)rows * WIDTH;
+        float *kv = ds4_gpu_tensor_contents(ra), *sc = ds4_gpu_tensor_contents(scores);
+        float *ga = ds4_gpu_tensor_contents(pool_a), *gb = ds4_gpu_tensor_contents(pool_b);
+        CHECK(kv && sc && ga && gb);
+        for (size_t j = 0; j < n; j++) { kv[j] = bf16(random_value()); sc[j] = random_value(); }
+        /* An even row leaves `out` untouched in the per-row path and gets kv in the rows kernel;
+         * seeding the reference with kv states that intent instead of hiding it. */
+        for (size_t j = 0; j < n; j++) { ga[j] = -7.5f; gb[j] = kv[j]; }
+        for (uint32_t r = 0; r < rows; r++) {
+            float *ka = ds4_gpu_tensor_contents(prev_kv_a[r]);
+            float *kb = ds4_gpu_tensor_contents(prev_kv_b[r]);
+            float *sa = ds4_gpu_tensor_contents(prev_sc_a[r]);
+            float *sb = ds4_gpu_tensor_contents(prev_sc_b[r]);
+            CHECK(ka && kb && sa && sb);
+            for (uint32_t j = 0; j < WIDTH; j++) {
+                ka[j] = kb[j] = bf16(random_value());
+                sa[j] = sb[j] = random_value();
+            }
+        }
+        CHECK(ds4_gpu_v41_rows_begin(rows));
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_v41_row row = {0};
+            row.previous_kv = ratio == 2u ? prev_kv_a[r] : NULL;
+            row.previous_score = ratio == 2u ? prev_sc_a[r] : NULL;
+            row.pos = positions[r];
+            CHECK(ds4_gpu_v41_rows_set(r, &row));
+        }
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_pool2_rows(pool_a, ra, scores, WIDTH, rows, ratio));
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_tensor *o = ds4_gpu_tensor_view(pool_b, (uint64_t)r * WIDTH * 4u, WIDTH * 4u);
+            ds4_gpu_tensor *k = ds4_gpu_tensor_view(ra, (uint64_t)r * WIDTH * 4u, WIDTH * 4u);
+            ds4_gpu_tensor *v = ds4_gpu_tensor_view(scores, (uint64_t)r * WIDTH * 4u, WIDTH * 4u);
+            CHECK(o && k && v);
+            CHECK(ratio == 2u ?
+                ds4_gpu_dsv41_pool2(o, k, v, prev_kv_b[r], prev_sc_b[r], WIDTH, 1, positions[r]) :
+                ds4_gpu_tensor_copy(o, 0, k, 0, WIDTH * 4u));
+            ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(k); ds4_gpu_tensor_free(o);
+        }
+        CHECK(ds4_gpu_end_commands());
+        CHECK(!memcmp(ga, gb, n * sizeof(float)));
+        for (uint32_t r = 0; ratio == 2u && r < rows; r++) {
+            CHECK(!memcmp(ds4_gpu_tensor_contents(prev_kv_a[r]),
+                          ds4_gpu_tensor_contents(prev_kv_b[r]), WIDTH * sizeof(float)));
+            CHECK(!memcmp(ds4_gpu_tensor_contents(prev_sc_a[r]),
+                          ds4_gpu_tensor_contents(prev_sc_b[r]), WIDTH * sizeof(float)));
+        }
+    }
+    CHECK(ds4_gpu_v41_rows_begin(2));
+    for (uint32_t r = 0; r < 2; r++) {
+        ds4_gpu_v41_row row = {0};
+        row.previous_kv = prev_kv_a[r];
+        row.previous_score = prev_sc_a[r];
+        row.pos = positions[r];
+        CHECK(ds4_gpu_v41_rows_set(r, &row));
+    }
+    CHECK(!ds4_gpu_dsv41_pool2_rows(pool_a, ra, scores, WIDTH, 2, 0));
+    CHECK(!ds4_gpu_dsv41_pool2_rows(pool_a, ra, scores, WIDTH, 2, 3));
+    CHECK(!ds4_gpu_dsv41_pool2_rows(pool_a, ra, scores, WIDTH, MAX_ROWS + 1u, 2));
+    CHECK(!ds4_gpu_dsv41_pool2_rows(pool_a, ra, scores, WIDTH, 4, 2));   /* table holds 2 rows */
+    CHECK(!ds4_gpu_dsv41_pool2_rows(NULL, ra, scores, WIDTH, 2, 2));
+    fprintf(stderr, "V4.1 rows pooling: bit-identical to per-row pool2 at ratio 1 and 2 with mixed "
+                    "parities, carry included, guards PASS\n");
+
+    /* (4) Publish scatter. Only the publishing rows may write, and only at slot n_comp - 1. */
+    ds4_gpu_tensor *keys = upload(NULL, (size_t)MAX_ROWS * KEY * sizeof(float));
+    ds4_gpu_tensor *cache_k_a[MAX_ROWS] = {0}, *cache_k_b[MAX_ROWS] = {0};
+    ds4_gpu_tensor *cache_v_a[MAX_ROWS] = {0}, *cache_v_b[MAX_ROWS] = {0};
+    CHECK(keys);
+    for (uint32_t r = 0; r < MAX_ROWS; r++) {
+        cache_k_a[r] = upload(NULL, (size_t)CACHE * KEY * sizeof(float));
+        cache_k_b[r] = upload(NULL, (size_t)CACHE * KEY * sizeof(float));
+        cache_v_a[r] = upload(NULL, (size_t)CACHE * WIDTH * sizeof(float));
+        cache_v_b[r] = upload(NULL, (size_t)CACHE * WIDTH * sizeof(float));
+        CHECK(cache_k_a[r] && cache_k_b[r] && cache_v_a[r] && cache_v_b[r]);
+    }
+    /* Positions small enough that n_comp - 1 stays inside CACHE at ratio 1 (the worst case,
+     * n_comp = pos + 1), and mixed so that at ratio 2 only the odd ones publish while the even
+     * ones must leave their sentinel untouched. */
+    const uint32_t publish_positions[MAX_ROWS] = {1, 2, 3, 20, 21, 100, 101, 190};
+    for (uint32_t ratio = 1; ratio <= 2; ratio++)
+    for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+        const uint32_t rows = counts[ci];
+        float *k = ds4_gpu_tensor_contents(keys), *v = ds4_gpu_tensor_contents(ra);
+        CHECK(k && v);
+        for (size_t j = 0; j < (size_t)rows * KEY; j++) k[j] = bf16(random_value());
+        for (size_t j = 0; j < (size_t)rows * WIDTH; j++) v[j] = bf16(random_value());
+        for (uint32_t r = 0; r < rows; r++) {
+            float *ka = ds4_gpu_tensor_contents(cache_k_a[r]);
+            float *kb = ds4_gpu_tensor_contents(cache_k_b[r]);
+            float *va = ds4_gpu_tensor_contents(cache_v_a[r]);
+            float *vb = ds4_gpu_tensor_contents(cache_v_b[r]);
+            CHECK(ka && kb && va && vb);
+            for (size_t j = 0; j < (size_t)CACHE * KEY; j++) ka[j] = kb[j] = (float)(j % 97) - 48.0f;
+            for (size_t j = 0; j < (size_t)CACHE * WIDTH; j++) va[j] = vb[j] = (float)(j % 89) - 44.0f;
+        }
+        CHECK(ds4_gpu_v41_rows_begin(rows));
+        for (uint32_t r = 0; r < rows; r++) {
+            const uint32_t pos = publish_positions[r];
+            ds4_gpu_v41_row row = {0};
+            row.compressed = cache_v_a[r];
+            row.index_cache = cache_k_a[r];
+            row.pos = pos;
+            row.n_comp = (pos + 1u) / ratio;
+            row.publish = (pos + 1u) % ratio == 0u;
+            CHECK(ds4_gpu_v41_rows_set(r, &row));
+        }
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_publish_scatter_rows(keys, ra, KEY, WIDTH, rows));
+        for (uint32_t r = 0; r < rows; r++) {
+            const uint32_t pos = publish_positions[r], n_comp = (pos + 1u) / ratio;
+            if ((pos + 1u) % ratio) continue;
+            ds4_gpu_tensor *kr = ds4_gpu_tensor_view(keys, (uint64_t)r * KEY * 4u, KEY * 4u);
+            ds4_gpu_tensor *vr = ds4_gpu_tensor_view(ra, (uint64_t)r * WIDTH * 4u, WIDTH * 4u);
+            CHECK(kr && vr);
+            CHECK(ds4_gpu_tensor_copy(cache_k_b[r], (uint64_t)(n_comp - 1u) * KEY * 4u, kr, 0, KEY * 4u));
+            CHECK(ds4_gpu_tensor_copy(cache_v_b[r], (uint64_t)(n_comp - 1u) * WIDTH * 4u, vr, 0, WIDTH * 4u));
+            ds4_gpu_tensor_free(vr); ds4_gpu_tensor_free(kr);
+        }
+        CHECK(ds4_gpu_end_commands());
+        for (uint32_t r = 0; r < rows; r++) {
+            CHECK(!memcmp(ds4_gpu_tensor_contents(cache_k_a[r]),
+                          ds4_gpu_tensor_contents(cache_k_b[r]), (size_t)CACHE * KEY * sizeof(float)));
+            CHECK(!memcmp(ds4_gpu_tensor_contents(cache_v_a[r]),
+                          ds4_gpu_tensor_contents(cache_v_b[r]), (size_t)CACHE * WIDTH * sizeof(float)));
+        }
+    }
+    CHECK(ds4_gpu_v41_rows_begin(2));
+    for (uint32_t r = 0; r < 2; r++) {
+        ds4_gpu_v41_row row = {0};
+        row.compressed = cache_v_a[r];
+        row.index_cache = cache_k_a[r];
+        row.pos = 1; row.n_comp = 1; row.publish = 0;
+        CHECK(ds4_gpu_v41_rows_set(r, &row));
+    }
+    CHECK(!ds4_gpu_dsv41_publish_scatter_rows(keys, ra, WIDTH, KEY, 2));
+    CHECK(!ds4_gpu_dsv41_publish_scatter_rows(keys, ra, KEY, WIDTH, MAX_ROWS + 1u));
+    CHECK(!ds4_gpu_dsv41_publish_scatter_rows(keys, ra, KEY, WIDTH, 4));   /* table holds 2 rows */
+    CHECK(!ds4_gpu_dsv41_publish_scatter_rows(keys, ra, 0, WIDTH, 2));
+    CHECK(!ds4_gpu_dsv41_publish_scatter_rows(NULL, ra, KEY, WIDTH, 2));
+    fprintf(stderr, "V4.1 rows publish scatter: bit-identical to the per-row copies, "
+                    "non-publishing caches untouched, guards PASS\n");
+
+    /* (5) The destination bounds. The two ds4_gpu_tensor_copy calls and the window copy this stage
+     * replaces all began by refusing a write past the end of their destination; a raw GPU address
+     * cannot, so the encode helpers check it on the host and this is the proof that they do -- and
+     * that they do not merely refuse everything, which would pass a negative-only test while the
+     * stage never ran. Each rejection below is otherwise a write into whatever follows another
+     * session's cache: production has no shader validation layer to catch it. */
+    CHECK(ds4_gpu_v41_rows_begin(2));
+    for (uint32_t r = 0; r < 2; r++) {
+        ds4_gpu_v41_row row = {0};
+        row.window = window_a[r]; row.compressed = cache_v_a[r]; row.index_cache = cache_k_a[r];
+        row.previous_kv = prev_kv_a[r]; row.previous_score = prev_sc_a[r];
+        row.pos = positions[r]; row.n_comp = CACHE; row.publish = 1;
+        CHECK(ds4_gpu_v41_rows_set(r, &row));
+    }
+    /* Positive controls: the last slot of each destination is accepted, on the persistent encoder
+     * production uses. */
+    CHECK(ds4_gpu_begin_commands());
+    CHECK(ds4_gpu_dsv41_quantize_window_rows(ra, WIDTH, 2, DS4_V41_FP8_E8M0, SLOTS));
+    CHECK(ds4_gpu_dsv41_pool2_rows(pool_a, ra, scores, WIDTH, 2, 2));
+    CHECK(ds4_gpu_dsv41_publish_scatter_rows(keys, ra, KEY, WIDTH, 2));
+    CHECK(ds4_gpu_end_commands());
+    /* The window holds SLOTS slots of WIDTH; a dispatch claiming more slots, or a wider row than
+     * the slot it would land in, is refused. */
+    CHECK(!ds4_gpu_dsv41_quantize_window_rows(ra, WIDTH, 2, DS4_V41_FP8_E8M0, SLOTS + 1u));
+    CHECK(!ds4_gpu_dsv41_quantize_window_rows(ra, WIDTH * 2u, 2, DS4_V41_FP8_E8M0, SLOTS));
+    /* One row past the end of the caches: slot n_comp - 1 = CACHE is outside both. */
+    CHECK(ds4_gpu_v41_rows_begin(2));
+    for (uint32_t r = 0; r < 2; r++) {
+        ds4_gpu_v41_row row = {0};
+        row.compressed = cache_v_a[r]; row.index_cache = cache_k_a[r];
+        row.pos = positions[r]; row.n_comp = CACHE + 1u; row.publish = 1;
+        CHECK(ds4_gpu_v41_rows_set(r, &row));
+    }
+    CHECK(!ds4_gpu_dsv41_publish_scatter_rows(keys, ra, KEY, WIDTH, 2));
+    /* publish with n_comp == 0 would wrap the slot to 0xFFFFFFFF: the row itself is refused. */
+    CHECK(ds4_gpu_v41_rows_begin(1));
+    {   ds4_gpu_v41_row row = {0};
+        row.compressed = cache_v_a[0]; row.index_cache = cache_k_a[0];
+        row.n_comp = 0; row.publish = 1;
+        CHECK(!ds4_gpu_v41_rows_set(0, &row));
+        row.n_comp = 1;
+        CHECK(ds4_gpu_v41_rows_set(0, &row)); }
+    /* A destination this layer never set resolves to address 0; no dispatch may dereference it. */
+    CHECK(ds4_gpu_v41_rows_begin(1));
+    {   ds4_gpu_v41_row row = {0}; row.pos = 5; row.n_comp = 1; row.publish = 1;
+        CHECK(ds4_gpu_v41_rows_set(0, &row)); }
+    CHECK(!ds4_gpu_dsv41_quantize_window_rows(ra, WIDTH, 1, DS4_V41_FP8_E8M0, SLOTS));
+    CHECK(!ds4_gpu_dsv41_pool2_rows(pool_a, ra, scores, WIDTH, 1, 2));
+    CHECK(!ds4_gpu_dsv41_publish_scatter_rows(keys, ra, KEY, WIDTH, 1));
+    /* ...but ratio 1 never touches previous_*, so that same table is fine for the plain copy. */
+    CHECK(ds4_gpu_begin_commands());
+    CHECK(ds4_gpu_dsv41_pool2_rows(pool_a, ra, scores, WIDTH, 1, 1));
+    CHECK(ds4_gpu_end_commands());
+    /* A previous_kv shorter than the width: refused at ratio 2. */
+    {   ds4_gpu_tensor *half = ds4_gpu_tensor_view(prev_kv_a[0], 0, (WIDTH / 2u) * 4u);
+        CHECK(half);
+        CHECK(ds4_gpu_v41_rows_begin(1));
+        ds4_gpu_v41_row row = {0};
+        row.previous_kv = half; row.previous_score = prev_sc_a[0]; row.pos = 1;
+        CHECK(ds4_gpu_v41_rows_set(0, &row));
+        CHECK(!ds4_gpu_dsv41_pool2_rows(pool_a, ra, scores, WIDTH, 1, 2));
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_pool2_rows(pool_a, ra, scores, WIDTH / 2u, 1, 2));
+        CHECK(ds4_gpu_end_commands());
+        ds4_gpu_tensor_free(half); }
+    fprintf(stderr, "V4.1 rows table bounds: window slots, cache slots, previous_* width, the "
+                    "n_comp == 0 wrap and unset addresses are all refused on the host, and the "
+                    "last valid slot of each is accepted, guards PASS\n");
+
+    for (uint32_t r = 0; r < MAX_ROWS; r++) {
+        ds4_gpu_tensor_free(cache_v_b[r]); ds4_gpu_tensor_free(cache_v_a[r]);
+        ds4_gpu_tensor_free(cache_k_b[r]); ds4_gpu_tensor_free(cache_k_a[r]);
+        ds4_gpu_tensor_free(prev_sc_b[r]); ds4_gpu_tensor_free(prev_sc_a[r]);
+        ds4_gpu_tensor_free(prev_kv_b[r]); ds4_gpu_tensor_free(prev_kv_a[r]);
+        ds4_gpu_tensor_free(window_b[r]); ds4_gpu_tensor_free(window_a[r]);
+    }
+    ds4_gpu_tensor_free(keys);
+    ds4_gpu_tensor_free(scores); ds4_gpu_tensor_free(pool_b); ds4_gpu_tensor_free(pool_a);
+    ds4_gpu_tensor_free(rb); ds4_gpu_tensor_free(ra);
+
+    /* (6) The table must not survive a cleanup/init cycle. views[] is __unsafe_unretained and
+     * n_rows/filled/the capacities are plain scalars, so a table left behind would still satisfy
+     * ds4_gpu_v41_rows_ready() and pass up to 40 released MTLBuffer handles to
+     * -useResources:count:usage: on the next dispatch -- a GPU fault or worse, and the one stale
+     * state the readiness guard cannot see. ds4_gpu_cleanup() clears it (ds4_gpu_v41_rows_reset);
+     * this is the witness, and it runs last because it releases everything allocated above. */
+    {   ds4_gpu_tensor *window = upload(NULL, (size_t)SLOTS * WIDTH * sizeof(float));
+        CHECK(window);
+        CHECK(ds4_gpu_v41_rows_begin(1));
+        ds4_gpu_v41_row row = {0};
+        row.window = window;
+        row.pos = 3;
+        CHECK(ds4_gpu_v41_rows_set(0, &row));
+        ds4_gpu_tensor_free(window);
+        ds4_gpu_cleanup();
+        CHECK(ds4_gpu_init());
+        ds4_gpu_tensor *fresh = upload(NULL, WIDTH * sizeof(float));
+        CHECK(fresh);
+        CHECK(!ds4_gpu_dsv41_quantize_window_rows(fresh, WIDTH, 1, DS4_V41_FP8_E8M0, SLOTS));
+        ds4_gpu_tensor_free(fresh);
+        fprintf(stderr, "V4.1 rows table cleared by ds4_gpu_cleanup: a dispatch after a "
+                        "cleanup/init cycle is refused, guards PASS\n");
+    }
+    fprintf(stderr, "V4.1 batched attention rows, stage (a): PASS\n");
     return 1;
 }
 #endif
@@ -1388,7 +1820,11 @@ static int check_embedding(void) {
 static int check_index_projection(void) {
     enum { MAX_ROWS = 4096 };
     const uint32_t widths[] = {1280, 5120, 5120, 512}, outputs[] = {4096, 32, 512, 128};
-    const uint32_t counts[] = {1, 31, 64, 65, 513, 2048, MAX_ROWS};
+    /* 3.6a (2026-09-17): 2..8 are the decode batch widths. ds41_project_rows sends a batched
+     * decode step's compressor and indexer projections through here, and the memcmp below against
+     * N single-row dispatches is what makes stage (a) bit-identical per row rather than merely
+     * "batched == sequential"; nothing exercised those widths before. */
+    const uint32_t counts[] = {1, 2, 3, 4, 5, 6, 7, 8, 31, 64, 65, 513, 2048, MAX_ROWS};
     for (uint32_t shape = 0; shape < 4; shape++) {
         const uint32_t width = widths[shape], output = outputs[shape];
         const size_t weight_bytes = (size_t)width * output * sizeof(uint16_t);
@@ -2418,18 +2854,61 @@ static int check_fused_bf16(void) {
         fprintf(stderr, "Q8 matvec + BF16 epilogue %5u x %6u: bit-identical (fused, and with the rollback env set)\n", in, outn);
         ds4_gpu_tensor_free(xv); ds4_gpu_tensor_free(av); ds4_gpu_tensor_free(bv); ds4_gpu_tensor_free(cv);
     }
-    {
-        ds4_gpu_tensor *xv = ds4_gpu_tensor_view(xt, 0, 5120 * 4);
-        ds4_gpu_tensor *av = ds4_gpu_tensor_view(a, 0, 5120 * 4), *bv = ds4_gpu_tensor_view(b, 0, 5120 * 4);
-        CHECK(xv && av && bv);
-        CHECK(ds4_gpu_begin_commands());
-        CHECK(ds4_gpu_rms_norm_weight_tensor(av, xv, model, model_bytes, norm_off, 5120, 1e-6f));
-        CHECK(ds4_gpu_dsv41_quantize(av, 5120, 1, DS4_V41_BF16));
-        CHECK(ds4_gpu_rms_norm_weight_bf16_tensor(bv, xv, model, model_bytes, norm_off, 5120, 1e-6f));
-        CHECK(ds4_gpu_end_commands());
-        CHECK(!memcmp(ds4_gpu_tensor_contents(av), ds4_gpu_tensor_contents(bv), 5120 * 4));
-        fprintf(stderr, "weighted RMS norm + BF16 epilogue 5120: bit-identical\n");
-        ds4_gpu_tensor_free(xv); ds4_gpu_tensor_free(av); ds4_gpu_tensor_free(bv);
+    {   /* 3.6a (2026-09-17): 5120 is the residual norm; 512 (attn_compressor_norm) and 128
+         * (indexer_k_norm) are the two widths the V4.1 publish tail asks for, and the batched
+         * decode step replaces N of those calls with one rows dispatch. */
+        static const uint32_t norm_widths[] = {5120, 512, 128};
+        for (size_t wi = 0; wi < sizeof(norm_widths) / sizeof(*norm_widths); wi++) {
+            const uint32_t n = norm_widths[wi];
+            ds4_gpu_tensor *xv = ds4_gpu_tensor_view(xt, 0, n * 4);
+            ds4_gpu_tensor *av = ds4_gpu_tensor_view(a, 0, n * 4), *bv = ds4_gpu_tensor_view(b, 0, n * 4);
+            CHECK(xv && av && bv);
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_rms_norm_weight_tensor(av, xv, model, model_bytes, norm_off, n, 1e-6f));
+            CHECK(ds4_gpu_dsv41_quantize(av, n, 1, DS4_V41_BF16));
+            CHECK(ds4_gpu_rms_norm_weight_bf16_tensor(bv, xv, model, model_bytes, norm_off, n, 1e-6f));
+            CHECK(ds4_gpu_end_commands());
+            CHECK(!memcmp(ds4_gpu_tensor_contents(av), ds4_gpu_tensor_contents(bv), n * 4));
+            fprintf(stderr, "weighted RMS norm + BF16 epilogue %u: bit-identical\n", n);
+            ds4_gpu_tensor_free(xv); ds4_gpu_tensor_free(av); ds4_gpu_tensor_free(bv);
+        }
+        /* 3.6a: and the substitution itself. ds41_norm_batch() is
+         * ds4_gpu_rms_norm_weight_rows_tensor + one batched BF16 quantize; the calls it replaces
+         * are N x ds41_norm(), which on this device is the fused single-row kernel. Byte for byte,
+         * per row, at the two widths and every decode batch width. Nothing pinned rows > 1 before:
+         * the rows entry point is the same pipeline with dispatchThreadgroups(rows,1,1), and this
+         * is the memcmp that says so. */
+        {   static const uint32_t rows_widths[] = {512, 128};
+            static const uint32_t row_counts[] = {1, 2, 4, 8};
+            for (size_t wi = 0; wi < sizeof(rows_widths) / sizeof(*rows_widths); wi++)
+            for (size_t ri = 0; ri < sizeof(row_counts) / sizeof(*row_counts); ri++) {
+                const uint32_t n = rows_widths[wi], rows = row_counts[ri];
+                const uint64_t bytes = (uint64_t)n * rows * 4;
+                ds4_gpu_tensor *xv = ds4_gpu_tensor_view(xt, 0, bytes);
+                ds4_gpu_tensor *av = ds4_gpu_tensor_view(a, 0, bytes);
+                ds4_gpu_tensor *bv = ds4_gpu_tensor_view(b, 0, bytes);
+                CHECK(xv && av && bv);
+                CHECK(ds4_gpu_begin_commands());
+                CHECK(ds4_gpu_rms_norm_weight_rows_tensor(av, xv, model, model_bytes, norm_off,
+                                                          n, rows, 1e-6f));
+                CHECK(ds4_gpu_dsv41_quantize(av, n, rows, DS4_V41_BF16));
+                for (uint32_t r = 0; r < rows; r++) {
+                    ds4_gpu_tensor *xr = ds4_gpu_tensor_view(xt, (uint64_t)r * n * 4, n * 4);
+                    ds4_gpu_tensor *br = ds4_gpu_tensor_view(b, (uint64_t)r * n * 4, n * 4);
+                    CHECK(xr && br);
+                    CHECK(ds4_gpu_rms_norm_weight_bf16_tensor(br, xr, model, model_bytes,
+                                                              norm_off, n, 1e-6f));
+                    ds4_gpu_tensor_free(br); ds4_gpu_tensor_free(xr);
+                }
+                CHECK(ds4_gpu_end_commands());
+                CHECK(!memcmp(ds4_gpu_tensor_contents(av), ds4_gpu_tensor_contents(bv), (size_t)bytes));
+                fprintf(stderr, "weighted RMS norm rows n=%u rows=%u: bit-identical to %u fused "
+                                "single-row norms\n", n, rows, rows);
+                ds4_gpu_tensor_free(bv); ds4_gpu_tensor_free(av); ds4_gpu_tensor_free(xv);
+            }
+            fprintf(stderr, "V4.1 batched norm substitution (ds41_norm_batch vs N x ds41_norm) "
+                            "at n=512,128 and N=1,2,4,8: PASS\n");
+        }
     }
     {   /* elementwise producers: SwiGLU, add, HC weighted sums, HC expand4; and the attention low projection */
         enum { E = 5120, H = 4, FF = 2304, GROUPS = 8, RANK = 1024, GDIM = 4096 };
@@ -2916,6 +3395,16 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--quantize-digest")) {
+        const int ok = ds4_gpu_init() && check_quantize_digest();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--rows-a")) {
+        const int ok = ds4_gpu_init() && check_rows_a();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--fusion-gates")) {
         /* ds4_gpu_init() first: the gates start with the Metal device name. */
         const int ok = ds4_gpu_init() && check_fusion_gates();
@@ -3021,7 +3510,7 @@ int main(int argc, char **argv) {
              check_flash_rows() && check_tp_attention();
 #ifdef __APPLE__
     if (ok) ok = check_rope_pair() && check_quantize_store() &&
-                 check_rope_freqs() && check_fusion_gates() && check_attn_out_path() &&
+                 check_rope_freqs() && check_rows_a() && check_fusion_gates() && check_attn_out_path() &&
                  check_flash_rows_desc() &&
                  check_attention_output_decode() && check_attn_out_rows() &&
                  check_pre_commit_hook();

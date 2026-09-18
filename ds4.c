@@ -40191,6 +40191,12 @@ typedef struct {
      * from a *g whose flags are false - and does not always re-point ffn_split - so it
      * keeps the copy and the two separate dispatches. */
     bool pre_fused, rope_pair_fused, quantize_store_fused;
+    /* PRE_M5 3.6a (2026-09-17): true only on the local `row` copy the batched decode step builds
+     * for a layer whose RoPE / FP8 quantize / window store / compressor publish ds41_attention_rows
+     * has already run for all N rows. ds41_attention then starts at the indexer. Never set on a
+     * session graph, so the single-token loop, the prefill sweep and the fallback path all keep
+     * the per-row front. */
+    bool rows_stage_a_done;
     uint32_t tp_world, tp_rank;
     ds4_gpu_tensor *tp_logits_half;
     ds4_gpu_tensor **tp_out, **tp_in;
@@ -40542,6 +40548,15 @@ static bool ds41_batch_attention_flash_gate(void) {
     return ds4_gpu_device_is_pre_m5_apple_silicon() &&
         !getenv("DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_FLASH");
 }
+/* PRE_M5 3.6a (2026-09-17): the batched decode step runs the RoPE, the FP8 quantize, the window
+ * store and the compressor publish of all its rows in one dispatch each instead of one set per
+ * row. This is the env/device half of the decision, kept pure so the test oracle below can observe
+ * it; the per-step eligibility (prefill rows, TP, images, GPU addresses) lives in
+ * ds41_batch_attention_rows_enabled(). */
+static bool ds41_batch_attention_rows_gate(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_ROWS_A");
+}
 
 /* Test oracle (tests/test_deepseek41_metal --fusion-gates). The helpers above are all file
  * static, so without this nothing outside ds4.c can observe the switches: a misspelt name would
@@ -40554,7 +40569,8 @@ int ds4_v41_decode_fusion_gates(void) {
            (ds41_batch_attention_output_gate() ? 8 : 0) |
            (ds41_batch_attention_output_rows_gate() ? 16 : 0) |
            (ds41_late_engram_join() ? 32 : 0) |
-           (ds41_batch_attention_flash_gate() ? 64 : 0);
+           (ds41_batch_attention_flash_gate() ? 64 : 0) |
+           (ds41_batch_attention_rows_gate() ? 128 : 0);
 }
 /* Test oracle (tests/test_deepseek41_metal --attn-out-path).  Which projection
  * ds41_graph_step_batch() selects for a `rows`-row batched step whose weights are eligible.  The
@@ -40978,6 +40994,10 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention_front(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t il) {
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    /* 3.6a: ds41_attention_select is publish + select_published. When the batched step has already
+     * run stage (a) for this row with the others -- RoPE, FP8 quantize, window store and publish --
+     * only the second half is left; otherwise this is 3.6c's untouched sequence. */
+    if (g->rows_stage_a_done) return ds41_attention_select_published(g, m, l, il);
     return ds41_rope_qkv(g, heads, il, g->pos) &&
            ds41_quantize_kv_store(g, il, g->pos) &&
            ds41_attention_select(g, m, l, il);
@@ -42828,6 +42848,205 @@ int ds4_v41_batch_attention_flash_desc(unsigned rows, const unsigned *positions,
 }
 #endif
 
+#ifdef __APPLE__
+/* PRE_M5 3.6a (2026-09-17): the weight types whose 2..8-row projection through ds41_project_rows
+ * is the single-row matvec per row, so that stage (a)'s compressor and indexer projections are
+ * bit-identical to the ones ds41_attention_publish issues:
+ *   F16  -> ds4_gpu_dsv41_projection_rows, ds4_gpu_matmul_f16_tensor_impl(..., exact_rows = true):
+ *           the n_tok == 1 matvec branch on a grid of (out_dim/nr0, rows, 1), memcmp'd against N
+ *           single-row dispatches by tests --index-projection at the decode widths 1..8;
+ *   Q8_0 -> ds4_gpu_matmul_q8_0_decode_rows_exact_tensor, the single-row function/nr0/nsg/smem
+ *           with the row as the grid's y;
+ *   F32  -> ds41_matmul_batch loops the single-row matvec itself.
+ * Anything else falls through ds41_matmul_batch to metal_graph_matmul_plain_tensor(..., count),
+ * which for count >= 2 is a batched mul_mm with a different reduction: still "batched ==
+ * sequential" by upstream's standard, but NOT the per-row bit-identity this stage claims, and
+ * with no test behind it. The gate below refuses such a model outright.
+ *
+ * The Q8_0 arm ASKS ds41_matmul_batch_q8_row_exact() -- the predicate ds41_matmul_batch itself
+ * branches on, which the committed 3.6d lifted out for exactly this purpose -- instead of
+ * restating it. A restatement is how the first revision of 3.6d shipped green: the selector moved
+ * and the stage silently became a mul_mv_ext reduction. Asking means a later change to
+ * DS4_TP_BATCH_MAX_ROWS, to the vocabulary-head carve-out or to that predicate makes this stage
+ * fall back loudly instead of quietly widening its claim. It is therefore a function of the
+ * step's row count too, not of the weight alone.
+ *
+ * ...and that predicate only describes the UNROUNDED half of the pair, which is why `round` is a
+ * parameter here. Both projections this stage replaces are issued with round = true on the per-row
+ * side for at least one shape (attn_compressor_kv at ratio 1, indexer_attn_k always), and there
+ * ds41_matmul() takes the FUSED ds4_gpu_matmul_q8_0_tensor_bf16() while ds41_matmul_batch() takes
+ * ds4_gpu_matmul_q8_0_decode_rows_exact_tensor() plus a separate BF16 quantize. Those two are
+ * pinned equal in-tree only at the committed 3.6d's out_b shape (8192 -> 5120, tests
+ * --attention-output-decode), never at the compressor's 5120 -> 512 or the indexer's 512 -> 128.
+ * This stage does not assume it: a rounded Q8_0 projection refuses the step, with the same one
+ * line as a mul_mm weight. With the BF16 epilogue disabled, or with round = false, both sides
+ * split into matmul + quantize and the predicate above is once again the whole question. */
+static bool ds41_rows_exact_projection(const ds4_tensor *weight, uint32_t rows, bool round) {
+    if (!weight) return false;
+    if (weight->type == DS4_TENSOR_Q8_0) {
+        if (round && ds41_bf16_epilogue_enabled()) return false;
+        return ds41_matmul_batch_q8_row_exact(rows, (uint32_t)weight->dim[1], weight->type);
+    }
+    return weight->type == DS4_TENSOR_F16 || weight->type == DS4_TENSOR_F32;
+}
+
+/* PRE_M5 3.6a (2026-09-17): is stage (a) of the batched attention available for this step?
+ *
+ * Exclusions, design-3_6.md 4.1: rows that share a session (prefill_rows > 0) read and write
+ * previous_kv/previous_score in position order and would race on the same compressed slot -- a
+ * serial dependency a rows kernel cannot express; TP slices the caches per rank; images change the
+ * embed and the Engram mask; streaming, quality and imatrix steps take other paths. Plus the
+ * device gate and the rollback env, and plus GPU buffer addresses: the row table passes
+ * session-private caches to the kernels by address, and ds4_gpu_buffer_address returns 0 below
+ * macOS 13, where a rows kernel would dereference it (design 4.4).
+ *
+ * Those flags are asked of EVERY row, not of the workspace graph: ds41_batch_workspace() returns
+ * whichever member happens to have the largest ctx, so a gate that read only that one would be a
+ * no-op for the other seven rows and a batch holding one image or streaming session beside a
+ * larger plain one would take the branch anyway.
+ *
+ * And the weights: stage (a)'s three compressor/indexer projections go through ds41_project_rows,
+ * which is bit-identical per row only for F16, and for Q8_0/F32 on the branch of ds41_matmul_batch
+ * that keeps the single-row geometry at THIS step's row count (see ds41_rows_exact_projection);
+ * the pooling implements only ratio 1 and 2. A model outside that is refused for the whole step
+ * with one line, the way ds41_batch_attention_output_enabled refuses an out_b ds41_matmul_batch
+ * would not project row-exactly, rather than silently widening the claim from "bit-identical per
+ * row" to "batched == sequential".
+ *
+ * The one stderr line the first time the branch is live is not decoration: every model-level gate
+ * in the runner is satisfied by the untouched per-row loop, so without it a silent fallback (wrong
+ * device, TP, a rollback left in the environment) would be recorded as a clean, free stage. The
+ * runner greps for it, and for its ABSENCE in the concurrency-1 parity runs, which is how it
+ * proves the single-token path never enters here. */
+static bool ds41_batch_attention_rows_enabled(ds41_gpu_graph *const *graphs, int count,
+                                              const ds4_weights *w, uint32_t prefill_rows) {
+    if (prefill_rows != 0u || !graphs || !w || count < 2 ||
+        !ds41_batch_attention_rows_gate()) return false;
+    for (int i = 0; i < count; i++) {
+        const ds41_gpu_graph *row = graphs[i];
+        if (!row || row->tp_world != 1 || row->streaming || row->quality ||
+            row->imatrix || row->image_count) return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds41_kv_source(il)) continue;
+        const ds4_layer_weights *l = &w->layer[il];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        /* The `round` flags are the ones ds41_attention_rows passes to ds41_project_rows for these
+         * same three weights, which are in turn the ones ds41_attention_publish passes to
+         * ds41_matmul: the question asked is the question the step will ask. */
+        if ((ratio == 1u || ratio == 2u) &&
+            ds41_rows_exact_projection(l->attn_compressor_kv, (uint32_t)count, ratio == 1u) &&
+            ds41_rows_exact_projection(l->indexer_attn_k, (uint32_t)count, true) &&
+            (ratio != 2u ||
+             ds41_rows_exact_projection(l->attn_compressor_gate, (uint32_t)count, false))) continue;
+        static bool weights_warned = false;
+        if (!weights_warned) {
+            fprintf(stderr, "ds4: V4.1 batched attention rows unavailable (layer %u compressor or "
+                    "indexer weights are not F16, and are not a type ds41_matmul_batch would "
+                    "project row-exactly for %d rows at the rounding this step asks for, or its "
+                    "compression ratio is not 1 or 2); "
+                    "using the per-row RoPE/quantize/window/publish\n", il, count);
+            weights_warned = true;
+        }
+        return false;
+    }
+    if (!ds4_gpu_v41_rows_available()) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "ds4: V4.1 batched attention rows unavailable (no GPU buffer "
+                    "addresses); using the per-row RoPE/quantize/window/publish\n");
+            warned = true;
+        }
+        return false;
+    }
+    static bool announced = false;
+    if (!announced) {
+        fprintf(stderr, "ds4: V4.1 batched attention rows (a) enabled "
+                "(RoPE/quantize/window/publish once for %u rows)\n", (unsigned)DS4_TP_BATCH_MAX_ROWS);
+        announced = true;
+    }
+    return true;
+}
+
+/* Stage (a) for all `rows` rows of one layer: the front of ds41_attention (ds41_rope_qkv,
+ * ds41_quantize_kv_store) and ds41_attention_publish, computed once instead of once per row.
+ *
+ * Every activation it touches is a row-contiguous workspace view (active->q/kv/norm/pool_kv/
+ * pool_score/latent/index_k, whose row i slice is exactly g->rows_view[i]'s tensor), and every
+ * cache it touches reaches the kernels through the row table. Row r's output is a function of
+ * row r's inputs and tab[r] alone; nothing reduces across rows and no K walk depends on r or on
+ * `rows`, which is what check_batch_isolation requires.
+ *
+ * Returns 1 when the stage ran, 0 when the table could not be built (the caller runs the per-row
+ * stage (a) for this layer and the rest of the step), -1 on a hard failure. */
+static int ds41_attention_rows(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs,
+                               const ds41_prefill_row *active, const uint32_t *positions,
+                               const ds4_model *m, const ds4_layer_weights *l,
+                               uint32_t il, uint32_t rows) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    uint32_t rope_positions[DS4_TP_BATCH_MAX_ROWS] = {0};
+    bool publish_any = false;
+    if (rows < 2u || rows > DS4_TP_BATCH_MAX_ROWS || rows > DS4_GPU_V41_MAX_ROWS) return 0;
+    if (!ds4_gpu_v41_rows_begin(rows)) return 0;
+    for (uint32_t i = 0; i < rows; i++) {
+        const uint32_t pos = positions[i];
+        const bool publish = ratio != 0u && (pos + 1u) % ratio == 0u;
+        ds4_gpu_v41_row row;
+        /* window[il] and the four owner caches are session i's own, not workspace views: this is
+         * the whole reason the table exists. The unused ones stay NULL so no address is resolved
+         * and no buffer is made resident for a layer that never dereferences it. */
+        row.window = graphs[i]->window[il];
+        row.compressed = ds41_kv_source(il) ? graphs[i]->compressed[owner] : NULL;
+        row.index_cache = ds41_kv_source(il) ? graphs[i]->index_cache[owner] : NULL;
+        row.previous_kv = ds41_kv_source(il) && ratio == 2u ? graphs[i]->previous_kv[owner] : NULL;
+        row.previous_score = ds41_kv_source(il) && ratio == 2u ? graphs[i]->previous_score[owner] : NULL;
+        row.pos = pos;
+        row.n_comp = ratio ? (pos + 1u) / ratio : 0u;
+        row.publish = publish ? 1u : 0u;
+        if (!ds4_gpu_v41_rows_set(i, &row)) return 0;
+        /* The published key rotates at the first position of the pair it pools, as
+         * ds41_attention_publish's `rope_pos = pos + 1 - ratio` does. Non-publishing rows compute
+         * a discarded row; keep their position in range. */
+        rope_positions[i] = publish ? pos + 1u - ratio : 0u;
+        publish_any = publish_any || publish;
+    }
+    if (!ds4_gpu_dsv41_rope_rows(active->q, DS4_N_HEAD_DIM, heads, rows, positions,
+                                 ratio != 0, false) ||
+        !ds4_gpu_dsv41_rope_rows(active->kv, DS4_N_HEAD_DIM, 1, rows, positions,
+                                 ratio != 0, false) ||
+        !ds4_gpu_dsv41_quantize_window_rows(active->kv, DS4_N_HEAD_DIM, rows,
+                                            DS4_V41_FP8_E8M0, 128u)) return -1;
+    if (!ds41_kv_source(il)) return 1;
+    /* ratio 1 rounds the compressor projection and copies it into latent; ratio 2 leaves both
+     * projections unrounded and lets the pooling round. Exactly ds41_attention_publish. */
+    if (!ds41_project_rows(active->pool_kv, m, l->attn_compressor_kv, active->norm,
+                           rows, ratio == 1u)) return -1;
+    if (ratio == 2u && !ds41_project_rows(active->pool_score, m, l->attn_compressor_gate,
+                                          active->norm, rows, false)) return -1;
+    if (!ds4_gpu_dsv41_pool2_rows(active->latent, active->pool_kv,
+            ratio == 2u ? active->pool_score : active->pool_kv,
+            DS4_N_HEAD_DIM, rows, ratio)) return -1;
+    if (!publish_any) return 1;
+    /* The tail runs for every row and stores for the publishing ones. A non-publishing row's
+     * latent holds its own pooled kv (never uninitialised), its results are discarded, and it can
+     * change no other row: these kernels are all row-wise. */
+    if (!ds41_norm_batch(active->latent, active->latent, m, l->attn_compressor_norm, rows) ||
+        !ds41_project_rows(active->index_k, m, l->indexer_attn_k, active->latent, rows, true) ||
+        !ds41_norm_batch(active->index_k, active->index_k, m, l->indexer_k_norm, rows) ||
+        !ds4_gpu_dsv41_rope_rows(active->index_k, DS4_N_INDEXER_HEAD_DIM, 1, rows,
+                                 rope_positions, ratio != 0, false) ||
+        !ds4_gpu_dsv41_quantize(active->index_k, DS4_N_INDEXER_HEAD_DIM, rows, DS4_V41_FP4_E8M0) ||
+        !ds4_gpu_dsv41_rope_rows(active->latent, DS4_N_HEAD_DIM, 1, rows,
+                                 rope_positions, ratio != 0, false) ||
+        !ds4_gpu_dsv41_quantize(active->latent, DS4_N_HEAD_DIM, rows, DS4_V41_FP4_E4M3) ||
+        !ds4_gpu_dsv41_publish_scatter_rows(active->index_k, active->latent,
+                                            DS4_N_INDEXER_HEAD_DIM, DS4_N_HEAD_DIM, rows)) return -1;
+    return 1;
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights) {
@@ -42852,6 +43071,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
      * quantize, window store, publish, indexer select) and the per-row tail (BF16 + inverse RoPE).
      * Not const: a layer the encoder refuses turns it off for the rest of the step. */
     bool batch_flash = ds41_batch_attention_flash_enabled(g, prefill_rows, rows);
+#ifdef __APPLE__
+    /* 3.6a: one RoPE / quantize / window store / publish for all rows, decided once -- over every
+     * row's own graph, not the workspace's, and over the compressor/indexer weight types. Cleared
+     * for the rest of the step if a layer's row table cannot be built. */
+    bool batch_rows_a = ds41_batch_attention_rows_enabled(graphs, count, weights, prefill_rows);
+#endif
     /* PRE_M5 queued batched decode (2026-09-17): both Engram tables are read
      * by reader threads straight into per-row upload slots — table 0 into
      * batch.engram_rows, table 1 into the prefill staging buffer, which is
@@ -42987,9 +43212,36 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows,
                 queued && il == 14u ? engram_rows_tab1 : active.engram_rows) &&
             ds41_attention_project_batch(g, model, l, rows);
+        bool stage_a_done = false;
+#ifdef __APPLE__
+        if (ok && batch_rows_a) {
+            const int staged = ds41_attention_rows(g, graphs, &active, positions,
+                                                   model, l, il, rows);
+            if (staged < 0) ok = false;
+            else if (staged > 0) stage_a_done = true;
+            else {
+                /* design-3_6.md 4.4: one line, then the per-row loop for the rest of the step.
+                 * ds4_gpu_v41_rows_set refuses a session cache with no GPU address and a
+                 * publishing row with n_comp == 0; either is a fallback, never a raw write.
+                 * The flag is static for 3.6c's reason: batch_rows_a is recomputed at the top of
+                 * every step, so on its own it suppresses the repeat only within this token, and a
+                 * refusal that is a property of the run rather than of one layer would print one
+                 * line per TOKEN forever instead of the "one line" 4.4 asks for. */
+                batch_rows_a = false;
+                static bool warned_rows_fallback = false;
+                if (!warned_rows_fallback) {
+                    fprintf(stderr, "ds4: V4.1 batched attention rows fell back at layer %u "
+                            "(the row table could not be built for a session cache); using the "
+                            "per-row path\n", il);
+                    warned_rows_fallback = true;
+                }
+            }
+        }
+#endif
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
+            row.rows_stage_a_done = stage_a_done;
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
             DS41_PREFILL_ROWS(DS41_SESSION_ROW)
 #undef DS41_SESSION_ROW
@@ -43029,6 +43281,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph row = *graphs[i];
                 row.pos = positions[i];
+                row.rows_stage_a_done = stage_a_done;   /* 3.6a: the same row, the same answer */
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
                 DS41_PREFILL_ROWS(DS41_SESSION_ROW)
 #undef DS41_SESSION_ROW

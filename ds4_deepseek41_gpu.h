@@ -81,10 +81,59 @@ int ds4_gpu_dsv41_quantize_store(ds4_gpu_tensor *x, uint32_t width, uint32_t row
  * once under precise float control. Exported so the test can prove the host-side table is
  * unchanged; every RoPE dispatch's theta is built from it. */
 const float *ds4_gpu_dsv41_rope_frequencies(bool compressed);
-/* Test oracle for the three rollback switches, which are read by file-static helpers in ds4.c:
- * bit 0 pre copy, bit 1 q+kv RoPE, bit 2 quantize + window store; each bit is set when that
- * fusion is live for this process. */
+/* Test oracle for the rollback switches, which are read by file-static helpers in ds4.c:
+ * bit 0 pre copy, bit 1 q+kv RoPE, bit 2 quantize + window store, bit 3 batched attention output
+ * (3.6d), bit 4 rows-templated attention output and bit 5 late Engram join (3.6d2), bit 6 batched
+ * attention flash (3.6c), bit 7 batched attention rows stage (a) (3.6a); each bit is set when that
+ * fusion is live for this process.
+ * tests/test_deepseek41_metal --fusion-gates indexes its name table by bit position, so a bit
+ * added here must be appended there. */
 int ds4_v41_decode_fusion_gates(void);
+
+/* PRE_M5 3.6a (2026-09-17): the V4.1 batched-decode row table and the four rows kernels that read
+ * it. A batched decode step runs N <= DS4_GPU_V41_MAX_ROWS rows of DIFFERENT sessions; their
+ * activations are row-contiguous workspace views, but their caches (window[il],
+ * compressed[owner], index_cache[owner], previous_kv/previous_score[owner]) are session-private
+ * buffers that no stride can reach. The table carries their GPU addresses to the kernels, the way
+ * kernel_touch_u8_stride_table's address table already does, and every buffer behind an address is
+ * passed to useResource on the encoder that dereferences it. */
+enum { DS4_GPU_V41_MAX_ROWS = 8 };   /* mirrors DS4_TP_BATCH_MAX_ROWS (ds4_tp.h) */
+typedef struct {
+    ds4_gpu_tensor *window;          /* window[il],           f32[slots][512]      */
+    ds4_gpu_tensor *compressed;      /* compressed[owner],    f32[cap][512]        */
+    ds4_gpu_tensor *index_cache;     /* index_cache[owner],   f32[cap][128]        */
+    ds4_gpu_tensor *previous_kv;     /* previous_kv[owner],   f32[512]             */
+    ds4_gpu_tensor *previous_score;  /* previous_score[owner],f32[512]             */
+    uint32_t pos;                    /* absolute position of this row              */
+    uint32_t n_comp;                 /* ratio ? (pos + 1) / ratio : 0              */
+    uint32_t publish;                /* ratio && (pos + 1) % ratio == 0            */
+} ds4_gpu_v41_row;
+/* 1 when GPU buffer addresses are usable on this device; 0 means the caller must keep the per-row
+ * loop for the whole step (design-3_6.md 4.4: here a 0 address is a fault, not a prefetch). */
+int ds4_gpu_v41_rows_available(void);
+/* Start a table of `rows` entries; every entry must then be set before a rows kernel is called. */
+int ds4_gpu_v41_rows_begin(uint32_t rows);
+/* Resolve one row's tensors to GPU addresses and record their buffers and lengths. A NULL tensor
+ * is "unused at this layer" and resolves to 0; a non-NULL tensor whose address is unavailable, and
+ * a publishing row with n_comp == 0 (slot n_comp - 1 would wrap), fail the call. Each dispatch
+ * below then refuses a row whose slot or width would fall outside the destination it was given --
+ * the bound ds4_gpu_tensor_copy checked, which a raw GPU address cannot carry. */
+int ds4_gpu_v41_rows_set(uint32_t index, const ds4_gpu_v41_row *row);
+/* RoPE N rows at N absolute positions in one dispatch; per row identical to ds4_gpu_dsv41_rope. */
+int ds4_gpu_dsv41_rope_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                            uint32_t rows, const uint32_t *positions,
+                            bool compressed, bool inverse);
+/* Quantize N rows and store each rounded row into its own session's window slot (pos % slots). */
+int ds4_gpu_dsv41_quantize_window_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
+                                       ds4_v41_activation_format format, uint32_t slots);
+/* Pool N single-position rows against their own previous_kv/previous_score carry (ratio 2), or
+ * copy kv into out (ratio 1). */
+int ds4_gpu_dsv41_pool2_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *kv,
+                             const ds4_gpu_tensor *scores, uint32_t width,
+                             uint32_t rows, uint32_t ratio);
+/* Store each publishing row's index_k and latent at slot n_comp - 1 of its own caches. */
+int ds4_gpu_dsv41_publish_scatter_rows(const ds4_gpu_tensor *index_k, const ds4_gpu_tensor *latent,
+                                       uint32_t key_width, uint32_t value_width, uint32_t rows);
 int ds4_v41_decode_batch_out_b_row_exact(uint32_t rows, uint32_t outputs);
 /* Which attention-output projection a batched decode step of `rows` eligible rows selects: 0 the
  * per-row loop, 1 3.6d's out_a+out_b pair, 2 the opt-in mv_ext out_b, 3 3.6d2's rows<R> kernels.

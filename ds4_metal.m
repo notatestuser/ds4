@@ -12251,6 +12251,11 @@ int ds4_gpu_synchronize(void) {
 
 static void qwen4_nax_release_scratch(void);
 static void qwen4_batch_release_scratch(void);
+/* PRE_M5 3.6a (2026-09-17): clear the V4.1 batched-decode row table. Its views[] are
+ * __unsafe_unretained and its n_rows/filled/capacity fields are plain scalars, so without this a
+ * table built before a cleanup would still pass ds4_gpu_v41_rows_ready() afterwards and pass
+ * released MTLBuffers to -useResources:. */
+static void ds4_gpu_v41_rows_reset(void);
 
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
@@ -12547,6 +12552,7 @@ void ds4_gpu_cleanup(void) {
         g_model_mapped_max_tensor_bytes = 0;
         qwen4_nax_release_scratch();
         qwen4_batch_release_scratch();
+        ds4_gpu_v41_rows_reset();
         ds4_gpu_tensor_tracking_reset();
         g_flash_attn_mask_bytes = 0;
         g_flash_attn_zero_mask_bytes = 0;
@@ -49433,6 +49439,285 @@ int ds4_gpu_dsv41_quantize_store(ds4_gpu_tensor *x, uint32_t width, uint32_t row
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 activation quantization + store");
+    }
+}
+
+
+/* ---- PRE_M5 3.6a (2026-09-17): the V4.1 batched-decode row table --------------------------- *
+ *
+ * design-3_6.md 2. One 64-byte record per row, uploaded by value with setBytes into every rows
+ * dispatch, exactly as ds4_gpu_encode_touch_table uploads its address array. No buffer is
+ * allocated and nothing is cached across dispatches: ds4_gpu_compute_encoder hands out the same
+ * persistent encoder for a whole command buffer, so a useResources has to be issued per dispatch
+ * anyway, and at 512 B the upload is free.
+ *
+ * The table is file-static rather than caller-owned so that ds4.c can build it without touching
+ * Objective-C or GPU addresses (design 2.2's opaque handle). Like the rest of this file's encode
+ * path (g_batch_cb, g_batch_enc) it assumes one encoding thread; the V4.1 session step is that
+ * thread.
+ *
+ * Every address is checked: ds4_gpu_buffer_address returns 0 below macOS 13, and unlike the touch
+ * prefetch, which silently skips a 0, a rows kernel would dereference it. ds4_gpu_v41_rows_set
+ * refuses instead, and ds41_attention_rows falls back to the per-row loop (design 4.4). */
+
+typedef struct {
+    uint64_t window, compressed, index_cache, previous_kv, previous_score;   /* 40 B */
+    uint32_t pos, n_comp, publish, reserved0, reserved1, reserved2;          /* 24 B */
+} ds4_gpu_v41_row_gpu;   /* 64 B; mirrors struct ds4_metal_dsv41_row in metal/dsv41.metal */
+
+/* The `*_floats` arrays are the destination bounds the calls this stage replaces enforced and a
+ * raw GPU address cannot: ds4_gpu_tensor_copy begins with
+ * `if (dst_offset > d.bytes || bytes > d.bytes - dst_offset) return 0;`, and an address carries no
+ * size, so the bound is re-established here, on the host, in floats. It is a COMPLETE check, not a
+ * sample: every index a rows kernel forms is (pos % slots) * width + column, (n_comp - 1) * width
+ * + column or column, and all three are bounded by slots * width, n_comp * width and width, which
+ * the host knows before the dispatch. A violation fails the encode helper before a command buffer
+ * is acquired -- the same failure the out-of-range copy produced, so the step fails loudly instead
+ * of writing through an address into whatever follows a neighbour's cache. They stay on the host:
+ * putting them in the 64-byte record would let the kernel skip a row instead, which is a silent
+ * wrong answer where this is a caught bug. */
+static struct {
+    ds4_gpu_v41_row_gpu rows[DS4_GPU_V41_MAX_ROWS];
+    uint64_t window_floats[DS4_GPU_V41_MAX_ROWS];
+    uint64_t compressed_floats[DS4_GPU_V41_MAX_ROWS];
+    uint64_t index_floats[DS4_GPU_V41_MAX_ROWS];
+    uint64_t previous_floats[DS4_GPU_V41_MAX_ROWS];
+    __unsafe_unretained id<MTLResource> views[5 * DS4_GPU_V41_MAX_ROWS];
+    uint32_t n_rows, n_views, filled;
+} g_v41_rows;
+
+/* The table holds up to 40 __unsafe_unretained id<MTLResource> handles, and ds4_gpu_cleanup()
+ * releases every MTLBuffer this file owns. A table that survived a cleanup/init cycle would
+ * therefore still report its layer complete through ds4_gpu_v41_rows_ready() -- n_rows, filled and
+ * the *_floats capacities are all plain scalars that outlive the buffers they describe -- and hand
+ * those freed handles to -useResources:count:usage: on the next dispatch. So the table is cleared
+ * in ds4_gpu_cleanup() through this helper, beside the other cached-resource statics it nils
+ * (g_stream_compact_gate_addr_buffers and the rest), forward-declared there exactly as
+ * qwen4_batch_release_scratch() is. */
+static void ds4_gpu_v41_rows_reset(void) { memset(&g_v41_rows, 0, sizeof(g_v41_rows)); }
+
+int ds4_gpu_v41_rows_available(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_device) return 0;
+#if TARGET_OS_OSX
+    if (@available(macOS 13.0, *)) return 1;
+#endif
+    return 0;
+}
+
+int ds4_gpu_v41_rows_begin(uint32_t rows) {
+    if (!rows || rows > DS4_GPU_V41_MAX_ROWS) return 0;
+    /* views[] is __unsafe_unretained, so the whole table -- addresses, capacities, the view list
+     * and the filled mask -- clears with one memset and no row can survive into the next layer. */
+    ds4_gpu_v41_rows_reset();
+    g_v41_rows.n_rows = rows;
+    return ds4_gpu_v41_rows_available();
+}
+
+/* Resolve one cache tensor and remember the buffer behind it, de-duplicated: the same
+ * compressed[owner] serves every row of a single-session batch, and useResources wants each
+ * resource once. */
+static int ds4_gpu_v41_rows_resolve(const ds4_gpu_tensor *tensor, uint64_t *address) {
+    *address = 0;
+    if (!tensor) return 1;
+    id<MTLBuffer> buffer = ds4_gpu_tensor_buffer(tensor);
+    if (!buffer) return 0;
+    const uint64_t resolved = ds4_gpu_buffer_address(buffer, ds4_gpu_tensor_offset(tensor));
+    if (resolved == 0u) return 0;
+    for (uint32_t i = 0; i < g_v41_rows.n_views; i++)
+        if (g_v41_rows.views[i] == buffer) { *address = resolved; return 1; }
+    if (g_v41_rows.n_views >= sizeof(g_v41_rows.views) / sizeof(*g_v41_rows.views)) return 0;
+    g_v41_rows.views[g_v41_rows.n_views++] = buffer;
+    *address = resolved;
+    return 1;
+}
+
+int ds4_gpu_v41_rows_set(uint32_t index, const ds4_gpu_v41_row *row) {
+    if (!row || !g_v41_rows.n_rows || index >= g_v41_rows.n_rows) return 0;
+    /* A publishing row writes slot n_comp - 1, so n_comp == 0 would wrap the slot to 0xFFFFFFFF.
+     * The per-row path cannot reach that state -- ds41_attention_publish publishes only when
+     * (pos + 1) % ratio == 0, which makes n_comp >= 1 -- and neither may the table. */
+    if (row->publish && row->n_comp == 0u) return 0;
+    ds4_gpu_v41_row_gpu *dst = &g_v41_rows.rows[index];
+    if (!ds4_gpu_v41_rows_resolve(row->window, &dst->window) ||
+        !ds4_gpu_v41_rows_resolve(row->compressed, &dst->compressed) ||
+        !ds4_gpu_v41_rows_resolve(row->index_cache, &dst->index_cache) ||
+        !ds4_gpu_v41_rows_resolve(row->previous_kv, &dst->previous_kv) ||
+        !ds4_gpu_v41_rows_resolve(row->previous_score, &dst->previous_score)) return 0;
+    dst->pos = row->pos;
+    dst->n_comp = row->n_comp;
+    dst->publish = row->publish ? 1u : 0u;
+    /* An absent tensor measures 0 floats, which fails every bound below: a kernel that would
+     * dereference a destination this layer did not set is refused rather than writing to 0. */
+    g_v41_rows.window_floats[index] = ds4_gpu_tensor_bytes(row->window) / sizeof(float);
+    g_v41_rows.compressed_floats[index] = ds4_gpu_tensor_bytes(row->compressed) / sizeof(float);
+    g_v41_rows.index_floats[index] = ds4_gpu_tensor_bytes(row->index_cache) / sizeof(float);
+    g_v41_rows.previous_floats[index] = MIN(ds4_gpu_tensor_bytes(row->previous_kv),
+                                            ds4_gpu_tensor_bytes(row->previous_score)) / sizeof(float);
+    g_v41_rows.filled |= 1u << index;
+    return 1;
+}
+
+/* Checked in each helper's argument block, BEFORE a command buffer is acquired, so a stale or
+ * incomplete table can never leave one half-encoded. */
+static int ds4_gpu_v41_rows_ready(uint32_t rows) {
+    return rows && rows <= DS4_GPU_V41_MAX_ROWS && rows == g_v41_rows.n_rows &&
+           g_v41_rows.filled == (1u << rows) - 1u;
+}
+
+/* Bind the table to one dispatch: the legality of every dereference first (a missing useResource
+ * is a GPU fault, which is what MTL_DEBUG_LAYER=1 catches), then the 512 B blob itself. Read and
+ * write are both requested because stage (a) writes window, compressed, index_cache and
+ * previous_* through these addresses. Issued per dispatch, not once per layer:
+ * ds4_gpu_compute_encoder hands out the same persistent encoder and a blit can end it underneath. */
+static void ds4_gpu_v41_rows_bind(id<MTLComputeCommandEncoder> enc, NSUInteger index) {
+    if (g_v41_rows.n_views)
+        [enc useResources:g_v41_rows.views
+                    count:(NSUInteger)g_v41_rows.n_views
+                    usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+    [enc setBytes:g_v41_rows.rows length:sizeof(g_v41_rows.rows) atIndex:index];
+}
+
+/* One dispatch for the N rows' RoPE. The frequency table is the shared one; only the position of
+ * each row comes from the caller, so theta is what the per-row call computed. */
+int ds4_gpu_dsv41_rope_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                            uint32_t rows, const uint32_t *positions,
+                            bool compressed, bool inverse) {
+    if (width < 64 || !heads || !rows || rows > DS4_GPU_V41_MAX_ROWS || !positions ||
+        (uint64_t)heads * rows > UINT64_MAX / width ||
+        !dsv41_tensor_has_floats(x, (uint64_t)width * heads * rows)) return 0;
+    for (uint32_t i = 0; i < rows; i++) if (positions[i] >= 1048576u) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_rope_rows");
+        if (!pipeline) return 0;
+        struct {
+            uint32_t width, heads, rows, start, inverse, stride;
+            float frequencies[32];
+        } args = {width, heads, rows, 0, inverse, 0, {0}};
+        memcpy(args.frequencies, ds4_gpu_dsv41_rope_frequencies(compressed), sizeof(args.frequencies));
+        uint32_t table[DS4_GPU_V41_MAX_ROWS] = {0};
+        memcpy(table, positions, (size_t)rows * sizeof(*positions));
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBytes:table length:sizeof(table) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(heads, rows, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 unit-magnitude RoPE (rows)");
+    }
+}
+
+int ds4_gpu_dsv41_quantize_window_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
+                                       ds4_v41_activation_format format, uint32_t slots) {
+    const uint32_t block = format == DS4_V41_FP4_E4M3 ? 16u : 32u;
+    if (!width || !rows || !slots || !ds4_gpu_v41_rows_ready(rows) ||
+        format < DS4_V41_BF16 || format > DS4_V41_FP4_E4M3 ||
+        (format != DS4_V41_BF16 && width % block) ||
+        !dsv41_tensor_has_floats(x, (uint64_t)width * rows)) return 0;
+    /* The window slot the kernel writes is (pos % slots) * width + column, so slots * width bounds
+     * it whatever the positions are. This is the bound ds4_gpu_tensor_copy checked. */
+    for (uint32_t i = 0; i < rows; i++)
+        if (!g_v41_rows.rows[i].window ||
+            (uint64_t)slots * width > g_v41_rows.window_floats[i]) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv41_quantize_window_rows");
+        if (!pipeline) return 0;
+        const uint32_t args[] = {width, rows, (uint32_t)format, slots};
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        ds4_gpu_v41_rows_bind(enc, 2);
+        [enc setBytes:args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(((uint64_t)width + block - 1u) / block, rows, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 quantize + window scatter (rows)");
+    }
+}
+
+int ds4_gpu_dsv41_pool2_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *kv,
+                             const ds4_gpu_tensor *scores, uint32_t width,
+                             uint32_t rows, uint32_t ratio) {
+    const uint64_t count = (uint64_t)width * rows;
+    if (!width || !rows || !ds4_gpu_v41_rows_ready(rows) || (ratio != 1u && ratio != 2u) ||
+        !dsv41_tensor_has_floats(out, count) || !dsv41_tensor_has_floats(kv, count) ||
+        !dsv41_tensor_has_floats(scores, count)) return 0;
+    /* At ratio 2 every row reads or writes previous_kv[column] and previous_score[column] for
+     * column < width, so both must exist and hold width floats. */
+    if (ratio == 2u)
+        for (uint32_t i = 0; i < rows; i++)
+            if (!g_v41_rows.rows[i].previous_kv || !g_v41_rows.rows[i].previous_score ||
+                (uint64_t)width > g_v41_rows.previous_floats[i]) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_pool2_rows");
+        if (!pipeline) return 0;
+        const uint32_t args[] = {width, rows, ratio};
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        ds4_gpu_v41_rows_bind(enc, 4);
+        [enc setBytes:args length:sizeof(args) atIndex:0];
+        const ds4_gpu_tensor *inputs[] = {out, kv, scores};
+        for (NSUInteger i = 0; i < 3; i++)
+            [enc setBuffer:ds4_gpu_tensor_buffer(inputs[i])
+                    offset:ds4_gpu_tensor_offset(inputs[i]) atIndex:i + 1];
+        [enc dispatchThreads:MTLSizeMake(width, rows, 1)
+             threadsPerThreadgroup:MTLSizeMake(MIN(width, 256u), 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 KV pair pooling (rows)");
+    }
+}
+
+int ds4_gpu_dsv41_publish_scatter_rows(const ds4_gpu_tensor *index_k, const ds4_gpu_tensor *latent,
+                                       uint32_t key_width, uint32_t value_width, uint32_t rows) {
+    if (!key_width || !value_width || key_width > value_width || !ds4_gpu_v41_rows_ready(rows) ||
+        !dsv41_tensor_has_floats(index_k, (uint64_t)key_width * rows) ||
+        !dsv41_tensor_has_floats(latent, (uint64_t)value_width * rows)) return 0;
+    /* A publishing row writes slot n_comp - 1 of both of its own caches, i.e. up to
+     * n_comp * width floats. This is the pair of bounds the two ds4_gpu_tensor_copy calls
+     * checked; n_comp >= 1 is guaranteed by ds4_gpu_v41_rows_set. */
+    for (uint32_t i = 0; i < rows; i++) {
+        if (!g_v41_rows.rows[i].publish) continue;
+        const uint64_t slots = g_v41_rows.rows[i].n_comp;
+        if (!g_v41_rows.rows[i].compressed || !g_v41_rows.rows[i].index_cache ||
+            slots * key_width > g_v41_rows.index_floats[i] ||
+            slots * value_width > g_v41_rows.compressed_floats[i]) return 0;
+    }
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv41_publish_scatter_rows");
+        if (!pipeline) return 0;
+        const uint32_t args[] = {key_width, value_width, rows};
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        ds4_gpu_v41_rows_bind(enc, 3);
+        [enc setBytes:args length:sizeof(args) atIndex:0];
+        const ds4_gpu_tensor *inputs[] = {index_k, latent};
+        for (NSUInteger i = 0; i < 2; i++)
+            [enc setBuffer:ds4_gpu_tensor_buffer(inputs[i])
+                    offset:ds4_gpu_tensor_offset(inputs[i]) atIndex:i + 1];
+        [enc dispatchThreads:MTLSizeMake(value_width, rows, 1)
+             threadsPerThreadgroup:MTLSizeMake(MIN(value_width, 256u), 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 compressor publish (rows)");
     }
 }
 
