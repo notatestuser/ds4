@@ -38,7 +38,7 @@ def scale_name(name):
 
 def validate_scales(tensors):
     for name, info in tensors.items():
-        if not name.startswith(("layers.", "embed.", "head.", "norm.")):
+        if not name.startswith(("layers.", "embed.", "head.", "norm.", "mtp.")):
             continue
         dtype, shape = info["dtype"], info["shape"]
         if dtype not in ("F8_E4M3", "I8") or not name.endswith(".weight"):

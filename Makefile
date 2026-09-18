@@ -1054,6 +1054,21 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm
 	./tests/test_mxfp4_dot
 
+.PHONY: test-deepseek41-dspark-conversion
+# Builds the C converter and the shared quantizer the Python validator loads.
+test-deepseek41-dspark-conversion:
+	$(MAKE) -C gguf-tools all
+	python3 tests/test_deepseek41_dspark_conversion.py
+
+.PHONY: test-deepseek41-conversion
+# The main-model conversion fixtures.  They are the only automated cover for
+# deepseek41_quantize.py's validate_scales and for the shared parts of
+# deepseek41_validate_gguf.py (check_payload, the argument parser), both of
+# which the DSpark work touches, and they had no target until now.
+test-deepseek41-conversion:
+	$(MAKE) -C gguf-tools all
+	python3 tests/test_deepseek41_conversion.py
+
 .PHONY: test-download-model
 test-download-model:
 	python3 tests/test_model_download.py
