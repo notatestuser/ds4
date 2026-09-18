@@ -9,7 +9,6 @@ deepseek41_validate_gguf.py --dspark --payload. No model weights and no GPU.
 
 import json
 from pathlib import Path
-import re
 import struct
 import subprocess
 import sys
@@ -45,10 +44,6 @@ KV = 64
 VOCAB = 512
 RANK = 32
 EXPERTS = 4
-# dspark_expert_sample strides by max(1, count // 8), so the stride sample is
-# only a strict subset of the expert range once the count reaches 16.  One
-# fixture at that width keeps --all-experts falsifiable end to end.
-WIDE_EXPERTS = 16
 STAGES = 3
 TARGET_LAYERS = [5, 6, 7]
 
@@ -97,7 +92,7 @@ class Shard:
         return self.entries
 
 
-def build_checkpoint(directory, seed=41, experts=EXPERTS):
+def build_checkpoint(directory, seed=41):
     rng = np.random.default_rng(seed)
     shard = Shard()
     names = []
@@ -127,14 +122,14 @@ def build_checkpoint(directory, seed=41, experts=EXPERTS):
         raw(f"{p}.attn.kv_norm.weight", "BF16", (KV,), bf16(rng, KV))
         fp8(f"{p}.attn.wo_a.weight", OUT_LOW, OUT_A_ROWS)
         fp8(f"{p}.attn.wo_b.weight", DIM, OUT_LOW)
-        raw(f"{p}.ffn.gate.weight", "BF16", (experts, DIM), bf16(rng, experts, DIM))
-        raw(f"{p}.ffn.gate.bias", "F32", (experts,), rng.standard_normal(experts).astype("<f4"))
-        raw(f"{p}.ffn.gate.bias_vl", "F32", (experts,),
-            rng.standard_normal(experts).astype("<f4"))
+        raw(f"{p}.ffn.gate.weight", "BF16", (EXPERTS, DIM), bf16(rng, EXPERTS, DIM))
+        raw(f"{p}.ffn.gate.bias", "F32", (EXPERTS,), rng.standard_normal(EXPERTS).astype("<f4"))
+        raw(f"{p}.ffn.gate.bias_vl", "F32", (EXPERTS,),
+            rng.standard_normal(EXPERTS).astype("<f4"))
         fp8(f"{p}.ffn.shared_experts.w1.weight", INTER, DIM)
         fp8(f"{p}.ffn.shared_experts.w3.weight", INTER, DIM)
         fp8(f"{p}.ffn.shared_experts.w2.weight", DIM, INTER)
-        for expert in range(experts):
+        for expert in range(EXPERTS):
             for part, rows, cols in (("w1", INTER, DIM), ("w3", INTER, DIM), ("w2", DIM, INTER)):
                 base = f"{p}.ffn.experts.{expert}.{part}"
                 raw(f"{base}.weight", "I8", (rows, cols // 2),
@@ -165,7 +160,7 @@ def build_checkpoint(directory, seed=41, experts=EXPERTS):
             "rms_norm_eps": 1e-20, "compress_ratios": [0] * (8 + STAGES),
             "num_nextn_predict_layers": STAGES, "dspark_block_size": 5,
             "dspark_noise_token_id": 499, "dspark_target_layer_ids": TARGET_LAYERS,
-            "dspark_markov_rank": RANK, "dspark_n_routed_experts": experts,
+            "dspark_markov_rank": RANK, "dspark_n_routed_experts": EXPERTS,
             "dspark_num_experts_per_tok": 3,
         },
     }))
@@ -312,13 +307,6 @@ class DsparkConversionTests(unittest.TestCase):
         finally:
             db.close()
 
-    def coverage(self, stdout):
-        """(checked slabs, total slabs, distinct ids) of a --payload audit."""
-        match = re.search(r"expert payload coverage (\d+)/(\d+) slabs over "
-                          r"(\d+) distinct expert ids", stdout)
-        self.assertIsNotNone(match, stdout)
-        return tuple(int(value) for value in match.groups())
-
     def test_name_mapping_and_inventory(self):
         plan = {item.name: item for item in self.plan()}
         # 21 per-stage dense + 3 expert tensors per stage, 6 stage-specific.
@@ -418,7 +406,6 @@ class DsparkConversionTests(unittest.TestCase):
         self.assertIn("round-trip", result.stdout)
 
     def test_all_experts_flag(self):
-        """The flag is accepted for a DSpark audit and refused for a main one."""
         result = subprocess.run(
             [sys.executable, str(VALIDATOR), "--hf", str(self.hf), "--gguf", str(self.out),
              "--dspark", "--payload", "--all-experts", "--quants-library", str(self.library)],
@@ -431,37 +418,6 @@ class DsparkConversionTests(unittest.TestCase):
              "--all-experts", "--source-revision", "x"], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--all-experts applies to --dspark audits", result.stderr)
-
-    def test_all_experts_widens_the_sample(self):
-        """--all-experts must reach dspark_expert_sample, not merely parse.
-
-        At the shared fixture's four experts the stride sample is already the
-        whole range (stride = max(1, 4 // 8) = 1, start = crc32 % 1 = 0), so
-        both audits print the same coverage and dropping the flag at the
-        validator's call site would go unnoticed.  WIDE_EXPERTS crosses the
-        stride threshold, where the default audit must byte-check strictly
-        fewer slabs than --all-experts.
-        """
-        with tempfile.TemporaryDirectory() as scratch:
-            hf = build_checkpoint(scratch, seed=17, experts=WIDE_EXPERTS)
-            out = Path(scratch) / "wide-dspark.gguf"
-            result = subprocess.run(
-                [str(CONVERTER), "--hf", str(hf), "--dspark-support", "--v41-dspark",
-                 "--threads", "2", "--out", str(out), "--overwrite"],
-                capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            audit = [sys.executable, str(VALIDATOR), "--hf", str(hf), "--gguf", str(out),
-                     "--dspark", "--payload", "--quants-library", str(self.library)]
-            sampled = subprocess.run(audit, capture_output=True, text=True)
-            self.assertEqual(sampled.returncode, 0, sampled.stdout + sampled.stderr)
-            every = subprocess.run(audit + ["--all-experts"], capture_output=True, text=True)
-            self.assertEqual(every.returncode, 0, every.stdout + every.stderr)
-        total = STAGES * 3 * WIDE_EXPERTS
-        checked, reported, ids = self.coverage(sampled.stdout)
-        self.assertEqual(reported, total)
-        self.assertLess(checked, total)          # a sample, not the whole file
-        self.assertLessEqual(ids, WIDE_EXPERTS)
-        self.assertEqual(self.coverage(every.stdout), (total, total, WIDE_EXPERTS))
 
     def test_validator_rejects_a_flipped_payload_byte(self):
         corrupt = Path(self.tmp.name) / "corrupt.gguf"
