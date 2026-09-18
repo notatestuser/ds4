@@ -42,6 +42,15 @@ int ds4_gpu_dsv41_attention_output_batch(
         const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens);
+/* The out_a half of the call above for N rows at once, with the same BF16 rounding of `low`
+ * and bit-identical per row to the single-row projection; the caller supplies out_b.
+ * Metal-only (ds4_metal.m): ds4.c calls it from ds41_batch_attention_output_project(), which is
+ * #ifdef __APPLE__, as ds4_gpu_dsv41_quantize_store()/ds4_gpu_dsv41_rope_pair() are. */
+int ds4_gpu_dsv41_attention_output_low_batch(
+        ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens);
 /* Packed local 32-head input and BF16 low projection; output is an unrounded
  * rank partial. The graph sums ranks before rounding the attention block. */
 int ds4_gpu_dsv41_attention_output_tp_batch(
@@ -76,6 +85,7 @@ const float *ds4_gpu_dsv41_rope_frequencies(bool compressed);
  * bit 0 pre copy, bit 1 q+kv RoPE, bit 2 quantize + window store; each bit is set when that
  * fusion is live for this process. */
 int ds4_v41_decode_fusion_gates(void);
+int ds4_v41_decode_batch_out_b_row_exact(uint32_t rows, uint32_t outputs);
 #endif
 int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *kv,

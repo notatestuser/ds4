@@ -40465,14 +40465,36 @@ static bool ds41_quantize_store_fused(void) {
     return ds4_gpu_device_is_pre_m5_apple_silicon() &&
         !getenv("DS4_METAL_DISABLE_PRE_M5_V41_QUANTIZE_STORE");
 }
-/* Test oracle (tests/test_deepseek41_metal --fusion-gates). The three helpers above are file
+/* PRE_M5 3.6d (2026-09-17): the batched decode step projects the attention output of all its
+ * rows with one out_a dispatch and one out_b dispatch instead of one pair per row. This is the
+ * env/device half of the decision, kept pure so the test oracle below can observe it; the
+ * per-step eligibility (prefill rows, TP, images, weight types) lives in
+ * ds41_batch_attention_output_enabled(). */
+static bool ds41_batch_attention_output_gate(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT");
+}
+/* Opt-in: project out_b with the same prefill entry point, i.e. through mul_mv_ext, which reads
+ * each weight chunk once for r1ptg rows -- half the out_b traffic at N = 6..8 -- but reduces
+ * with simd_shuffle_down over nxpsg lanes instead of the single-row simd_sum tree, and picks
+ * nxpsg by the row COUNT (16 at 2 rows, 8 at 3+). It is therefore neither bit-identical to the
+ * per-row loop nor a function of the row alone, and it is not the default: on the real decode
+ * step it flipped tokens (--verify at N=2/4/8) and took the 2e-4 oracle from 2.9e-6 to 2.94.
+ * It stays reachable so the traffic it saves can still be priced, and so that failure stays
+ * reproducible -- tests/test_deepseek41_metal --attention-output-decode reproduces it model-free. */
+static bool ds41_batch_attention_output_mv_ext(void) {
+    return getenv("DS4_METAL_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_MV_EXT") != NULL;
+}
+
+/* Test oracle (tests/test_deepseek41_metal --fusion-gates). The helpers above are all file
  * static, so without this nothing outside ds4.c can observe the switches: a misspelt name would
  * leave the schedule bench's --candidate-env A/B comparing the fused path with itself and
  * reporting it exact. The test asserts each name disables exactly its own fusion. */
 int ds4_v41_decode_fusion_gates(void) {
     return (ds41_pre_copy_fused() ? 1 : 0) |
            (ds41_rope_pair_fused() ? 2 : 0) |
-           (ds41_quantize_store_fused() ? 4 : 0);
+           (ds41_quantize_store_fused() ? 4 : 0) |
+           (ds41_batch_attention_output_gate() ? 8 : 0);
 }
 #endif
 
@@ -40527,6 +40549,40 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
 
+/* PRE_M5 3.6d (2026-09-17): the condition under which ds41_matmul_batch() below projects a
+ * batched decode matmul with ds4_gpu_matmul_q8_0_decode_rows_exact_tensor() -- the single-row
+ * matvec's own kernel, nr0, nsg and smem on a grid of (out_dim/nr0, n_rows, 1). Lifted out of
+ * ds41_matmul_batch() unchanged, for two reasons, both of them the first revision's failure:
+ *   * the batched attention-output stage REQUIRES this branch. Its `else` at the bottom of
+ *     ds41_matmul_batch() is metal_graph_matmul_plain_tensor() -> ds4_gpu_matmul_q8_0_tensor(),
+ *     which for 2..16 rows of a 128-aligned input (out_b's K is 8192) dispatches
+ *     kernel_mul_mv_ext_q8_0_f32_r1_N -- the very reordering that flipped tokens. A later change
+ *     to DS4_TP_BATCH_MAX_ROWS or to this predicate would put the stage back there SILENTLY, so
+ *     ds41_batch_attention_output_enabled() asks the question instead of assuming the answer;
+ *   * the model-free test can now ask ds4.c the same question through the oracle below, instead
+ *     of calling the row-exact kernel itself and certifying a kernel ds4.c might not select. */
+static bool ds41_matmul_batch_q8_row_exact(uint32_t count, uint32_t outputs, uint32_t type) {
+#ifndef __APPLE__
+    (void)outputs;
+#endif
+    return count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS &&
+#ifdef __APPLE__
+        outputs != DS4_N_VOCAB &&
+#endif
+        type == DS4_TENSOR_Q8_0;
+}
+
+/* Test oracle for the predicate above (tests/test_deepseek41_metal --attention-output-decode).
+ * Nonzero iff ds41_matmul_batch() would project `rows` rows of an `outputs`-wide Q8_0 weight --
+ * i.e. the batched attention-output stage's out_b -- with the row-exact decode kernel rather
+ * than falling through to mul_mv_ext. The test pins it at every width the stage can take, so the
+ * host-side SELECTION is covered, not just the kernel: without it the gate would keep passing
+ * while ds4.c quietly moved to a different out_b, which is exactly how the first revision of
+ * this stage shipped green at kernel level and wrong on the model. */
+int ds4_v41_decode_batch_out_b_row_exact(uint32_t rows, uint32_t outputs) {
+    return ds41_matmul_batch_q8_row_exact(rows, outputs, DS4_TENSOR_Q8_0) ? 1 : 0;
+}
+
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
@@ -40534,11 +40590,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     bool ok;
     /* Small decode batches retain scalar reductions before BF16 and sparse
      * routing boundaries. Preserve Metal's separate vocabulary-head dispatch. */
-    if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS &&
-#ifdef __APPLE__
-        outputs != DS4_N_VOCAB &&
-#endif
-        weight->type == DS4_TENSOR_Q8_0) {
+    if (ds41_matmul_batch_q8_row_exact(count, outputs, weight->type)) {
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
@@ -42312,6 +42364,134 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
     return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
 }
 
+/* PRE_M5 3.6d (2026-09-17): project the attention output of all N rows of a batched decode
+ * step at once -- one out_a dispatch and one out_b dispatch a layer instead of two a row, so
+ * 80 dispatches a token instead of 640 at N = 8.
+ *
+ * out_a goes through ds4_gpu_dsv41_attention_output_low_batch(), the out_a half of the entry
+ * point the prefill chunk loop already uses for this pair, in this position of this graph: one
+ * (group, row) threadgroup per row, the same nr0=2 / nsg=4 k-split and reduction tree as the
+ * per-row call, so `low` is bit-identical per row. out_b goes through ds41_matmul_batch(),
+ * which for 2..8 Q8_0 rows takes ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(): the single-row
+ * matvec's own function, nr0, nsg and smem on a grid of (out_dim/nr0, n_rows, 1), i.e. the
+ * single-row geometry per row -- so `block` is bit-identical per row too, and independent of N.
+ * That branch is not assumed: ds41_matmul_batch_q8_row_exact() is the predicate ds41_matmul_batch
+ * itself uses, and this gate refuses the whole stage if it does not hold for this step's rows and
+ * this layer's out_b, because the fall-through is mul_mv_ext. The BF16 boundaries move from the
+ * two matvec stores to the rounding kernels that already follow them (the batch call's own
+ * quantize of `low`, and the step's quantize of `block`), which is the same round-to-nearest-even
+ * on the same bits; ds41_out_b_prerounded()'s rounding being skipped here is the no-op it always
+ * was.
+ *
+ * Both halves of the batched pair pin nr0 = 2, and so does the per-row loop they replace
+ * (ds4_gpu_attention_output_low_q8_impl pins nr0 2 / nsg 4 / smem 32*2*4;
+ * ds4_gpu_matmul_q8_0_legacy_tensor takes ds4_gpu_make_q8_0_mv_dispatch() verbatim), so both
+ * sides run the same geometry on both halves at every width a decode step can take. One selector
+ * survives on the batched half alone: ds4_gpu_attention_output_q8_batch_impl's use_direct_low,
+ * whose row-count half cannot fire below 32 rows, leaving the diagnostic
+ * DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT. That env swaps out_a's encode for
+ * kernel_mul_mv_id_q8_0_f32 on the same grid, args and threadgroup memory, wrapping the same
+ * kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0>; --attention-output-decode reruns out_a at widths 1..8
+ * with it exported and requires `low` to stay bit-identical, so the bit-for-bit claim above
+ * holds with that env set as well as unset.
+ *
+ * This collapses the dispatches, not out_b's weight traffic. The variant that did halve that --
+ * out_b through mul_mv_ext, the first version of this stage -- reorders the reduction and makes
+ * its lane map depend on the row count, and on the real model that flipped tokens within 33
+ * decode steps and moved the 2e-4 oracle by six orders of magnitude, because `block` is
+ * BF16-rounded immediately afterwards and the router picks 6 of 384 experts. It is kept behind
+ * DS4_METAL_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_MV_EXT for measurement only. If the dispatch
+ * collapse alone does not clear design-3_6.md 5's 1 %, the follow-up is patch3_6d2's
+ * kernel_dsv4_attn_out_low_q8_0_f32_rows<R> clone, which batches out_a's weight reads while
+ * keeping each row's K walk and reduction -- the same trade, made where it stays exact.
+ *
+ * Decided once per step, i.e. once per command batch. Rows that share a session keep the
+ * per-row loop (prefill_rows > 0: those rows read and write previous_kv/previous_score in
+ * position order), as do TP, streaming, quality, imatrix and image steps; a model whose output
+ * weights are not Q8_0 falls back for the whole step with one line on stderr. The single-token
+ * path never reaches here. Rollback: DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT. */
+static bool ds41_batch_attention_output_enabled(const ds41_gpu_graph *g,
+                                                const ds4_weights *w,
+                                                uint32_t prefill_rows,
+                                                uint32_t rows,
+                                                bool *mv_ext) {
+    *mv_ext = false;
+#ifdef __APPLE__
+    if (prefill_rows != 0u || g->tp_world != 1 || g->streaming || g->quality ||
+        g->imatrix || g->image_count ||
+        !ds41_batch_attention_output_gate()) return false;
+    /* Both weights Q8_0, AND out_b has to land on the branch of ds41_matmul_batch() that uses the
+     * row-exact decode kernel, at this step's width, in every layer. That second half is not
+     * decoration: the fall-through is metal_graph_matmul_plain_tensor() ->
+     * ds4_gpu_matmul_q8_0_tensor(), i.e. kernel_mul_mv_ext_q8_0_f32_r1_N for 2..16 rows of a
+     * 128-aligned K -- the reordering that flipped tokens in the first revision of this stage. So
+     * ask ds41_matmul_batch_q8_row_exact() rather than assume it: a later change to
+     * DS4_TP_BATCH_MAX_ROWS or to that predicate then makes the stage fall back loudly here
+     * instead of quietly becoming wrong again. Asked before *mv_ext is set, so the
+     * measurement-only variant shares the same gate. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (w->layer[il].attn_output_a->type == DS4_TENSOR_Q8_0 &&
+            w->layer[il].attn_output_b->type == DS4_TENSOR_Q8_0 &&
+            ds41_matmul_batch_q8_row_exact(rows, (uint32_t)w->layer[il].attn_output_b->dim[1],
+                                           w->layer[il].attn_output_b->type)) continue;
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "ds4: V4.1 batched attention output unavailable (layer %u output "
+                    "weights are not Q8_0, or ds41_matmul_batch would not project %u rows of its "
+                    "%llu-wide out_b with the row-exact Q8 kernel); using the per-row "
+                    "projections\n", il, rows,
+                    (unsigned long long)w->layer[il].attn_output_b->dim[1]);
+            warned = true;
+        }
+        return false;
+    }
+    *mv_ext = ds41_batch_attention_output_mv_ext();
+    /* One line the first time the branch is live. Without it every model-level gate passes
+     * vacuously when the step quietly falls back (wrong device, TP, a rollback left set in the
+     * environment) and a harness would record a result for a change that never ran. The runner
+     * greps for this line, and for its absence in the concurrency-1 parity runs, which is also
+     * how it proves the single-token path stays out of here. */
+    static bool announced = false;
+    if (!announced) {
+        fprintf(stderr, "ds4: V4.1 batched attention output enabled (%s out_b, one pair per step)\n",
+                *mv_ext ? "mv_ext" : "row-exact");
+        announced = true;
+    }
+    return true;
+#else
+    (void)g; (void)w; (void)prefill_rows; (void)rows;
+    return false;
+#endif
+}
+
+/* The projection itself, in the same #ifdef shape as ds41_rope_qkv() and
+ * ds41_quantize_kv_store() use for their Metal-only entry points, and for the same reason:
+ * ds4_gpu_dsv41_attention_output_low_batch() is defined in ds4_metal.m only. (The full-pair
+ * ds4_gpu_dsv41_attention_output_batch() below it DOES have a CUDA definition -- see
+ * ds4_deepseek41_cuda.cuh, which builds it out of ds4_gpu_attention_output_low_q8_rows_exact_tensor
+ * plus ds4_gpu_matmul_q8_0_decode_rows_exact_tensor, i.e. already row-exact -- but there is no
+ * low-only twin, and ds4_gpu_dsv41_quantize_store()/ds4_gpu_dsv41_rope_pair() are Metal-only in
+ * exactly this way.) ds41_graph_step_batch() is compiled on every platform, so the reference must
+ * not be EMITTED off Apple; the gate above returning false there is an argument about the
+ * optimizer, not about the language, and the Makefile's `CFLAGS ?= -O3` is overridable. */
+static bool ds41_batch_attention_output_project(const ds41_prefill_row *active,
+                                                const ds4_model *model,
+                                                const ds4_layer_weights *l,
+                                                uint32_t rows, bool mv_ext) {
+#ifdef __APPLE__
+    if (mv_ext)
+        return ds4_gpu_dsv41_attention_output_batch(active->block, active->low,
+            model->map, model->size, l->attn_output_a->abs_offset,
+            l->attn_output_b->abs_offset, active->heads, rows) != 0;
+    return ds4_gpu_dsv41_attention_output_low_batch(active->low, model->map, model->size,
+               l->attn_output_a->abs_offset, active->heads, rows) != 0 &&
+           ds41_matmul_batch(active->block, model, l->attn_output_b, active->low, rows, false);
+#else
+    (void)active; (void)model; (void)l; (void)rows; (void)mv_ext;
+    return false;
+#endif
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights) {
@@ -42325,6 +42505,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const bool prefill_only = prefill_rows == rows;
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+    /* 3.6d: one out_a dispatch and one out_b dispatch for all rows, decided once. */
+    bool batch_output_mv_ext = false;
+    const bool batch_output =
+        ds41_batch_attention_output_enabled(g, weights, prefill_rows, rows, &batch_output_mv_ext);
     /* PRE_M5 queued batched decode (2026-09-17): both Engram tables are read
      * by reader threads straight into per-row upload slots — table 0 into
      * batch.engram_rows, table 1 into the prefill staging buffer, which is
@@ -42441,8 +42625,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             row.q = queries[i];
             row.heads = heads[i];
             ok = ds41_attention(&row, model, l, il, true) &&
-                ds41_attention_output(&row, model, l);
+                (batch_output || ds41_attention_output(&row, model, l));
         }
+        /* Every row wrote its own slice of batch.heads, and active.heads/low/block are the
+         * row-contiguous views over exactly those slices, so one call projects them all. `low`
+         * is BF16-rounded inside the batch call and `block` by the quantize below, exactly as
+         * the per-row matvec epilogues round them -- and every row's arithmetic is the per-row
+         * loop's, so this is bit-identical, not merely batched == sequential. */
+        if (ok && batch_output)
+            ok = ds41_batch_attention_output_project(&active, model, l, rows, batch_output_mv_ext);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&

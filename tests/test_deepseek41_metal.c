@@ -570,16 +570,21 @@ static int check_rope_freqs(void) {
 }
 #pragma float_control(pop)
 
-/* The three rollback switches are read by file-static helpers in ds4.c, which no test can reach
+/* The rollback switches are read by file-static helpers in ds4.c, which no test can reach
  * by name; the fused entry points above are called directly and are deliberately unaware of them.
  * ds4_v41_decode_fusion_gates() is the oracle: assert that each env name, spelled as ds4.c spells
  * it, disables exactly its own fusion and nothing else. A misspelt name would otherwise survive
- * every check - including the strict bench, which would then A/B the fused path against itself. */
+ * every check - including the strict bench, which would then A/B the fused path against itself.
+ * 3.6d (2026-09-17): the batched attention-output rollback is bit 8. It gates a ds4.c-side branch
+ * rather than a kernel choice, so this oracle is the only model-free proof that its name is the
+ * one the A/B harness must export; without it a typo would leave every sweep comparing the new
+ * path with itself and reporting the stage clean and free. */
 static int check_fusion_gates(void) {
-    static const char *const names[3] = {
+    static const char *const names[4] = {
         "DS4_METAL_DISABLE_PRE_M5_V41_PRE_COPY",
         "DS4_METAL_DISABLE_PRE_M5_V41_ROPE_PAIR",
         "DS4_METAL_DISABLE_PRE_M5_V41_QUANTIZE_STORE",
+        "DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT",
     };
     /* ds4_gpu_init() must have run: the pre-M5 test reads the Metal device name, and without it
      * every gate reads false and this whole check would pass vacuously. */
@@ -587,7 +592,7 @@ static int check_fusion_gates(void) {
     const int base = ds4_v41_decode_fusion_gates();
     printf("fusion_gates=%d\n", base);
     CHECK(pre_m5 || base == 0);          /* nothing fuses off pre-M5 Apple silicon */
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < (int)(sizeof(names) / sizeof(*names)); i++) {
         const int bit = 1 << i;
         if (getenv(names[i])) {
             /* Inherited from the caller (the runner sets one per process): must read as off. */
@@ -602,8 +607,9 @@ static int check_fusion_gates(void) {
         CHECK(unsetenv(names[i]) == 0);
         CHECK(ds4_v41_decode_fusion_gates() == base);
     }
-    fprintf(stderr, "V4.1 decode fusion gates: pre_m5=%d live=0x%x, each rollback env disables "
-                    "exactly its own fusion PASS\n", pre_m5, base);
+    fprintf(stderr, "V4.1 decode fusion gates: pre_m5=%d live=0x%x, each of the %zu rollback envs "
+                    "disables exactly its own fusion PASS\n", pre_m5, base,
+            sizeof(names) / sizeof(*names));
     return 1;
 }
 #endif
@@ -797,7 +803,24 @@ static int check_attention_output(bool large) {
     CHECK(ds4_gpu_end_commands());
     CHECK(ds4_gpu_tensor_read(out, 0, reference, ob));
     CHECK(ds4_gpu_tensor_read(low, 0, reference_low, lb));
-    const uint32_t sizes[] = {31, 32, 63, 64, 65, 257, 512, 513, 8191, 8192};
+    /* 3.6d (2026-09-17): 1..8 are the decode batch widths. The V4.1 session step
+     * now sends its N rows through this entry point instead of calling the
+     * per-row projections N times, and nothing covered those widths here
+     * before. The reference above is the per-row path, so `low` is a
+     * bit-identical memcmp at every width and `out` is the 2e-5 comparison.
+     * These inputs are exact by construction (weight scale 1/128 with quants
+     * 0..7, x a non-negative multiple of 1/256), so no ordering can round
+     * differently here: this case pins row indexing, the row bounds and the
+     * BF16 boundary, and it is blind to the summation order. The order is what
+     * check_attention_output_decode() below tests, on signed dense inputs. */
+    const uint32_t sizes[] = {1, 2, 3, 4, 5, 6, 7, 8,
+                              31, 32, 63, 64, 65, 257, 512, 513, 8191, 8192};
+    /* Row 0 must come out IDENTICAL at every decode width on these exact inputs: a row reading
+     * or writing the wrong slice once the width changes which rows share a threadgroup would
+     * show up here even though a reordering cannot. */
+    enum { WIDTH_PROBE = 8 };
+    float *row0 = calloc(WIDTH_PROBE, OUT * sizeof(float));
+    CHECK(row0);
     for (unsigned n = 0; n < sizeof(sizes) / sizeof(*sizes); n++) {
         const uint32_t rows = sizes[n];
         if (rows > ROWS) break;
@@ -814,7 +837,29 @@ static int check_attention_output(bool large) {
                     rows, (unsigned long long)i, got[i], reference[i]);
             CHECK(isfinite(got[i]) && fabsf(got[i] - reference[i]) <= 2e-5f * (1 + fabsf(reference[i])));
         }
-        if (rows < ROWS) CHECK(isnan(got[(uint64_t)rows * OUT]));
+        if (rows < ROWS) {
+            CHECK(isnan(got[(uint64_t)rows * OUT]));
+            /* 3.6d: the decode step hands this call views sized to exactly N
+             * rows, so a write past row N-1 lands in the next workspace tensor. */
+            CHECK(isnan(got_low[(uint64_t)rows * GROUPS * RANK]));
+        }
+        if (rows <= WIDTH_PROBE) {
+            memcpy(row0 + (size_t)(rows - 1) * OUT, got, OUT * sizeof(float));
+            /* Compared here rather than after the loop so the probe still runs when a wider
+             * case fails -- rows=31 does exactly that under MTL_SHADER_VALIDATION=1, on the
+             * base tree as well as this one. */
+            for (uint32_t i = 0; rows > 1 && i < OUT; i++) {
+                const float at_1 = row0[i], at_n = row0[(size_t)(rows - 1) * OUT + i];
+                if (at_n != at_1)
+                    fprintf(stderr, "width dependence rows=%u column=%u at_1=%.9g at_%u=%.9g\n",
+                            rows, i, at_1, rows, at_n);
+                CHECK(at_n == at_1);
+            }
+            if (rows > 1)
+                fprintf(stderr, "V4.1 batched Q8 output, row 0 identical at rows=%u and rows=1 "
+                                "(exact inputs; 0 of %u columns moved): PASS\n",
+                        rows, (unsigned)OUT);
+        }
         fprintf(stderr, "V4.1 batched Q8 output, BF16 boundary, rows=%u: PASS\n", rows);
     }
     CHECK(!ds4_gpu_dsv41_attention_output_batch(out, low, model, a_bytes + b_bytes - 1,
@@ -905,9 +950,250 @@ static int check_attention_output(bool large) {
     ds4_gpu_tensor_free(partial[0]); ds4_gpu_tensor_free(partial[1]); ds4_gpu_tensor_free(packed);
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(low); ds4_gpu_tensor_free(out);
     ds4_gpu_cleanup();
+    free(x); free(reference); free(reference_low); free(model); free(row0);
+    return 1;
+}
+
+#ifdef __APPLE__
+/* 3.6d (2026-09-17): the batched decode step's attention-output stage, reproduced end to end
+ * against the per-row path it replaces, on inputs that can tell two summation orders apart.
+ *
+ * check_attention_output() above cannot tell them apart. Its weights are all +1/128 x quants 0..7
+ * and its activations are non-negative multiples of 1/256, so every partial sum is exact and every
+ * order gives the same float; it pins indexing, bounds and the BF16 boundary and nothing else.
+ * That is how the first version of this stage shipped green here and then produced different
+ * tokens from the per-row loop on the real decode step. Here the quants are signed (-127..127) and
+ * the activations are full-mantissa signed floats, so cancellation puts the summation order into
+ * the low bits, exactly as the model's own data does.
+ *
+ * REFERENCE = what ds41_attention_output() runs per row on the decode path at tp_world == 1, on
+ * views of one row-contiguous workspace buffer, exactly as the loop does through g->rows_view[i]:
+ *     ds4_gpu_attention_output_low_q8_bf16_tensor(low_i, ..., heads_i)   (ds41_attention_low)
+ *     ds4_gpu_matmul_q8_0_tensor_bf16(block_i, ..., low_i, 1)            (ds41_matmul, prerounded)
+ *
+ * CANDIDATES = the two things the batched step can run for all rows at once, each followed by the
+ * step's own ds4_gpu_dsv41_quantize(block, DS4_N_EMBD, rows, BF16):
+ *   row-exact (the default): ds4_gpu_dsv41_attention_output_low_batch() + the row-exact batched Q8
+ *          matvec ds41_matmul_batch() picks for 2..8 Q8_0 rows. Every row must be BIT-IDENTICAL at
+ *          every width.
+ *   mv_ext (DS4_METAL_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_MV_EXT): ds4_gpu_dsv41_attention_output_batch(),
+ *          whose out_b goes through kernel_mul_mv_ext_q8_0_f32_r1_N -- one weight chunk dotted
+ *          against r1ptg rows, reduced with simd_shuffle_down over nxpsg lanes (16 at 2 rows,
+ *          8 at 3+) instead of simd_sum + the threadgroup tree.
+ * Both are run and reported at every width; the one ds4.c will actually run is the one this test
+ * fails on, so `--attention-output-decode` passes by default and fails under the mv_ext env -- the
+ * model-free reproduction of the --verify and oracle failures the first revision measured.
+ *
+ * Both are also checked against a double-precision oracle at a few columns. That is not a bit gate
+ * -- `block` is BF16-rounded, so 2^-9 relative is the floor for either -- it is what separates "a
+ * different order" from "a wrong dot product", and it is why this test can say the mv_ext kernel is
+ * correct and still unusable here.
+ *
+ * One thing a kernel memcmp alone would still miss, so it is checked first: the SELECTION. This
+ * test calls ds4_gpu_matmul_q8_0_decode_rows_exact_tensor() itself, while the decode step calls
+ * ds41_matmul_batch(), whose fall-through is the mul_mv_ext path. The oracle
+ * ds4_v41_decode_batch_out_b_row_exact() asks ds4.c which one it would pick for this shape at
+ * every width, so a change to DS4_TP_BATCH_MAX_ROWS or to that predicate fails here rather than
+ * silently reinstating the first revision's defect.
+ *
+ * And one selector on the out_a half, the same worry on the other side: the batched encode is
+ * picked by ds4_gpu_attention_output_q8_batch_impl's use_direct_low, `n_tokens < 32 &&
+ * getenv("DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT") == NULL`, while the single-row
+ * ds4_gpu_attention_output_low_q8_impl() this stage replaces reads no environment at all -- 3.6d
+ * is what first puts a decode step behind that switch. A decode step is at most 8 rows, so only
+ * the env half can fire, and when it does the encode becomes kernel_mul_mv_id_q8_0_f32 over a
+ * group-ids buffer instead of kernel_dsv4_attn_out_low_q8_0_f32. So the widths are walked a third
+ * time with that env exported and `low` must still be bit-identical, rather than that being
+ * argued from the two kernels wrapping the same kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0>. */
+static int check_attention_output_decode(void) {
+    enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120, ROWS = 8 };
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const uint64_t a_bytes = (uint64_t)GROUPS * RANK * GROUP / 32 * sizeof(q8_block);
+    const uint64_t b_bytes = (uint64_t)OUT * GROUPS * RANK / 32 * sizeof(q8_block);
+    const uint64_t hb = (uint64_t)ROWS * GROUPS * GROUP * 4;
+    const uint64_t lb = (uint64_t)ROWS * GROUPS * RANK * 4, ob = (uint64_t)ROWS * OUT * 4;
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), a_bytes + b_bytes) == 0);
+    q8_block *w = model;
+    for (uint64_t i = 0; i < (a_bytes + b_bytes) / sizeof(*w); i++) {
+        w[i].d = 0x2000;  /* exactly 1/128, so the oracle below needs no half converter */
+        for (int j = 0; j < 32; j++)
+            w[i].qs[j] = (int8_t)((((int)(random_value() * 8192) & 0x7fffffff) % 255) - 127);
+    }
+    float *x = malloc(hb), *reference = malloc(ob), *reference_low = malloc(lb);
+    CHECK(x && reference && reference_low);
+    /* Full-mantissa signed activations: the real `heads` are BF16-rounded and then inverse-RoPEd,
+     * so what reaches out_a is an arbitrary float, not a short binary fraction. */
+    for (uint64_t i = 0; i < hb / 4; i++) x[i] = random_value() * 0.3141592653589793f;
+    ds4_gpu_tensor *heads = upload(x, hb), *low = upload(NULL, lb), *out = upload(NULL, ob);
+    CHECK(heads && low && out && ds4_gpu_set_model_map(model, a_bytes + b_bytes));
+
+    /* THE SELECTOR, not only the kernel. Everything below calls
+     * ds4_gpu_matmul_q8_0_decode_rows_exact_tensor() directly, but the decode step calls
+     * ds41_matmul_batch(), whose four-way dispatch has three other outcomes -- and whose final
+     * `else` is metal_graph_matmul_plain_tensor() -> ds4_gpu_matmul_q8_0_tensor(), i.e.
+     * kernel_mul_mv_ext_q8_0_f32_r1_N for 2..16 rows of a 128-aligned K. That is exactly the
+     * kernel the first revision of this stage shipped by accident. So ask ds4.c which out_b it
+     * would select for this shape at every width the stage can take, before certifying the
+     * kernel: a change to DS4_TP_BATCH_MAX_ROWS or to that predicate fails here instead of
+     * silently reinstating the defect with this test still green. rows == 1 must answer NO --
+     * ds41_graph_step_batch() requires count >= 2, so width 1 below is kernel coverage only. */
+    for (uint32_t rows = 1; rows <= ROWS; rows++)
+        CHECK(ds4_v41_decode_batch_out_b_row_exact(rows, OUT) == (rows >= 2 ? 1 : 0));
+    fprintf(stderr, "V4.1 decode output stage: ds41_matmul_batch selects the row-exact Q8 out_b "
+                    "for the %u-wide out_b at rows=2..%u, and not at rows=1: PASS\n",
+            (unsigned)OUT, (unsigned)ROWS);
+
+    const int step_mv_ext = getenv("DS4_METAL_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_MV_EXT") != NULL;
+
+    /* The per-row reference does not depend on how many rows the step carries, so it is built
+     * once for all ROWS rows and each width compares its first `rows` of them. */
+    CHECK(ds4_gpu_begin_commands());
+    for (uint32_t r = 0; r < ROWS; r++) {
+        ds4_gpu_tensor *hr = ds4_gpu_tensor_view(heads, (uint64_t)r * GROUPS * GROUP * 4,
+                                                GROUPS * GROUP * 4);
+        ds4_gpu_tensor *lr = ds4_gpu_tensor_view(low, (uint64_t)r * GROUPS * RANK * 4,
+                                                GROUPS * RANK * 4);
+        ds4_gpu_tensor *br = ds4_gpu_tensor_view(out, (uint64_t)r * OUT * 4, OUT * 4);
+        CHECK(hr && lr && br);
+        CHECK(ds4_gpu_attention_output_low_q8_bf16_tensor(lr, model, a_bytes + b_bytes,
+            0, GROUP, RANK, GROUPS, hr));
+        CHECK(ds4_gpu_matmul_q8_0_tensor_bf16(br, model, a_bytes + b_bytes,
+            a_bytes, GROUPS * RANK, OUT, lr, 1));
+        ds4_gpu_tensor_free(hr); ds4_gpu_tensor_free(lr); ds4_gpu_tensor_free(br);
+    }
+    CHECK(ds4_gpu_end_commands());
+    CHECK(ds4_gpu_tensor_read(low, 0, reference_low, lb));
+    CHECK(ds4_gpu_tensor_read(out, 0, reference, ob));
+
+    for (int variant = 0; variant < 2; variant++) {
+        const int mv_ext = variant == 1;
+        /* The gate follows ds4.c: only the variant the decode step will run has to be exact. */
+        const int gated = mv_ext == step_mv_ext;
+        for (uint32_t rows = 1; rows <= ROWS; rows++) {
+            CHECK(ds4_gpu_tensor_fill_f32(low, NAN, lb / 4));
+            CHECK(ds4_gpu_tensor_fill_f32(out, NAN, ob / 4));
+            ds4_gpu_tensor *hv = ds4_gpu_tensor_view(heads, 0, (uint64_t)rows * GROUPS * GROUP * 4);
+            ds4_gpu_tensor *lv = ds4_gpu_tensor_view(low, 0, (uint64_t)rows * GROUPS * RANK * 4);
+            ds4_gpu_tensor *bv = ds4_gpu_tensor_view(out, 0, (uint64_t)rows * OUT * 4);
+            CHECK(hv && lv && bv);
+            /* One command batch, as the layer is encoded in the real step. */
+            CHECK(ds4_gpu_begin_commands());
+            if (mv_ext) {
+                CHECK(ds4_gpu_dsv41_attention_output_batch(bv, lv, model, a_bytes + b_bytes,
+                    0, a_bytes, hv, rows));
+            } else {
+                CHECK(ds4_gpu_dsv41_attention_output_low_batch(lv, model, a_bytes + b_bytes,
+                    0, hv, rows));
+                /* The kernel (A) above proved ds41_matmul_batch() selects at these widths. */
+                CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(bv, model, a_bytes + b_bytes,
+                    a_bytes, GROUPS * RANK, OUT, lv, rows));
+            }
+            /* ds41_graph_step_batch's own epilogue over the projected block. */
+            CHECK(ds4_gpu_dsv41_quantize(bv, OUT, rows, DS4_V41_BF16));
+            CHECK(ds4_gpu_end_commands());
+            ds4_gpu_tensor_free(hv); ds4_gpu_tensor_free(lv); ds4_gpu_tensor_free(bv);
+
+            const float *got_low = ds4_gpu_tensor_contents(low);
+            const float *got = ds4_gpu_tensor_contents(out);
+            CHECK(got_low && got);
+            uint64_t low_differ = 0, out_differ = 0;
+            double worst = 0, worst_rel = 0;
+            for (uint64_t i = 0; i < (uint64_t)rows * GROUPS * RANK; i++)
+                if (memcmp(&got_low[i], &reference_low[i], 4)) low_differ++;
+            for (uint64_t i = 0; i < (uint64_t)rows * OUT; i++) {
+                CHECK(isfinite(got[i]));
+                if (!memcmp(&got[i], &reference[i], 4)) continue;
+                out_differ++;
+                const double d = fabs((double)got[i] - (double)reference[i]);
+                if (d > worst) worst = d;
+                if (d / (1 + fabs((double)reference[i])) > worst_rel)
+                    worst_rel = d / (1 + fabs((double)reference[i]));
+            }
+            /* Nothing may be written past row rows-1: the decode step hands these calls views
+             * sized to exactly N rows, so an overrun lands in the next workspace tensor. */
+            if (rows < ROWS) {
+                CHECK(isnan(got_low[(uint64_t)rows * GROUPS * RANK]));
+                CHECK(isnan(got[(uint64_t)rows * OUT]));
+            }
+            /* Independent double sums over reference_low, at both ends and in the interior.
+             * Loose by design: `block` is BF16-rounded, so neither variant can be closer than
+             * 2^-9 relative. This says the arithmetic is right; the memcmp says it is the same. */
+            const uint32_t columns[] = {0, 1, 31, 64, 997, 4095, OUT - 1};
+            for (uint32_t t = 0; t < rows; t++) {
+                for (size_t ci = 0; ci < sizeof(columns) / sizeof(*columns); ci++) {
+                    const uint32_t col = columns[ci];
+                    const q8_block *bw = (const q8_block *)((const char *)model + a_bytes) +
+                        (size_t)col * (GROUPS * RANK / 32);
+                    double sum = 0;
+                    for (uint32_t k = 0; k < GROUPS * RANK; k++)
+                        sum += bw[k / 32].qs[k % 32] / 128.0 *
+                            (double)reference_low[(size_t)t * GROUPS * RANK + k];
+                    if (fabs((double)got[(size_t)t * OUT + col] - sum) > 8e-3 * (1 + fabs(sum)))
+                        fprintf(stderr, "decode output stage oracle rows=%u variant=%s row=%u "
+                                "col=%u actual=%.9g oracle=%.9g\n", rows,
+                                mv_ext ? "mv_ext" : "row-exact", t, col,
+                                got[(size_t)t * OUT + col], sum);
+                    CHECK(fabs((double)got[(size_t)t * OUT + col] - sum) <= 8e-3 * (1 + fabs(sum)));
+                }
+            }
+            fprintf(stderr, "V4.1 decode output stage rows=%u %-9s: low %llu/%llu differ, "
+                            "block %llu/%llu differ (worst %.3g abs, %.3g rel)%s\n",
+                    rows, mv_ext ? "mv_ext" : "row-exact",
+                    (unsigned long long)low_differ,
+                    (unsigned long long)((uint64_t)rows * GROUPS * RANK),
+                    (unsigned long long)out_differ, (unsigned long long)((uint64_t)rows * OUT),
+                    worst, worst_rel, gated ? "   <- the decode step's default" : "");
+            /* out_a is bit-identical either way: the batch call runs the same (group, row)
+             * threadgroups, and its separate BF16 rounding is the same round-to-nearest-even
+             * as the one folded into the single-row matvec's store. */
+            CHECK(low_differ == 0);
+            if (gated && out_differ)
+                fprintf(stderr, "V4.1 decode output stage rows=%u %s: NOT bit-identical to the "
+                        "per-row path -- a batched decode step would not reproduce the tokens "
+                        "the per-row loop emits\n", rows, mv_ext ? "mv_ext" : "row-exact");
+            if (gated) CHECK(out_differ == 0);
+        }
+        fprintf(stderr, "V4.1 decode output stage, widths 1..%u, %s%s: %s\n", (unsigned)ROWS,
+                mv_ext ? "mv_ext" : "row-exact", gated ? " (the decode step's default)" : "",
+                gated ? "bit-identical to the per-row path PASS" : "reported only");
+    }
+
+    /* The out_a selector (see the header): the only env this stage newly exposes a decode step to
+     * is DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT, which picks kernel_mul_mv_id_q8_0_f32 over a
+     * group-ids buffer instead of kernel_dsv4_attn_out_low_q8_0_f32. out_b does not read it, so
+     * only out_a is rerun, against the same per-row `low` reference as above. */
+    CHECK(setenv("DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT", "1", 1) == 0);
+    for (uint32_t rows = 1; rows <= ROWS; rows++) {
+        CHECK(ds4_gpu_tensor_fill_f32(low, NAN, lb / 4));
+        ds4_gpu_tensor *hv = ds4_gpu_tensor_view(heads, 0, (uint64_t)rows * GROUPS * GROUP * 4);
+        ds4_gpu_tensor *lv = ds4_gpu_tensor_view(low, 0, (uint64_t)rows * GROUPS * RANK * 4);
+        CHECK(hv && lv);
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_attention_output_low_batch(lv, model, a_bytes + b_bytes, 0, hv, rows));
+        CHECK(ds4_gpu_end_commands());
+        ds4_gpu_tensor_free(hv); ds4_gpu_tensor_free(lv);
+        const float *got_low = ds4_gpu_tensor_contents(low);
+        CHECK(got_low);
+        uint64_t low_differ = 0;
+        for (uint64_t i = 0; i < (uint64_t)rows * GROUPS * RANK; i++)
+            if (memcmp(&got_low[i], &reference_low[i], 4)) low_differ++;
+        if (rows < ROWS) CHECK(isnan(got_low[(uint64_t)rows * GROUPS * RANK]));
+        fprintf(stderr, "V4.1 decode output stage rows=%u out_a, ATTN_OUT_LOW_DIRECT disabled: "
+                        "low %llu/%llu differ\n", rows, (unsigned long long)low_differ,
+                (unsigned long long)((uint64_t)rows * GROUPS * RANK));
+        CHECK(low_differ == 0);
+    }
+    CHECK(unsetenv("DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT") == 0);
+    fprintf(stderr, "V4.1 decode output stage, widths 1..%u, out_a with "
+                    "DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT exported: bit-identical to the "
+                    "per-row path PASS\n", (unsigned)ROWS);
+
+    ds4_gpu_tensor_free(heads); ds4_gpu_tensor_free(low); ds4_gpu_tensor_free(out);
     free(x); free(reference); free(reference_low); free(model);
     return 1;
 }
+#endif
 
 static int check_indexer_batch(void) {
     enum { KEYS = 1025, ROWS = 33, HEADS = 32, DIM = 128 };
@@ -2032,6 +2318,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--attention-output-decode")) {
+        const int ok = ds4_gpu_init() && check_attention_output_decode();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
 #endif
     if (argc == 2 && !strcmp(argv[1], "--embedding")) {
         const int ok = ds4_gpu_init() && check_embedding();
@@ -2099,7 +2390,8 @@ int main(int argc, char **argv) {
              check_tp_attention();
 #ifdef __APPLE__
     if (ok) ok = check_rope_pair() && check_quantize_store() &&
-                 check_rope_freqs() && check_fusion_gates();
+                 check_rope_freqs() && check_fusion_gates() &&
+                 check_attention_output_decode();
 #endif
     ds4_gpu_cleanup();
     return ok ? 0 : 1;

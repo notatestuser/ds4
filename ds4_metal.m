@@ -26549,9 +26549,15 @@ static int ds4_gpu_attention_output_q8_batch_impl(
         uint32_t                n_tokens,
         bool                    round_low_bf16,
         uint64_t                full_low_dim,
-        uint64_t                low_offset) {
+        uint64_t                low_offset,
+        /* PRE_M5 3.6d (2026-09-17): encode the out_a half and the BF16 rounding of `low` and
+         * stop. The batched decode step projects out_b itself, with a kernel whose per-row
+         * arithmetic does not depend on how many rows share the step; out_b through
+         * ds4_gpu_matmul_q8_0_tensor() takes mul_mv_ext at 2..16 rows, which reorders the
+         * reduction and makes its lane map a function of the row COUNT. `out` may be NULL. */
+        bool                    low_only) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!out || !low || !group_tmp || !low_tmp || !heads || !model_map ||
+    if ((!out && !low_only) || !low || !group_tmp || !low_tmp || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0 ||
         group_dim > UINT32_MAX || rank > UINT32_MAX || out_dim > UINT32_MAX) {
         return 0;
@@ -26571,7 +26577,8 @@ static int ds4_gpu_attention_output_q8_batch_impl(
         const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
         const uint64_t out_b_bytes = out_dim * row_b_bytes;
         if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
-            out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) {
+            (!low_only && (out_b_offset > model_size ||
+                           out_b_bytes > model_size - out_b_offset))) {
             fprintf(stderr, "ds4: Metal attention output batch weights are outside the mapped model\n");
             return 0;
         }
@@ -26581,7 +26588,7 @@ static int ds4_gpu_attention_output_q8_batch_impl(
         const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
         if (ds4_gpu_tensor_bytes(heads) < heads_bytes ||
             ds4_gpu_tensor_bytes(low) < low_bytes ||
-            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            (!low_only && ds4_gpu_tensor_bytes(out) < out_bytes)) {
             fprintf(stderr, "ds4: Metal attention output batch received undersized buffers\n");
             return 0;
         }
@@ -26867,7 +26874,9 @@ static int ds4_gpu_attention_output_q8_batch_impl(
 
         if (ok && round_low_bf16)
             ok = ds4_gpu_dsv41_quantize(low, (uint32_t)low_dim, n_tokens, DS4_V41_BF16);
-        if (ok && full_low_dim != low_dim) {
+        if (low_only) {
+            /* 3.6d: `low` is finished and rounded; the caller projects out_b. */
+        } else if (ok && full_low_dim != low_dim) {
             const uint32_t matrix_rows = ds4_gpu_mpp_available() ? n_tokens / 32u * 32u : 0;
             if (matrix_rows) {
                 ok = ds4_gpu_matmul_q8_0_kslice_rows_impl(out, model_map, model_size,
@@ -26906,7 +26915,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         const ds4_gpu_tensor *heads, uint32_t n_tokens) {
     return ds4_gpu_attention_output_q8_batch_impl(out, low, group_tmp, low_tmp,
         model_map, model_size, out_a_offset, out_b_offset, group_dim, rank,
-        n_groups, out_dim, heads, n_tokens, false, 0, 0);
+        n_groups, out_dim, heads, n_tokens, false, 0, 0, false);
 }
 
 int ds4_gpu_dsv41_attention_output_batch(
@@ -26916,7 +26925,41 @@ int ds4_gpu_dsv41_attention_output_batch(
         const ds4_gpu_tensor *heads, uint32_t n_tokens) {
     return ds4_gpu_attention_output_q8_batch_impl(out, low, low, low,
         model_map, model_size, out_a_offset, out_b_offset, 4096, 1024,
-        8, 5120, heads, n_tokens, true, 0, 0);
+        8, 5120, heads, n_tokens, true, 0, 0, false);
+}
+
+/* PRE_M5 3.6d (2026-09-17): the out_a half of the call above, for the batched decode step.
+ * It encodes exactly the dispatch that call encodes for out_a -- one (group, row) threadgroup
+ * per row running kernel_dsv4_attn_out_low_q8_0_f32 with the nr0=2 / nsg=4 k-split and the
+ * helper_mv_reduce_and_write tree -- followed by the same BF16 rounding of `low`, and then
+ * stops. The caller finishes with out_b, which on the decode path must keep the single-row
+ * matvec's arithmetic: ds4_gpu_matmul_q8_0_tensor() would take mul_mv_ext at 2..16 rows, whose
+ * reduction order (and whose nxpsg lane map, 16 at 2 rows and 8 at 3+) depends on the batch.
+ *
+ * nr0 = 2 IS PINNED HERE: this reuses ds4_gpu_attention_output_q8_batch_impl's use_direct_low
+ * encode, which hardcodes nr0 2, nsg 4 and "kernel_dsv4_attn_out_low_q8_0_f32", as it always has
+ * for the prefill and TP callers. The SINGLE-ROW ds4_gpu_attention_output_low_q8_impl() this
+ * stage replaces pins the same nr0 2 / nsg 4 / smem 32*2*4, and the single-row out_b in
+ * ds4_gpu_matmul_q8_0_legacy_tensor() takes ds4_gpu_make_q8_0_mv_dispatch() verbatim, so the
+ * batched stage and the per-row loop run the same geometry on both halves at every width a
+ * decode step can take. ONE selector is left on the batched half that the per-row loop does not
+ * have: use_direct_low is `n_tokens < 32 && getenv("DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT") ==
+ * NULL`, and since a decode step is at most 8 rows only that diagnostic env can move it. It
+ * moves the encode, not the arithmetic -- the other branch dispatches kernel_mul_mv_id_q8_0_f32
+ * over the same (row_groups, 1, pairs) grid of 32 x nsg threads, with the same args (nr0 2,
+ * nsg 4, smem 32*2*4) and a group-ids buffer holding ids[t][g] = g, and that kernel reaches the
+ * same kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0> this one wraps, with the same args0 and the same
+ * src0/dst offsets. Measured, not argued: tests/test_deepseek41_metal --attention-output-decode
+ * reruns out_a at widths 1..8 with that env exported and requires `low` to stay bit-identical to
+ * the per-row reference. */
+int ds4_gpu_dsv41_attention_output_low_batch(
+        ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    return ds4_gpu_attention_output_q8_batch_impl(NULL, low, low, low,
+        model_map, model_size, out_a_offset, 0, 4096, 1024,
+        8, 5120, heads, n_tokens, true, 0, 0, true);
 }
 
 int ds4_gpu_dsv41_attention_output_tp_batch(
@@ -26929,7 +26972,7 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
         shard_bytes * 2u > model_size - out_a_offset) return 0;
     return ds4_gpu_attention_output_q8_batch_impl(out, low, low, low,
         model_map, model_size, out_a_offset + tp_rank * shard_bytes, out_b_offset,
-        4096, 1024, 4, 5120, heads, n_tokens, true, 8192, tp_rank * 4096u);
+        4096, 1024, 4, 5120, heads, n_tokens, true, 8192, tp_rank * 4096u, false);
 }
 
 int ds4_gpu_attention_output_q4_K_batch_tensor(
