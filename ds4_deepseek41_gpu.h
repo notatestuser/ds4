@@ -86,6 +86,12 @@ const float *ds4_gpu_dsv41_rope_frequencies(bool compressed);
  * fusion is live for this process. */
 int ds4_v41_decode_fusion_gates(void);
 int ds4_v41_decode_batch_out_b_row_exact(uint32_t rows, uint32_t outputs);
+/* Which attention-output projection a batched decode step of `rows` eligible rows selects: 0 the
+ * per-row loop, 1 3.6d's out_a+out_b pair, 2 the opt-in mv_ext out_b, 3 3.6d2's rows<R> kernels.
+ * The fusion-gates oracle above proves the rollback names are read; this proves they route, which
+ * for a stage whose two sides are bit-identical is the only model-free way to show that its
+ * rollback does anything at all. */
+int ds4_v41_batch_attention_output_path(unsigned rows);
 #endif
 int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *kv,

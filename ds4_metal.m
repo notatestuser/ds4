@@ -5908,6 +5908,19 @@ static int ds4_gpu_encode_attn_out_low_q8_direct(
         NSUInteger                  nsg,
         bool                        rows_per_group_is_nr0);
 
+static int ds4_gpu_encode_attn_out_low_q8_rows(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        id<MTLBuffer>               src0,
+        NSUInteger                  src0_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst,
+        NSUInteger                  dst_off,
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  nsg);
+
 static int ds4_gpu_encode_attn_out_low_mpp(
         id<MTLCommandBuffer>           cb,
         id<MTLComputePipelineState>    pipeline,
@@ -9704,6 +9717,27 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
     return 1;
 }
 
+/* PRE_M5 3.6d2 (2026-09-17): a pre-commit callback.  ds4.c's batched decode step defers the
+ * Engram reader join until the first COMMIT (the invariant the join exists for is stated in terms
+ * of committed commands, not encoded ones).  Deciding by hand which callees can end a command
+ * batch inside a layer is an enumeration that goes stale -- ds4_gpu_routed_moe_batch_tensor's Q4
+ * expert-table residency boundary and half a dozen stage-profile diagnostics all do it -- so the
+ * step registers the join here instead and every commit path runs it first, by construction.
+ * Single-threaded with the rest of the command-batch state (g_batch_cb is a plain global).  A hook
+ * must not begin/end/flush a batch or encode work; joining host threads is the intended use. */
+static void (*g_pre_commit_hook)(void *) = NULL;
+static void  *g_pre_commit_hook_ctx = NULL;
+
+void ds4_gpu_set_pre_commit_hook(void (*hook)(void *), void *ctx) {
+    g_pre_commit_hook = hook;
+    g_pre_commit_hook_ctx = ctx;
+}
+
+static void ds4_gpu_run_pre_commit_hook(void) {
+    void (*hook)(void *) = g_pre_commit_hook;
+    if (hook) hook(g_pre_commit_hook_ctx);
+}
+
 int ds4_gpu_begin_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* A failed concurrent FFN must never affect the next command batch. */
@@ -9759,6 +9793,7 @@ int ds4_gpu_flush_commands(void) {
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb) return 0;
 
+    ds4_gpu_run_pre_commit_hook();   /* 3.6d2: everything encoded so far is about to be submitted */
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
@@ -10802,6 +10837,7 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb || event_value == 0) return 0;
+    ds4_gpu_run_pre_commit_hook();   /* 3.6d2 */
 
     if (@available(macOS 12.0, *)) {
         if (!g_selected_readback_event) return 0;
@@ -12064,6 +12100,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb) return 0;
+    ds4_gpu_run_pre_commit_hook();   /* 3.6d2 */
 
     if (@available(macOS 12.0, *)) {
         if (!g_selected_readback_event) {
@@ -12128,6 +12165,7 @@ int ds4_gpu_end_commands(void) {
         ds4_gpu_parallel_ffn_reset_state(YES);
         return 0;
     }
+    ds4_gpu_run_pre_commit_hook();   /* 3.6d2 */
     ds4_gpu_parallel_ffn_reset_state(YES);
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
@@ -26975,6 +27013,197 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
         4096, 1024, 4, 5120, heads, n_tokens, true, 8192, tp_rank * 4096u, false);
 }
 
+
+/* =========================================================================
+ * PRE_M5 3.6d2 (2026-09-17): the attention-output pair for N decode rows with each weight block
+ * read once.  See metal/dense.metal kernel_mul_mv_q8_0_f32_nrows_impl for the exactness argument:
+ * per row this is the single-row dispatch's arithmetic in the single-row dispatch's order, so the
+ * batched result is the per-row result bit for bit -- the property neither the grid-y form nor
+ * mul_mv_ext has.  Both projections keep the fused BF16 store of the single-row producers when
+ * round_bf16 is set, so the rounding POINT does not move either (analysis-3_6-gaps.md 4.4).
+ * ========================================================================= */
+static uint32_t ds4_gpu_attn_out_rows_template(uint32_t n_rows) {
+    return n_rows <= 2u ? 2u : n_rows <= 4u ? 4u : 8u;
+}
+
+static const char *ds4_gpu_attn_out_low_rows_name(bool round, uint32_t tmpl) {
+    switch (tmpl) {
+    case 2: return round ? "kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows2"
+                         : "kernel_dsv4_attn_out_low_q8_0_f32_rows2";
+    case 4: return round ? "kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows4"
+                         : "kernel_dsv4_attn_out_low_q8_0_f32_rows4";
+    case 8: return round ? "kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows8"
+                         : "kernel_dsv4_attn_out_low_q8_0_f32_rows8";
+    default: return NULL;
+    }
+}
+
+static const char *ds4_gpu_mv_q8_0_nrows_name(bool round, uint32_t tmpl) {
+    switch (tmpl) {
+    case 2: return round ? "kernel_mul_mv_q8_0_f32_bf16_nrows2" : "kernel_mul_mv_q8_0_f32_nrows2";
+    case 4: return round ? "kernel_mul_mv_q8_0_f32_bf16_nrows4" : "kernel_mul_mv_q8_0_f32_nrows4";
+    case 8: return round ? "kernel_mul_mv_q8_0_f32_bf16_nrows8" : "kernel_mul_mv_q8_0_f32_nrows8";
+    default: return NULL;
+    }
+}
+
+int ds4_gpu_attention_output_q8_rows_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_rows,
+        int                     round_bf16) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !low || !heads || !model_map ||
+        n_rows < 2u || n_rows > 8u ||
+        group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 ||
+        group_dim > UINT32_MAX || rank > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        const uint64_t low_dim = (uint64_t)n_groups * rank;
+        /* NR0 is 2 and the impl reads both of its weight rows without a tail guard, exactly as the
+         * single-row dispatch does, so both output extents must be even. */
+        if ((group_dim % 32u) != 0 || (low_dim % 32u) != 0 || low_dim > UINT32_MAX ||
+            (rank % 2u) != 0 || (out_dim % 2u) != 0) {
+            return 0;
+        }
+
+        const uint64_t row_a_bytes = (group_dim / 32u) * 34u;
+        const uint64_t row_b_bytes = (low_dim / 32u) * 34u;
+        const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
+        const uint64_t out_b_bytes = out_dim * row_b_bytes;
+        if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
+            out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) {
+            fprintf(stderr, "ds4: Metal attention output rows weights are outside the mapped model\n");
+            return 0;
+        }
+
+        const uint64_t heads_bytes = (uint64_t)n_rows * n_groups * group_dim * sizeof(float);
+        const uint64_t low_bytes = (uint64_t)n_rows * low_dim * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)n_rows * out_dim * sizeof(float);
+        if (ds4_gpu_tensor_bytes(heads) < heads_bytes ||
+            ds4_gpu_tensor_bytes(low) < low_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: Metal attention output rows received undersized buffers\n");
+            return 0;
+        }
+
+        const bool round = round_bf16 != 0;
+        const uint32_t tmpl = ds4_gpu_attn_out_rows_template(n_rows);
+        /* nsg 4 for out_a is the k-split ds4_gpu_attention_output_low_q8_impl and the batched
+         * direct-low path both use; out_b takes the single-row matvec's own dispatch.  The split
+         * has to match or the per-row reduction tree would not: nsg IS the reduction tree here --
+         * it fixes ib0 = sgitg*NQ + ix and the NSG*NQ block stride, hence which blocks land in
+         * which simdgroup partial before helper_mv_reduce_and_write sums them.  That is why the
+         * `out_dim > 65536 -> nsg 8` rule below is not optional: ds4_gpu_matmul_q8_0_tensor_impl
+         * and ds4_gpu_matmul_q8_0_decode_rows_exact_tensor -- the two single-row producers this
+         * entry point is documented to reproduce -- both apply it, so a rows dispatch that kept
+         * nsg 4 on a wide out_dim would group the blocks differently and be off by ULPs.  V4.1's
+         * 5120 never reaches it; check_attn_out_rows()'s second geometry does. */
+        ds4_gpu_mv_dispatch out_b_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        if (out_dim > 65536u) out_b_dispatch.nsg = 8;
+        id<MTLComputePipelineState> low_pipeline =
+            ds4_gpu_get_mul_mv_pipeline(ds4_gpu_attn_out_low_rows_name(round, tmpl), 4);
+        id<MTLComputePipelineState> out_pipeline =
+            ds4_gpu_get_mul_mv_pipeline(ds4_gpu_mv_q8_0_nrows_name(round, tmpl),
+                                          out_b_dispatch.nsg);
+        if (!low_pipeline || !out_pipeline) return 0;
+
+        uint64_t out_a_inner = 0, out_b_inner = 0;
+        id<MTLBuffer> out_a_buf =
+            ds4_gpu_wrap_model_range(model_map, model_size, out_a_offset, out_a_bytes, &out_a_inner);
+        id<MTLBuffer> out_b_buf =
+            ds4_gpu_wrap_model_range(model_map, model_size, out_b_offset, out_b_bytes, &out_b_inner);
+        if (!out_a_buf || !out_b_buf) return 0;
+
+        const bool had_batch = g_batch_cb != nil;
+        if (!had_batch && ds4_gpu_begin_commands() == 0) return 0;
+
+        bool ok = true;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb || owned) ok = false;
+
+        if (ok) {
+            ds4_gpu_mul_mv_id_args args = {
+                .nei0 = (int32_t)n_groups,
+                .nei1 = (int32_t)n_rows,
+                .nbi1 = 0,
+                .ne00 = (int32_t)group_dim,
+                .ne01 = (int32_t)rank,
+                .ne02 = (int32_t)n_groups,
+                .nb00 = 34,
+                .nb01 = row_a_bytes,
+                .nb02 = (uint64_t)rank * row_a_bytes,
+                .ne10 = (int32_t)group_dim,
+                .ne11 = (int32_t)n_groups,
+                .ne12 = (int32_t)n_rows,
+                .ne13 = 1,
+                .nb10 = sizeof(float),
+                .nb11 = (uint64_t)group_dim * sizeof(float),
+                .nb12 = (uint64_t)n_groups * group_dim * sizeof(float),
+                .ne0 = (int32_t)rank,
+                .ne1 = (int32_t)n_groups,
+                .nb1 = (uint64_t)rank * sizeof(float),
+                .nr0 = 2,
+            };
+            ok = ds4_gpu_encode_attn_out_low_q8_rows(cb,
+                                                       low_pipeline,
+                                                       &args,
+                                                       out_a_buf,
+                                                       (NSUInteger)out_a_inner,
+                                                       ds4_gpu_tensor_buffer(heads),
+                                                       ds4_gpu_tensor_offset(heads),
+                                                       ds4_gpu_tensor_buffer(low),
+                                                       ds4_gpu_tensor_offset(low),
+                                                       32u * 2u * sizeof(float),
+                                                       4) != 0;
+        }
+
+        if (ok) {
+            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(low_dim, out_dim);
+            mv_args.ne11 = (int32_t)n_rows;
+            mv_args.ne1 = (int32_t)n_rows;
+            mv_args.nr0 = 2;
+
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:out_pipeline];
+            [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+            [enc setBuffer:out_b_buf offset:(NSUInteger)out_b_inner atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(low) offset:ds4_gpu_tensor_offset(low) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / 2u, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)out_b_dispatch.nsg, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+
+        if (!had_batch) {
+            ok = ds4_gpu_end_commands() != 0 && ok;
+        }
+        return ok ? 1 : 0;
+    }
+}
+
+int ds4_gpu_dsv41_attention_output_rows(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_rows) {
+    return ds4_gpu_attention_output_q8_rows_tensor(out, low, model_map, model_size,
+        out_a_offset, out_b_offset, 4096, 1024, 8, 5120, heads, n_rows, 1);
+}
+
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -32612,6 +32841,46 @@ static int ds4_gpu_encode_attn_out_low_q8_direct(
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
     [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* PRE_M5 3.6d2 (2026-09-17): the rows-templated twin of the dispatch above.  The row index is no
+ * longer a grid dimension -- the kernel holds all nei1 rows -- so the grid is one threadgroup per
+ * (row group, GROUP) instead of per (row group, group x row), and each group's weight is streamed
+ * once for the whole step instead of once per row. */
+static int ds4_gpu_encode_attn_out_low_q8_rows(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        id<MTLBuffer>               src0,
+        NSUInteger                  src0_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst,
+        NSUInteger                  dst_off,
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  nsg) {
+    if (!cb || !pipeline || !args || !src0 || !src1 || !dst ||
+        args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 <= 0 || args->nei1 <= 0 ||
+        args->nr0 <= 0) {
+        return 0;
+    }
+
+    const NSUInteger row_groups =
+        ((NSUInteger)args->ne01 + (NSUInteger)args->nr0 - 1u) / (NSUInteger)args->nr0;
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBuffer:src0 offset:src0_off atIndex:1];
+    [enc setBuffer:src1 offset:src1_off atIndex:2];
+    [enc setBuffer:dst  offset:dst_off  atIndex:3];
+    if (threadgroup_bytes != 0) {
+        [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, (NSUInteger)args->nei0)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;

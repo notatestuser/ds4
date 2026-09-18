@@ -290,6 +290,40 @@ int ds4_gpu_hc_expand_split_bf16_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_te
 int ds4_gpu_attention_output_low_q8_bf16_tensor(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
                                                 uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
                                                 uint32_t n_groups, const ds4_gpu_tensor *heads);
+/* PRE_M5 3.6d2 (2026-09-17): the attention-output pair (out_a then out_b) for 2..8 decode rows
+ * through the rows-templated Q8_0 matvecs, which read each weight block once and dot it against
+ * every row.  Each row's floats are bit-identical to its own single-row dispatch -- same K walk,
+ * same reduction tree -- so this is a drop-in for the per-row loop, unlike the mul_mv_ext path
+ * whose reduction both reorders and depends on the batch width.  round_bf16 selects the fused
+ * BF16 store of the single-row producers (kernel_mul_mv_q8_0_f32_bf16 /
+ * kernel_dsv4_attn_out_low_q8_0_f32_bf16) for both projections.  0 on any ineligible shape, so
+ * the caller can fall back.  Requires even rank and out_dim: the NR0 2 impl reads both of its
+ * weight rows unguarded.  The k-split follows the single-row rule at every size, including the
+ * nsg 8 every Q8_0 matvec switches to above 65536 output rows, so the bit-identity claim holds
+ * outside the V4.1 geometry too. */
+int ds4_gpu_attention_output_q8_rows_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint64_t out_dim,
+        const ds4_gpu_tensor *heads, uint32_t n_rows, int round_bf16);
+/* The V4.1 geometry (8 groups x 1024 rank x 4096, 5120 out) with the fused BF16 epilogue. */
+int ds4_gpu_dsv41_attention_output_rows(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_rows);
+/* PRE_M5 3.6d2 (2026-09-17): a callback run immediately before the batch command buffer is
+ * committed -- by EVERY path that commits it: ds4_gpu_end_commands(), ds4_gpu_flush_commands(),
+ * ds4_gpu_signal_batch_and_wait_event() and ds4_gpu_commit_and_wait_selected_readback(), which are
+ * the only four (ds4_gpu_cleanup() commits at teardown, after any step has returned).  The V4.1
+ * batched decode step installs one for the length of its layer loop so that holding the Engram
+ * reader join until the first commit is ENFORCED rather than enumerated: whatever ends the batch
+ * inside a layer -- the step's own flush, a stage-profile diagnostic, the Q4 expert-table
+ * residency boundary inside the MoE, or something added later -- the readers are joined first.
+ * NULL clears it.  Callbacks must not begin, end or flush a command batch (no re-entry) and must
+ * not encode GPU work; joining host threads, as ds4.c does, is the intended use. */
+void ds4_gpu_set_pre_commit_hook(void (*hook)(void *), void *ctx);
 int ds4_gpu_device_is_m5_apple_silicon(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
 /* Strict test oracle for the fixed decode mul_mv pipeline lookup cache. */
@@ -327,6 +361,22 @@ void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
 static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
+/* 3.6d2: the rows kernels are Metal-only; off Apple the batched step never asks for them, but the
+ * call still has to compile. */
+static inline int ds4_gpu_dsv41_attention_output_rows(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_rows) {
+    (void)out; (void)low; (void)model_map; (void)model_size;
+    (void)out_a_offset; (void)out_b_offset; (void)heads; (void)n_rows;
+    return 0;
+}
+/* 3.6d2: so is the pre-commit hook -- off Apple there is no batch command buffer to hook, and the
+ * batched step's join stays where it was, but the call still has to compile. */
+static inline void ds4_gpu_set_pre_commit_hook(void (*hook)(void *), void *ctx) {
+    (void)hook; (void)ctx;
+}
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);

@@ -182,6 +182,128 @@ void kernel_mul_mv_q8_0_f32_impl(
     helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
+// PRE_M5 3.6d2 (2026-09-17): the Q8_0 decode matvec with N ACTIVATION ROWS held in one
+// threadgroup, so each weight block is read once and dotted against all of them.  The single-row
+// kernel above is dispatched once per row of a batched decode step, which re-streams the whole
+// weight per row (35.6 MB for attn_output_a, 44.6 MB for attn_output_b, per layer, per row); the
+// grid-y form of the same kernel (r1 = tgpig.y above) re-streams it too and only wins where the
+// weight fits the cache -- measured 7.05x at ~8 MB but 1.29x at 44.6 MB (analysis-3_6-gaps.md 4.3).
+//
+// EXACTNESS.  For every (activation row, weight row) pair this computes the single-row kernel's
+// arithmetic, in the single-row kernel's order: the same ix/il lane mapping, the same
+// ib0 = sgitg*NQ + ix with stride NSG*NQ, the same eight-term sumq accumulated in index order, the
+// same sumf += sumq*d accumulated in block order, and the same helper_mv_reduce_and_write over the
+// same NSG simdgroup partials.  Only the loop NEST changes: the block's quants and its `half`
+// scale are hoisted into registers, so the row loop reuses them instead of reloading them.  The
+// accumulators of different rows never meet.  Each row is therefore bit-identical to its own
+// single-row dispatch, which is what makes these kernels a drop-in for the per-row loop.
+//
+// NROWS is the compile-time bound (2, 4 or 8); `nrows` is the step's actual row count and comes
+// from the constant args buffer, so it is uniform across the threadgroup and the reduce loop that
+// closes over threadgroup barriers is uniform too.  Rows at or past `nrows` read row 0 and are
+// never stored, so rounding 3 rows up to the NROWS-4 kernel costs arithmetic, never a bad access.
+//
+// The reduction scratch is the single-row dispatch's own (NR0*32 floats, 256 B at NR0 2) and is
+// reused row by row; the barrier before each reuse is what stops a fast simdgroup zeroing it
+// while a slow one is still reading the previous row's partials.
+//
+// Note on the name: kernel_mul_mv_q8_0_f32_rows<N> already exists and means N OUTPUT rows per
+// simdgroup (the NR0 family).  These count TOKEN rows, hence _nrows<N>.
+template<short NR0, short NROWS, bool ROUND>
+void kernel_mul_mv_q8_0_f32_nrows_impl(
+        const int           ne00,
+        const int           ne01,
+        const uint64_t      nb01,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        const uint          src1_row_floats,
+        const uint          dst_row_floats,
+        const short         nrows,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = ne00/QK8_0;
+
+    const int r0 = tgpig.x*NR0;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + (r0 + row)*nb01);
+    }
+
+    float sumf[NROWS][NR0];
+    FOR_UNROLL (short t = 0; t < NROWS; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            sumf[t][row] = 0.f;
+        }
+    }
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    // Rows past the step's row count fold onto row 0: in bounds, never stored.
+    uint roff[NROWS];
+    FOR_UNROLL (short t = 0; t < NROWS; ++t) {
+        roff[t] = (uint) (t < nrows ? t : 0) * src1_row_floats;
+    }
+
+    device const float * yb = (device const float *) src1 + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        int8_t qv[NR0][NQ];
+        half   dv[NR0];
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                qv[row][i] = qs[i];
+            }
+
+            dv[row] = ax[row][ib].d;
+        }
+
+        FOR_UNROLL (short t = 0; t < NROWS; ++t) {
+            float yl[NQ];
+
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                yl[i] = yb[roff[t] + i];
+            }
+
+            for (short row = 0; row < NR0; row++) {
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += qv[row][i] * yl[i];
+                }
+
+                sumf[t][row] += sumq*dv[row];
+            }
+        }
+
+        yb += NSG*NQ*QK8_0;
+    }
+
+    for (short t = 0; t < NROWS && t < nrows; ++t) {
+        if (t > 0) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        device float * dst_f32 = (device float *) dst + (uint64_t)t*dst_row_floats;
+
+        helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf[t], r0, ne01, tiisg, sgitg, shmem);
+    }
+}
+
+
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
 // projections such as shared experts and output-side small matvecs.
 [[host_name("kernel_mul_mv_q8_0_f32")]]
@@ -210,6 +332,120 @@ kernel void kernel_mul_mv_q8_0_f32_bf16(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+// PRE_M5 3.6d2: out_b for 2 decode rows, plain f32 store.  args.ne11 carries the actual row count,
+// args.nb11 the activation row stride and args.ne0 the destination row stride; the grid is the
+// single-row grid (ceil(ne01/NR0), 1, 1) because the rows live inside the threadgroup.
+[[host_name("kernel_mul_mv_q8_0_f32_nrows2")]]
+kernel void kernel_mul_mv_q8_0_f32_nrows2(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_nrows_impl<N_R0_Q8_0, 2, false>(
+        args.ne00, args.ne01, args.nb01, src0, src1, dst,
+        (uint) (args.nb11/sizeof(float)), (uint) args.ne0, (short) args.ne11,
+        shmem, tgpig, tiisg, sgitg);
+}
+
+// PRE_M5 3.6d2: out_b for 4 decode rows, plain f32 store.  args.ne11 carries the actual row count,
+// args.nb11 the activation row stride and args.ne0 the destination row stride; the grid is the
+// single-row grid (ceil(ne01/NR0), 1, 1) because the rows live inside the threadgroup.
+[[host_name("kernel_mul_mv_q8_0_f32_nrows4")]]
+kernel void kernel_mul_mv_q8_0_f32_nrows4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_nrows_impl<N_R0_Q8_0, 4, false>(
+        args.ne00, args.ne01, args.nb01, src0, src1, dst,
+        (uint) (args.nb11/sizeof(float)), (uint) args.ne0, (short) args.ne11,
+        shmem, tgpig, tiisg, sgitg);
+}
+
+// PRE_M5 3.6d2: out_b for 8 decode rows, plain f32 store.  args.ne11 carries the actual row count,
+// args.nb11 the activation row stride and args.ne0 the destination row stride; the grid is the
+// single-row grid (ceil(ne01/NR0), 1, 1) because the rows live inside the threadgroup.
+[[host_name("kernel_mul_mv_q8_0_f32_nrows8")]]
+kernel void kernel_mul_mv_q8_0_f32_nrows8(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_nrows_impl<N_R0_Q8_0, 8, false>(
+        args.ne00, args.ne01, args.nb01, src0, src1, dst,
+        (uint) (args.nb11/sizeof(float)), (uint) args.ne0, (short) args.ne11,
+        shmem, tgpig, tiisg, sgitg);
+}
+
+// PRE_M5 3.6d2: out_b for 2 decode rows, the BF16 boundary rounding fused into the store.  args.ne11 carries the actual row count,
+// args.nb11 the activation row stride and args.ne0 the destination row stride; the grid is the
+// single-row grid (ceil(ne01/NR0), 1, 1) because the rows live inside the threadgroup.
+[[host_name("kernel_mul_mv_q8_0_f32_bf16_nrows2")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16_nrows2(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_nrows_impl<N_R0_Q8_0, 2, true>(
+        args.ne00, args.ne01, args.nb01, src0, src1, dst,
+        (uint) (args.nb11/sizeof(float)), (uint) args.ne0, (short) args.ne11,
+        shmem, tgpig, tiisg, sgitg);
+}
+
+// PRE_M5 3.6d2: out_b for 4 decode rows, the BF16 boundary rounding fused into the store.  args.ne11 carries the actual row count,
+// args.nb11 the activation row stride and args.ne0 the destination row stride; the grid is the
+// single-row grid (ceil(ne01/NR0), 1, 1) because the rows live inside the threadgroup.
+[[host_name("kernel_mul_mv_q8_0_f32_bf16_nrows4")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16_nrows4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_nrows_impl<N_R0_Q8_0, 4, true>(
+        args.ne00, args.ne01, args.nb01, src0, src1, dst,
+        (uint) (args.nb11/sizeof(float)), (uint) args.ne0, (short) args.ne11,
+        shmem, tgpig, tiisg, sgitg);
+}
+
+// PRE_M5 3.6d2: out_b for 8 decode rows, the BF16 boundary rounding fused into the store.  args.ne11 carries the actual row count,
+// args.nb11 the activation row stride and args.ne0 the destination row stride; the grid is the
+// single-row grid (ceil(ne01/NR0), 1, 1) because the rows live inside the threadgroup.
+[[host_name("kernel_mul_mv_q8_0_f32_bf16_nrows8")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16_nrows8(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_nrows_impl<N_R0_Q8_0, 8, true>(
+        args.ne00, args.ne01, args.nb01, src0, src1, dst,
+        (uint) (args.nb11/sizeof(float)), (uint) args.ne0, (short) args.ne11,
+        shmem, tgpig, tiisg, sgitg);
 }
 
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same

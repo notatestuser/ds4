@@ -40485,6 +40485,50 @@ static bool ds41_batch_attention_output_gate(void) {
 static bool ds41_batch_attention_output_mv_ext(void) {
     return getenv("DS4_METAL_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_MV_EXT") != NULL;
 }
+/* PRE_M5 3.6d2 (2026-09-17): project the batched step's rows through the rows-templated Q8_0
+ * kernels, which load each weight block once and dot it against all N rows.  3.6d collapsed the
+ * DISPATCHES and kept every row's arithmetic; what it could not collapse is the weight traffic,
+ * because both of its kernels give each row its own threadgroup and re-read out_a's 35.6 MB and
+ * out_b's 44.6 MB per row per layer.  The variant that did halve out_b's traffic -- mul_mv_ext --
+ * is not exact and is the reason 3.6d ships row-exact.  These kernels take the traffic without
+ * the trade: they hold the N activation rows in one threadgroup, so per (activation row, output
+ * row) the lane-to-block map, the k-split, the eight-term dot, the block order, the simd_sum
+ * reduction tree and the fused BF16 store are the single-row kernel's, and every row stays
+ * bit-identical to its own single-row dispatch at every N.  That is the follow-up 3.6d's own
+ * comment names.  Rollback DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_ROWS returns the
+ * step to 3.6d's pair of dispatches.  Kept pure for the --fusion-gates oracle; the per-step
+ * eligibility (2..8 rows, and everything ds41_batch_attention_output_enabled() already requires)
+ * is decided there. */
+static bool ds41_batch_attention_output_rows_gate(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_ROWS");
+}
+/* The three-way projection decision, as far as env state and the row count settle it: 0 the
+ * per-row loop, 1 3.6d's out_a+out_b pair, 2 the opt-in mv_ext out_b, 3 these rows<R> kernels.
+ * Factored out of ds41_batch_attention_output_enabled() so that it and the
+ * ds4_v41_batch_attention_output_path() oracle below cannot drift apart.  --fusion-gates can only
+ * show that a rollback NAME reaches the predicate that owns it; this stage's two predicates gate
+ * ds4.c branches whose two sides are bit-identical, and the kernel entry points read no
+ * environment at all, so without an oracle over the SELECTION nothing model-free could show that
+ * either rollback routes anywhere. */
+static int ds41_batch_attention_output_kind(uint32_t rows) {
+    if (!ds41_batch_attention_output_gate()) return 0;
+    if (ds41_batch_attention_output_mv_ext()) return 2;
+    if (rows >= 2u && rows <= (uint32_t)DS4_TP_BATCH_MAX_ROWS &&
+        ds41_batch_attention_output_rows_gate()) return 3;
+    return 1;
+}
+/* PRE_M5 3.6d2 (2026-09-17): join the Engram reader threads before the first COMMIT rather than
+ * before layer 1 is ENCODED.  The invariant the join exists for is stated in terms of committed
+ * commands, and the flush that makes the first commit joins already, so the readers get the encode
+ * of layers 1..flush_every-1 to hide behind.  No float changes; only when the host waits.
+ * Rollback DS4_METAL_DISABLE_PRE_M5_V41_LATE_ENGRAM_JOIN.  Pure, for the oracle: the call site
+ * adds the two conditions that are not env state (an in-loop flush must exist, and no diagnostic
+ * may end a command batch inside a layer). */
+static bool ds41_late_engram_join(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_LATE_ENGRAM_JOIN");
+}
 
 /* Test oracle (tests/test_deepseek41_metal --fusion-gates). The helpers above are all file
  * static, so without this nothing outside ds4.c can observe the switches: a misspelt name would
@@ -40494,8 +40538,24 @@ int ds4_v41_decode_fusion_gates(void) {
     return (ds41_pre_copy_fused() ? 1 : 0) |
            (ds41_rope_pair_fused() ? 2 : 0) |
            (ds41_quantize_store_fused() ? 4 : 0) |
-           (ds41_batch_attention_output_gate() ? 8 : 0);
+           (ds41_batch_attention_output_gate() ? 8 : 0) |
+           (ds41_batch_attention_output_rows_gate() ? 16 : 0) |
+           (ds41_late_engram_join() ? 32 : 0);
 }
+/* Test oracle (tests/test_deepseek41_metal --attn-out-path).  Which projection
+ * ds41_graph_step_batch() selects for a `rows`-row batched step whose weights are eligible.  The
+ * gates above say which env names are read; this says what they route.  Without it an A/B could
+ * export DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_ROWS, compare the new path with
+ * itself and report the stage exact and free. */
+int ds4_v41_batch_attention_output_path(unsigned rows) {
+    return ds41_batch_attention_output_kind((uint32_t)rows);
+}
+#else
+/* 3.6d2: ds41_graph_step_batch() asks for this decision unconditionally, and it is compiled for
+ * every DS4_HAS_DEEPSEEK41_GPU backend, not just Metal.  Off Apple there is no pre-M5 device and
+ * no Metal command batch to defer a join into, so the answer is no and the join stays exactly
+ * where it has always been. */
+static bool ds41_late_engram_join(void) { return false; }
 #endif
 
 /* Producers with the rounding folded in; each falls back to producer + rounding kernel. */
@@ -41582,6 +41642,42 @@ static void ds41_engram_rows_join(ds41_engram_prefetch *pre, bool *joined, bool 
     if (!(a && b)) *ok = false;
 }
 
+/* PRE_M5 3.6d2 (2026-09-17): the join, registered with the GPU layer as a pre-commit callback.
+ * The batched decode step stops joining the readers before layer 1 is ENCODED and lets them run
+ * until something is COMMITTED -- which is what the invariant has always been about.  Deciding by
+ * hand which callees can end a command batch inside a layer would be an enumeration that goes
+ * stale: ds4_gpu_routed_moe_batch_tensor() ends and restarts the batch in EVERY layer when
+ * DS4_METAL_Q4_TABLE_RESIDENCY_SET is set, several stage profiles do the same, and the selected-id
+ * readback commits from inside the attention stage.  Registering the join instead makes it a
+ * property of the commit path: ds4_gpu_end_commands(), ds4_gpu_flush_commands(),
+ * ds4_gpu_signal_batch_and_wait_event() and ds4_gpu_commit_and_wait_selected_readback() -- the
+ * four functions that commit the batch -- all run this first.
+ * Host-side only: it joins two pthreads and computes nothing, so it cannot re-enter the commit
+ * path, cannot encode work, and cannot deadlock (the Engram reader threads only read the table
+ * file and store into host memory; they never call into the GPU). */
+typedef struct {
+    ds41_engram_prefetch *pre;
+    bool                 *joined;
+    bool                  failed;
+} ds41_engram_join_hook;
+
+/* A reader failure is reported through a sticky flag of the hook's own rather than into the step's
+ * `ok`.  The hook fires from inside a callee's commit, i.e. while one of the step's chained
+ * assignments (`ok = a() && b() && ...`) is still being evaluated, and a store to `ok` made there
+ * is overwritten by the chain's own result the moment it finishes -- leaving the step to carry on
+ * with Engram rows that were never read and to finish "successfully" with wrong logits.  That is
+ * not a corner: ds4_gpu_routed_moe_batch_tensor() commits from inside ds41_moe_batch(), which is
+ * a term of exactly such a chain, and it is one of the callee commits this hook exists for.
+ * ds41_graph_step_batch() folds the flag into `ok` at the bottom of the layer body and once more
+ * after the hook is retired; neither point is inside an expression. */
+static DS4_MAYBE_UNUSED void ds41_engram_join_pre_commit(void *ctx) {
+    ds41_engram_join_hook *h = (ds41_engram_join_hook *)ctx;
+    if (!h) return;
+    bool ok = true;
+    ds41_engram_rows_join(h->pre, h->joined, &ok, false);
+    if (!ok) h->failed = true;
+}
+
 /* PRE_M5 queued decode (2026-09-17): one Apple GPU, resident weights, no
  * per-layer CPU reads. The legacy schedule drains after every layer; the
  * queued one commits without waiting and drains once per token. Read at step
@@ -42364,6 +42460,18 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
     return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
 }
 
+/* The stage's one-line liveness announcement, shared by the two places that can each prove which
+ * projection really ran: ds41_batch_attention_output_enabled() for the paths it settles by itself,
+ * ds41_batch_attention_output_project() for the rows<R> kernels, which are only live once a
+ * dispatch has been accepted.  First caller wins, exactly as the single `announced` flag it
+ * replaces did. */
+static DS4_MAYBE_UNUSED void ds41_batch_attention_output_announce(const char *what) {
+    static bool announced = false;
+    if (announced) return;
+    announced = true;
+    fprintf(stderr, "ds4: V4.1 batched attention output enabled (%s, one pair per step)\n", what);
+}
+
 /* PRE_M5 3.6d (2026-09-17): project the attention output of all N rows of a batched decode
  * step at once -- one out_a dispatch and one out_b dispatch a layer instead of two a row, so
  * 80 dispatches a token instead of 640 at N = 8.
@@ -42414,8 +42522,10 @@ static bool ds41_batch_attention_output_enabled(const ds41_gpu_graph *g,
                                                 const ds4_weights *w,
                                                 uint32_t prefill_rows,
                                                 uint32_t rows,
-                                                bool *mv_ext) {
+                                                bool *mv_ext,
+                                                bool *rows_kernel) {
     *mv_ext = false;
+    *rows_kernel = false;
 #ifdef __APPLE__
     if (prefill_rows != 0u || g->tp_world != 1 || g->streaming || g->quality ||
         g->imatrix || g->image_count ||
@@ -42445,18 +42555,24 @@ static bool ds41_batch_attention_output_enabled(const ds41_gpu_graph *g,
         }
         return false;
     }
-    *mv_ext = ds41_batch_attention_output_mv_ext();
+    /* 3.6d2: the rows kernels are the default -- they keep 3.6d's bit-identity AND drop the
+     * weight re-reads -- for the 2..8 row counts the 2/4/8 templates cover.  The opt-in mv_ext
+     * env keeps exactly the meaning 3.6d gave it (price, and reproduce, the non-exact variant),
+     * so when it is set it still wins; there is no other way to reach that path. */
+    const int kind = ds41_batch_attention_output_kind(rows);
+    *mv_ext = kind == 2;
+    *rows_kernel = kind == 3;
     /* One line the first time the branch is live. Without it every model-level gate passes
      * vacuously when the step quietly falls back (wrong device, TP, a rollback left set in the
      * environment) and a harness would record a result for a change that never ran. The runner
      * greps for this line, and for its absence in the concurrency-1 parity runs, which is also
-     * how it proves the single-token path stays out of here. */
-    static bool announced = false;
-    if (!announced) {
-        fprintf(stderr, "ds4: V4.1 batched attention output enabled (%s out_b, one pair per step)\n",
-                *mv_ext ? "mv_ext" : "row-exact");
-        announced = true;
-    }
+     * how it proves the single-token path stays out of here.
+     * 3.6d2: everything this function settles is announced from here, but the rows<R> wording is
+     * NOT.  This runs before anything is encoded, and the projection can still fall back to 3.6d's
+     * pair; that fallback is bit-identical, so no correctness check separates the two either, and
+     * announcing the intent would let the grep pass for a stage that never ran. */
+    if (!*rows_kernel)
+        ds41_batch_attention_output_announce(*mv_ext ? "mv_ext out_b" : "row-exact out_b");
     return true;
 #else
     (void)g; (void)w; (void)prefill_rows; (void)rows;
@@ -42477,17 +42593,45 @@ static bool ds41_batch_attention_output_enabled(const ds41_gpu_graph *g,
 static bool ds41_batch_attention_output_project(const ds41_prefill_row *active,
                                                 const ds4_model *model,
                                                 const ds4_layer_weights *l,
-                                                uint32_t rows, bool mv_ext) {
+                                                uint32_t rows, bool mv_ext, bool rows_kernel) {
 #ifdef __APPLE__
     if (mv_ext)
         return ds4_gpu_dsv41_attention_output_batch(active->block, active->low,
             model->map, model->size, l->attn_output_a->abs_offset,
             l->attn_output_b->abs_offset, active->heads, rows) != 0;
+    /* 3.6d2 first: one dispatch a projection whose threadgroup holds all N rows, so each weight
+     * block is loaded once instead of once per row, and every row's arithmetic is still the
+     * single-row dispatch's -- `low` and `block` end up holding exactly what the pair below (and
+     * the per-row loop before it) would have written.  The entry point validates everything before
+     * it encodes anything, so a 0 (an ineligible shape, a pipeline that failed to compile) means
+     * nothing was encoded and the pair can run in its place; that is still bit-identical, but it
+     * is not this stage, so say so once. */
+    if (rows_kernel) {
+        if (ds4_gpu_dsv41_attention_output_rows(active->block, active->low,
+                model->map, model->size, l->attn_output_a->abs_offset,
+                l->attn_output_b->abs_offset, active->heads, rows) != 0) {
+            /* Only now: the dispatch was accepted, so the wording the runner greps for is a
+             * statement about work that ran and not about an intent. */
+            ds41_batch_attention_output_announce("rows<R> weight-once out_a+out_b, "
+                                                 "bit-identical per row");
+            return true;
+        }
+        static bool warned_rows = false;
+        if (!warned_rows) {
+            fprintf(stderr, "ds4: V4.1 batched attention output rows kernels unavailable; "
+                    "falling back to the per-row-threadgroup projections\n");
+            warned_rows = true;
+        }
+    }
+    /* 3.6d's pair.  Reached either because the rows kernels were not selected -- in which case
+     * ds41_batch_attention_output_enabled() has already said so and this is a no-op -- or because
+     * they were and declined, which is the case the announce above must not have claimed. */
+    ds41_batch_attention_output_announce("row-exact out_b");
     return ds4_gpu_dsv41_attention_output_low_batch(active->low, model->map, model->size,
                l->attn_output_a->abs_offset, active->heads, rows) != 0 &&
            ds41_matmul_batch(active->block, model, l->attn_output_b, active->low, rows, false);
 #else
-    (void)active; (void)model; (void)l; (void)rows; (void)mv_ext;
+    (void)active; (void)model; (void)l; (void)rows; (void)mv_ext; (void)rows_kernel;
     return false;
 #endif
 }
@@ -42505,10 +42649,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const bool prefill_only = prefill_rows == rows;
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
-    /* 3.6d: one out_a dispatch and one out_b dispatch for all rows, decided once. */
-    bool batch_output_mv_ext = false;
+    /* 3.6d: one out_a dispatch and one out_b dispatch for all rows, decided once.
+     * 3.6d2: and, when the rows kernels are live, with each weight block read once for all of
+     * them instead of once per row. */
+    bool batch_output_mv_ext = false, batch_output_rows = false;
     const bool batch_output =
-        ds41_batch_attention_output_enabled(g, weights, prefill_rows, rows, &batch_output_mv_ext);
+        ds41_batch_attention_output_enabled(g, weights, prefill_rows, rows,
+                                            &batch_output_mv_ext, &batch_output_rows);
     /* PRE_M5 queued batched decode (2026-09-17): both Engram tables are read
      * by reader threads straight into per-row upload slots — table 0 into
      * batch.engram_rows, table 1 into the prefill staging buffer, which is
@@ -42519,6 +42666,22 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ds4_gpu_tensor_bytes(g->engram_prefetch) >=
             (uint64_t)rows * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(float);
     const uint32_t flush_every = queued ? ds41_decode_flush_layers() : 0u;
+    /* 3.6d2: hold the Engram readers until the first COMMIT instead of joining them before layer 1
+     * is ENCODED.  Safety is not this expression's job -- ds41_engram_join_pre_commit(), installed
+     * below, joins ahead of every commit from anywhere -- so what is left here is whether there is
+     * anything to gain:
+     *   - an in-loop flush must actually run, which is `flush_every != 0 && flush_every <
+     *     DS4_N_LAYER`, the exact complement of the flush's own `(il + 1) % flush_every == 0 &&
+     *     il + 1 < DS4_N_LAYER` further down.  ds41_decode_flush_layers() accepts any value up to
+     *     and including DS4_N_LAYER, and at DS4_N_LAYER the only il that satisfies the modulo is
+     *     DS4_N_LAYER-1, which the bound rejects: no in-loop flush, nothing to defer to, so keep
+     *     the old schedule rather than carry the readers across all 61 layers for nothing.  Keep
+     *     the two conditions in step if either moves.
+     *   - DS4_METAL_ATTN_OUT_STAGE_PROFILE ends the command batch inside the attention-output
+     *     call, so with it set the deferral buys one layer at most while changing the schedule the
+     *     profile was written to measure. */
+    const bool late_engram_join = queued && flush_every != 0u && flush_every < DS4_N_LAYER &&
+        ds41_late_engram_join() && !getenv("DS4_METAL_ATTN_OUT_STAGE_PROFILE");
     uint32_t ids_all[DS4_TP_BATCH_MAX_ROWS][2][DS4_ENGRAM_COLS];
     ds41_engram_prefetch rows_pre[2] = {{0}, {0}};
     bool rows_joined = !queued;
@@ -42595,14 +42758,26 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+    /* 3.6d2: for the length of the loop, whatever commits joins the readers first.  Installed only
+     * when the join is being deferred, so the rollback env restores the old schedule exactly, and
+     * cleared right before the join below.  The loop contains no return and no goto -- it leaves
+     * only by running out or by `if (!ok) break` -- so the hook cannot outlive `join_hook`. */
+    ds41_engram_join_hook join_hook = { rows_pre, &rows_joined, false };
+    if (late_engram_join) ds4_gpu_set_pre_commit_hook(ds41_engram_join_pre_commit, &join_hook);
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
         /* Layer 1 is the first Engram consumer: join the readers before it is
          * encoded, so no command that reads the row buffers can be committed
          * while a reader may still be writing. Nothing in layer 0 reads them;
-         * do not move this later than layer 1. */
-        if (queued && il == 1u) ds41_engram_rows_join(rows_pre, &rows_joined, &ok, !ok);
+         * do not move this later than layer 1.
+         * 3.6d2 (2026-09-17): the invariant is about COMMITTING, and while late_engram_join is
+         * on, ds41_engram_join_pre_commit() joins ahead of every commit -- the flush below, and
+         * any a callee makes inside a layer -- so this one is redundant and only costs the
+         * readers the encode of layers 1..flush_every-1 (three at the default 4).  Bit identical
+         * by construction: nothing here computes a value. */
+        if (queued && il == 1u && !late_engram_join)
+            ds41_engram_rows_join(rows_pre, &rows_joined, &ok, !ok);
         if (!ok) break;
         if (!queued && ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
@@ -42633,7 +42808,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
          * the per-row matvec epilogues round them -- and every row's arithmetic is the per-row
          * loop's, so this is bit-identical, not merely batched == sequential. */
         if (ok && batch_output)
-            ok = ds41_batch_attention_output_project(&active, model, l, rows, batch_output_mv_ext);
+            ok = ds41_batch_attention_output_project(&active, model, l, rows, batch_output_mv_ext,
+                                                     batch_output_rows);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&
@@ -42654,9 +42830,24 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             /* The second Engram upload reuses the first one's input storage. */
             ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
         }
+        /* And a reader failure the pre-commit hook reported from inside one of the calls above.
+         * This is the only place it is read: every `ok = ...` in the body is a chained assignment
+         * that would overwrite a store made while it was still evaluating, and the flag is sticky,
+         * so nothing is lost by reading it once per layer. */
+        if (join_hook.failed) ok = false;
     }
     /* The readers must be joined before anything is committed: the flushes
-     * above do that; this covers one-buffer mode (k = 0) and failure. */
+     * above do that; this covers one-buffer mode (k = 0) and failure.
+     * 3.6d2: and, while the loop ran, so did the pre-commit hook, for commits the loop does not
+     * make itself. Retire it here: the head and the logits readback below commit for reasons of
+     * their own, and this join covers them. */
+    if (late_engram_join) {
+        ds4_gpu_set_pre_commit_hook(NULL, NULL);
+        /* Belt and braces for an exit that is not the loop condition: if a later change breaks
+         * out of the body after a commit but before the fold at its bottom, or adds a commit
+         * between the loop and here, the failure still lands. */
+        if (join_hook.failed) ok = false;
+    }
     ds41_engram_rows_join(rows_pre, &rows_joined, &ok, !ok);
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);

@@ -3500,6 +3500,141 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_bf16(
         sgitg);
 }
 
+// PRE_M5 3.6d2 (2026-09-17): the block diagonal attention-output low projection for N decode rows.
+// Same decomposition as kernel_dsv4_attn_out_low_q8_0_f32 above -- the id is the group number, so
+// tgpig.z is the group and the weight, activation and destination bases are the group's -- except
+// that the row index leaves the grid and becomes the nrows core's inner dimension.  Grid:
+// (ceil(rank/NR0), 1, n_groups) instead of (ceil(rank/NR0), 1, n_groups*n_rows), and each group's
+// 4.45 MB of Q8 weight is streamed once for all N rows instead of once per row.
+//
+// Per row this is the single-row dispatch's arithmetic in its order (see the core), so `low` is
+// bit-identical to ds4_gpu_attention_output_low_q8{,_bf16}_tensor row by row, and independent of
+// how many rows share the step.
+template<short NR0, short NROWS, bool ROUND>
+void kernel_dsv4_attn_out_low_q8_0_rows_impl(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const int idx = tgpig.z;
+
+    tgpig.z = 0;
+
+    const int64_t i11 = idx % args.ne11;
+
+    device const char * src0_cur = src0s + idx*args.nb02;
+    device const char * src1_cur = src1  + i11*args.nb11;
+    device       char * dst_cur  = dst   + (idx*args.ne0)*sizeof(float);
+
+    kernel_mul_mv_q8_0_f32_nrows_impl<NR0, NROWS, ROUND>(
+        args.ne00, args.ne01, args.nb01,
+        src0_cur, src1_cur, dst_cur,
+        (uint) (args.nb12/sizeof(float)),
+        (uint) ((uint64_t)args.ne1*args.ne0),
+        (short) args.nei1,
+        shmem, tgpig, tiisg, sgitg);
+}
+
+// PRE_M5 3.6d2: out_a for 2 decode rows, plain f32 store.
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_rows2(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_attn_out_low_q8_0_rows_impl<N_R0_Q8_0, 2, false>(
+        args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+    (void)tiitg;
+}
+
+// PRE_M5 3.6d2: out_a for 4 decode rows, plain f32 store.
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_rows4(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_attn_out_low_q8_0_rows_impl<N_R0_Q8_0, 4, false>(
+        args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+    (void)tiitg;
+}
+
+// PRE_M5 3.6d2: out_a for 8 decode rows, plain f32 store.
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_rows8(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_attn_out_low_q8_0_rows_impl<N_R0_Q8_0, 8, false>(
+        args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+    (void)tiitg;
+}
+
+// PRE_M5 3.6d2: out_a for 2 decode rows, the BF16 boundary rounding fused into the store.
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows2(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_attn_out_low_q8_0_rows_impl<N_R0_Q8_0, 2, true>(
+        args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+    (void)tiitg;
+}
+
+// PRE_M5 3.6d2: out_a for 4 decode rows, the BF16 boundary rounding fused into the store.
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows4(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_attn_out_low_q8_0_rows_impl<N_R0_Q8_0, 4, true>(
+        args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+    (void)tiitg;
+}
+
+// PRE_M5 3.6d2: out_a for 8 decode rows, the BF16 boundary rounding fused into the store.
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows8(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_attn_out_low_q8_0_rows_impl<N_R0_Q8_0, 8, true>(
+        args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+    (void)tiitg;
+}
+
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
