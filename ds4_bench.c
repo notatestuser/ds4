@@ -787,7 +787,15 @@ int main(int argc, char **argv) {
         cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
         cfg.tp.role == DS4_TP_LEADER;
     const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
-    if (cfg.dspark && !speculative) {
+    if (cfg.dspark && !speculative && ds4_engine_dspark_draft_pending(engine)) {
+        /* The support model is bound and validated; this model family simply
+         * has no draft path yet (V4.1 before 3.7 stage 4).  Benchmark the
+         * serial decode instead of refusing: the refusal below is about a
+         * support model that did not load, which is still an error. */
+        fprintf(stderr,
+                "ds4-bench: DSpark support model bound but this model has no "
+                "draft path yet; benchmarking serial decode\n");
+    } else if (cfg.dspark && !speculative) {
         fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
         if (out != stdout) fclose(out);
         ds4_session_free(session);

@@ -580,6 +580,10 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+/* A DSpark support model is open and enabled, but this model family has no
+ * draft path yet (V4.1 before 3.7 stage 4): decode is serial and a zero draft
+ * width means "not available here", not "the support model failed to load". */
+bool ds4_engine_dspark_draft_pending(ds4_engine *e);
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 

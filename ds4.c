@@ -2944,6 +2944,12 @@ typedef struct {
     uint32_t noise_token_id;
     uint32_t target_layer_count;
     uint32_t target_layers[DS4_DSPARK_MAX_TARGET_LAYERS];
+    /* A DSpark block routes over its own expert count.  V4's happens to equal
+     * the target model's (256 top-6), so its support file carries no such
+     * metadata; a V4.1 draft routes 128 top-3 while the target routes 384
+     * top-6 (model.py:142-150), and its support file states both. */
+    uint32_t n_expert;
+    uint32_t n_expert_used;
     bool has_metadata;
     bool has_main_proj;
     bool has_main_norm;
@@ -2954,6 +2960,7 @@ typedef struct {
     bool has_markov_rank;
     bool has_noise_token_id;
     bool has_target_layers;
+    bool has_expert_counts;
 } ds4_dspark_summary;
 
 typedef enum {
@@ -3034,6 +3041,16 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
         "deepseek4.dspark_target_layer_ids",
         "dspark.target_layer_ids",
     };
+    static const char *const expert_keys[] = {
+        "deepseek4.dspark.n_expert",
+        "deepseek4.dspark_n_expert",
+        "dspark.n_expert",
+    };
+    static const char *const expert_used_keys[] = {
+        "deepseek4.dspark.n_expert_used",
+        "deepseek4.dspark_n_expert_used",
+        "dspark.n_expert_used",
+    };
 
     ds4_dspark_summary s = {0};
     if (model_get_u32_any(m, block_keys, sizeof(block_keys) / sizeof(block_keys[0]),
@@ -3059,6 +3076,22 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
                                 &s.target_layer_count)) {
         s.has_metadata = true;
         s.has_target_layers = true;
+    }
+    /* Both halves or neither: a file that states only one of them is treated
+     * as stating none, and the target model's globals stay the default. */
+    uint32_t n_expert = 0;
+    uint32_t n_expert_used = 0;
+    if (model_get_u32_any(m, expert_keys,
+                          sizeof(expert_keys) / sizeof(expert_keys[0]),
+                          &n_expert) &&
+        model_get_u32_any(m, expert_used_keys,
+                          sizeof(expert_used_keys) / sizeof(expert_used_keys[0]),
+                          &n_expert_used) &&
+        n_expert != 0 && n_expert_used != 0 && n_expert_used <= n_expert) {
+        s.n_expert = n_expert;
+        s.n_expert_used = n_expert_used;
+        s.has_expert_counts = true;
+        s.has_metadata = true;
     }
 
     uint32_t max_stage = 0;
@@ -3098,6 +3131,14 @@ static void model_print_dspark_summary(const ds4_model *m) {
         }
     }
     printf("\n");
+    if (s.has_expert_counts) {
+        /* V4.1: the draft's routing width differs from the target model's. */
+        printf("mtp/dspark experts: count=%u used=%u (target model %u/%u)\n",
+               s.n_expert,
+               s.n_expert_used,
+               DS4_N_EXPERT,
+               DS4_N_EXPERT_USED);
+    }
     if (s.has_main_proj || s.has_main_norm || s.has_markov_head ||
         s.has_confidence_head || s.has_final_head) {
         printf("mtp/dspark tensors: main_proj=%s main_norm=%s markov=%s confidence=%s final_head=%s\n",
@@ -4756,6 +4797,8 @@ typedef struct {
     uint32_t noise_token_id;
     uint32_t target_layer_count;
     uint32_t target_layers[DS4_DSPARK_MAX_TARGET_LAYERS];
+    uint32_t n_expert;
+    uint32_t n_expert_used;
     uint32_t present_tensors;
     uint32_t missing_tensors;
     uint32_t invalid_tensors;
@@ -4764,6 +4807,10 @@ typedef struct {
     bool has_markov_rank;
     bool has_noise_token_id;
     bool has_target_layers;
+    bool has_expert_counts;
+    /* V4.1 has no mtp.*.hc_head_*: its draft head reuses the last block's
+     * ffn_pre coefficients instead of an hc_mixes pass (model.py:1144). */
+    bool head_mix_from_last_ffn;
     ds4_dspark_stage_weights stage[DS4_DSPARK_MAX_STAGES];
 } ds4_dspark_weights;
 
@@ -6186,6 +6233,11 @@ static void dspark_weights_validate_metadata(ds4_dspark_weights *dw) {
         return;
     }
 
+    if (dw->n_expert == 0 || dw->n_expert_used == 0 ||
+        dw->n_expert_used > dw->n_expert) {
+        dspark_weights_note_metadata_error(dw, "invalid draft expert counts");
+    }
+
     uint32_t prev = UINT32_MAX;
     for (uint32_t i = 0; i < dw->target_layer_count; i++) {
         const uint32_t layer = dw->target_layers[i];
@@ -6202,6 +6254,11 @@ static void dspark_weights_validate_metadata(ds4_dspark_weights *dw) {
 static void dspark_weights_validate_block_layout(
         ds4_dspark_weights *dw,
         const ds4_layer_weights *l) {
+    if (!dw) return;
+    /* Everything but the routing width is the target model's geometry (the
+     * draft blocks are backbone-shaped).  The width is the support file's
+     * own: DS4_N_EXPERT for a V4 file, 128 for a V4.1 one. */
+    const uint64_t n_expert = dw->n_expert ? dw->n_expert : DS4_N_EXPERT;
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -6257,19 +6314,19 @@ static void dspark_weights_validate_block_layout(
                                   DS4_N_EMBD, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_inp, "ffn_gate_inp",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
-                                  DS4_N_EMBD, DS4_N_EXPERT, 0);
+                                  DS4_N_EMBD, n_expert, 0);
     dspark_validate_tensor_layout(dw, l->ffn_exp_probs_b, "exp_probs_b",
                                   DS4_DSPARK_LAYOUT_F32, 1,
-                                  DS4_N_EXPERT, 0, 0);
+                                  n_expert, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_exps, "ffn_gate_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
     dspark_validate_tensor_layout(dw, l->ffn_up_exps, "ffn_up_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
     dspark_validate_tensor_layout(dw, l->ffn_down_exps, "ffn_down_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+                                  DS4_N_FF_EXP, DS4_N_EMBD, n_expert);
     if (l->ffn_gate_exps &&
         l->ffn_up_exps &&
         l->ffn_gate_exps->type != l->ffn_up_exps->type) {
@@ -8803,6 +8860,33 @@ static void dspark_weights_bind_optional(
     memcpy(dw->target_layers,
            summary->target_layers,
            (size_t)dw->target_layer_count * sizeof(dw->target_layers[0]));
+    /* A V4 support file states no expert counts because its draft routes the
+     * target model's 256 top-6; keeping the globals as the default leaves its
+     * binding and validation byte-for-byte what it was. */
+    dw->has_expert_counts = summary->has_expert_counts;
+    dw->n_expert = summary->has_expert_counts ? summary->n_expert : DS4_N_EXPERT;
+    dw->n_expert_used = summary->has_expert_counts ? summary->n_expert_used
+                                                   : DS4_N_EXPERT_USED;
+    const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
+    /* Which dialect the FILE is written in.  Both the wrong-family error and
+     * the head-mix rule (set after the binds below) are properties of the
+     * file, not of the target: a V4 support file carries mtp.*.hc_head_*
+     * whoever opens it, and a V4.1 one never does. */
+    ds4_str arch = {0};
+    const bool file_is_v41 =
+        model_get_string(m, "general.architecture", &arch) &&
+        ds4_streq(arch, "deepseek41-dspark");
+    if (v41 && !file_is_v41) {
+        /* A V4 support file against a V4.1 target would otherwise surface as a
+         * wall of shape errors; name the real problem once.  Only the V4.1
+         * side is checked, so nothing about loading V4 changes. */
+        fprintf(stderr,
+                "ds4: DSpark support file is not a V4.1 support model "
+                "(general.architecture=%.*s, expected deepseek41-dspark)\n",
+                (int)arch.len,
+                arch.ptr ? arch.ptr : "");
+        dw->metadata_errors++;
+    }
     if (summary->stages > DS4_DSPARK_MAX_STAGES) dw->missing_tensors++;
 
     for (uint32_t stage = 0; stage < dw->n_stages; stage++) {
@@ -8818,12 +8902,14 @@ static void dspark_weights_bind_optional(
         const uint32_t final_stage = dw->n_stages - 1u;
         ds4_dspark_stage_weights *sw = &dw->stage[final_stage];
         sw->norm = dspark_bind_tensor(dw, m, final_stage, "norm.weight", true);
+        /* Required for V4, absent from V4.1 (the head mixes with the last
+         * block's ffn_pre instead), optional either way once bound. */
         sw->hc_head_base =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", !v41);
         sw->hc_head_fn =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", !v41);
         sw->hc_head_scale =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", !v41);
         sw->markov_w1 =
             dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w1.weight", true);
         sw->markov_w2 =
@@ -8832,7 +8918,29 @@ static void dspark_weights_bind_optional(
             dspark_bind_tensor(dw, m, final_stage, "confidence_head.proj.weight", true);
     }
 
+    /* V4.1's support model ships no mtp.*.hc_head_*: its draft head mixes with
+     * the last block's ffn_pre instead (model.py:1144).  Read that off the
+     * file rather than off the target family, so a V4-dialect file opened by a
+     * V4.1 engine keeps the V4 rule instead of claiming both a ffn_pre mix and
+     * three bound hc_head_* tensors (it is refused for the architecture
+     * mismatch anyway, below). */
+    dw->head_mix_from_last_ffn =
+        file_is_v41 && dw->n_stages != 0 &&
+        dw->stage[dw->n_stages - 1u].hc_head_fn == NULL;
+
     dspark_weights_validate_layout(dw);
+}
+
+/*
+ * Binding and validation only count problems; this is the line between
+ * "reported" and "accepted".  A V4.1 engine refuses to start on a support
+ * file that fails it (stage 4 dispatches from exactly these bindings, and
+ * nothing shipped depends on the lenient V4 behaviour, which is unchanged).
+ * --inspect stays advisory so an operator still sees every error at once.
+ */
+static bool dspark_weights_usable(const ds4_dspark_weights *dw) {
+    return dw && dw->missing_tensors == 0 && dw->invalid_tensors == 0 &&
+           dw->metadata_errors == 0;
 }
 
 static void weights_free(ds4_weights *w) {
@@ -62455,6 +62563,24 @@ static bool ds4_session_is_ds41(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
 }
 
+/*
+ * 3.7 stage 3 is the loader: a V4.1 engine may now open, bind, validate and
+ * report a DSpark support file.  The draft graph (stage 4) and the verify loop
+ * (stage 5) do not exist yet, and every DSpark runtime field lives on
+ * ds4_gpu_graph while V4.1 decodes on ds41_gpu_graph, so the draft path must
+ * stay shut for V4.1 until they land: --dspark then costs one extra mapped
+ * support model and decodes exactly like an engine without one.
+ */
+static bool ds4_engine_dspark_draft_available(const ds4_engine *e) {
+    return e && e->support_kind == DS4_SUPPORT_DSPARK &&
+           DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41;
+}
+
+static DS4_MAYBE_UNUSED bool ds4_session_dspark_draft_available(
+        const ds4_session *s) {
+    return s && ds4_engine_dspark_draft_available(s->engine);
+}
+
 static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
 #ifndef DS4_NO_GPU
     if (!s) return;
@@ -63442,13 +63568,26 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e &&
         e->backend != DS4_BACKEND_CPU &&
         e->distributed.role == DS4_DISTRIBUTED_NONE &&
-        e->support_kind == DS4_SUPPORT_DSPARK &&
+        ds4_engine_dspark_draft_available(e) &&
         e->dspark &&
         e->dspark_weights.block_size > 1) {
         return (int)e->dspark_weights.block_size;
     }
 #endif
     return 0;
+}
+
+/*
+ * True when a DSpark support model is open and --dspark was given but this
+ * model family has no draft path yet (V4.1 until 3.7 stage 4): the engine
+ * decodes serially with a perfectly good support file bound.  Front ends use
+ * it to tell that apart from "the support model did not load", which stays the
+ * hard error it has always been -- this is false for every family that does
+ * have a draft path, so V4 front ends behave exactly as before.
+ */
+bool ds4_engine_dspark_draft_pending(ds4_engine *e) {
+    return e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+           !ds4_engine_dspark_draft_available(e);
 }
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
@@ -71668,6 +71807,22 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
     return ds4_engine_open_internal(out, opt, gpu_cfg);
 }
 
+/*
+ * V4.1 refuses --mtp-model outright today.  The one combination stage 3 opens
+ * up is an explicit `--dspark --mtp-model FILE` on Metal, and the file still
+ * has to detect as a DSpark support model once it is read (checked where it is
+ * opened).  DS4_DISABLE_V41_DSPARK_LOAD=1 is the rollback to today's refusal.
+ * Note --ssd-streaming is a different switch from V4.1's Engram tables: those
+ * are always read from the model file by ds41_graph_alloc regardless of it, so
+ * the normal V4.1 configuration never trips the --ssd-streaming/--mtp-model
+ * refusal below (spec-3_7.md 6.6).
+ */
+static bool ds4_v41_dspark_support_requested(const ds4_engine_options *opt) {
+    return opt && opt->dspark && opt->mtp_path && opt->mtp_path[0] &&
+           opt->backend == DS4_BACKEND_METAL &&
+           getenv("DS4_DISABLE_V41_DSPARK_LOAD") == NULL;
+}
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
@@ -71835,14 +71990,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
                  false) &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
-            !load_slice && !opt->dspark && !opt->glm_mtp &&
+            !load_slice && !opt->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&
-            (!opt->mtp_path || !opt->mtp_path[0]) &&
+            (ds4_v41_dspark_support_requested(opt) ||
+             (!opt->dspark && (!opt->mtp_path || !opt->mtp_path[0]))) &&
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
             fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (optional network tensor parallelism); "
-                            "DSpark, steering and legacy diagnostics are not supported (maximum context 1048576)\n");
+                            "a support model needs --dspark --mtp-model FILE on Metal, and steering and legacy "
+                            "diagnostics are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -72342,6 +72499,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+            e->support_kind != DS4_SUPPORT_DSPARK) {
+            /* The `supported` predicate above could only see the flags; this
+             * is where the file itself is known. */
+            fprintf(stderr,
+                    "ds4: V4.1 --mtp-model accepts a DSpark support model only "
+                    "(detected=%s)\n",
+                    support_kind_name(e->support_kind));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if (e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
             if (opt->tp.role != DS4_TP_NONE) {
                 fprintf(stderr,
@@ -72374,7 +72543,34 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     e->dspark_weights.missing_tensors,
                     e->dspark_weights.invalid_tensors,
                     e->dspark_weights.metadata_errors);
-            if (e->dspark && !e->quality && !e->dspark_strict) {
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+                !dspark_weights_usable(&e->dspark_weights)) {
+                /* Reporting the counters is not enough for a path stage 4 will
+                 * dispatch from: a V4.1 support file that failed binding or
+                 * validation must not come back as a started engine.  V4.1
+                 * only -- the V4 combination is shipped and stays lenient. */
+                fprintf(stderr,
+                        "ds4: refusing the V4.1 DSpark support model %s: "
+                        "%u missing, %u invalid, %u metadata error(s) "
+                        "(ds4 -m MODEL --inspect --mtp-model FILE lists them)\n",
+                        opt->mtp_path,
+                        e->dspark_weights.missing_tensors,
+                        e->dspark_weights.invalid_tensors,
+                        e->dspark_weights.metadata_errors);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (e->dspark && !ds4_engine_dspark_draft_available(e)) {
+                fprintf(stderr,
+                        "ds4: V4.1 DSpark support model bound (experts=%u/%u%s); "
+                        "the V4.1 draft path is not implemented yet, "
+                        "decoding serially\n",
+                        e->dspark_weights.n_expert,
+                        e->dspark_weights.n_expert_used,
+                        e->dspark_weights.head_mix_from_last_ffn ?
+                            ", head mix from the last block's ffn_pre" : "");
+            } else if (e->dspark && !e->quality && !e->dspark_strict) {
                 fprintf(stderr,
                         "ds4: DSpark direct verifier-state commits enabled; "
                         "output may differ from one-token decode due "
@@ -72849,9 +73045,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
             model_warm_weights_sharded(&e->model, &e->weights,
                                        tp_shard_rank);
         }
+        /* Only a support model the decode path can actually reach is worth
+         * wrapping as GPU views: stage 3's V4.1 draft weights are bound and
+         * reported but never dispatched, and mapping them would cost 7.8 GiB
+         * of accelerator VM (and one more way for startup to fail) for
+         * nothing.  Stage 4 gets the mapping back with the draft path. */
         const bool support_model_runtime_ready =
             e->mtp_ready ||
-            (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
+            (ds4_engine_dspark_draft_available(e) && e->dspark);
         bool support_uses_secondary_rocm_cache = false;
 #ifdef DS4_ROCM_BUILD
         /* The generic range cache is already keyed by model map. Keep the
@@ -78476,6 +78677,7 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
         (void)ds4_session_prepare_legacy_mtp_draft(s, token, pos, mtp_probe_log);
         break;
     case DS4_SUPPORT_DSPARK:
+        if (!ds4_session_dspark_draft_available(s)) break;
         (void)ds4_session_prepare_dspark_draft(s, token, pos);
         break;
     case DS4_SUPPORT_NONE:
@@ -85440,6 +85642,15 @@ static int ds4_session_eval_speculative_argmax_impl(
     return -1;
 #else
     ds4_engine *e = s->engine;
+    if (e && e->support_kind == DS4_SUPPORT_DSPARK &&
+        !ds4_session_dspark_draft_available(s)) {
+        /* V4.1 with a bound support file but no draft path yet: one serial
+         * token, the same as an engine that was started without --dspark. */
+        if (!accepted || accepted_cap <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
     if (ds4_session_is_glm(s) && ds4_engine_glm_mtp_spec_enabled(e)) {
         int cycle_cap = accepted_cap;
         if (cycle_cap > max_tokens) cycle_cap = max_tokens;
@@ -86305,7 +86516,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         return rc;
     }
     const bool opportunistic_dspark =
-        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        ds4_session_dspark_draft_available(s) && e->dspark &&
         !e->quality && !e->dspark_strict && !e->dspark_exact_sampling;
     if (opportunistic_dspark) {
         /* first_token was sampled with the requested temperature. Commit the
@@ -86316,7 +86527,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
             accepted, accepted_cap, err, errlen);
     }
     const bool stochastic_dspark =
-        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        ds4_session_dspark_draft_available(s) && e->dspark &&
         !e->quality && !e->dspark_strict && e->dspark_exact_sampling;
     bool can_prepare = stochastic_dspark && !s->dspark_sched_bypass &&
         first_token != eos_token &&
