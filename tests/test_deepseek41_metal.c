@@ -583,13 +583,17 @@ static int check_rope_freqs(void) {
  * ds4.c-side branches for the same reason, and the join has no kernel at all -- a typo in its name
  * would make its A/B a pure noise measurement that nothing else could detect. */
 static int check_fusion_gates(void) {
-    static const char *const names[6] = {
+    static const char *const names[7] = {
         "DS4_METAL_DISABLE_PRE_M5_V41_PRE_COPY",
         "DS4_METAL_DISABLE_PRE_M5_V41_ROPE_PAIR",
         "DS4_METAL_DISABLE_PRE_M5_V41_QUANTIZE_STORE",
         "DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT",
         "DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_OUTPUT_ROWS",
         "DS4_METAL_DISABLE_PRE_M5_V41_LATE_ENGRAM_JOIN",
+        /* 3.6c (2026-09-17): bit 64 is the batched flash stage.  Same reason as bits 8/16: it
+         * gates a ds4.c-side branch no kernel test can reach, so this is the only model-free proof
+         * that the name the A/B harness exports is the name ds4.c reads. */
+        "DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_FLASH",
     };
     /* ds4_gpu_init() must have run: the pre-M5 test reads the Metal device name, and without it
      * every gate reads false and this whole check would pass vacuously. */
@@ -1630,6 +1634,252 @@ static int check_compact_carry(void) {
 
 /* Exercise the full-head and compact TP layouts with the same causal keys.
  * Selected rows are shuffled; include masked future rows at odd frontiers. */
+/* PRE_M5 3.6c (2026-09-17): the N-row decode FlashAttention against N single-row dispatches, by
+ * memcmp.  This is the stage's exactness proof and it needs no model: the claim is that
+ * ds4_gpu_attention_decode_heads_rows_tensor() computes row r out of row r's own window ring,
+ * gathered compressed rows and query exactly as ds4_gpu_dsv41_gather_kv() +
+ * ds4_gpu_attention_decode_heads_tensor() do, whatever the other rows in the batch are doing.
+ *
+ * What the cases are chosen to hit:
+ *   - N = 1, which compares the batched encoder against the single-row one on the SAME key count,
+ *     including key counts that are not multiples of 32.  Those are exactly the cases where the
+ *     single-row path compiles the vector kernel with has_kvpad = true and takes its tail block out
+ *     of the pad buffer while the rows path pads the slab instead: if that substitution were not
+ *     bit-exact, this is where it shows.
+ *   - rows at very different key counts in one batch (1 key next to 640), so a short row walks many
+ *     fully masked blocks that must contribute nothing.
+ *   - ring wrap (raw_start != 0) on BOTH reference encoders, not just the gathered one.  Wrap needs
+ *     a full window, so a wrapped row always has n_raw == raw_cap == 128; pos_raw[0] = 200 puts a
+ *     wrapped raw-only row in every width including N = 1, and 128 / 333 add two more at N >= 4.
+ *     That is the exact shape layers 0 and 1 present on every decode step past position 127
+ *     (ds4_expected_layer_compress_ratio() gives them ratio 0, so they are raw-only forever), and
+ *     it is the case where the reference stages the ring as a TAIL copy plus a HEAD copy --
+ *     ds4_gpu_encode_copy_raw_ring_to_f16(), two ds4_gpu_encode_cpy_f32_f16_1d dispatches -- while
+ *     kernel_dsv41_flash_stage_rows wraps in one pass.  The PASS line prints keys@raw_start per
+ *     row, so the log shows which cases actually wrapped.
+ *   - all three shapes a V4.1 decode layer can present: raw only (layers 0-1, ratio 0, and any row
+ *     whose pos + 1 < ratio), gathered, and a batch mixing the two.  Note the raw-only ENCODER is
+ *     also exercised at N = 1 with a key count that is not a multiple of 32 by pos_mixed[0] = 0
+ *     (ratio 2 gives n_comp = 0 there, so that row is raw-only with a single key), which is why
+ *     pos_raw can spend its first slot on the wrapped case.
+ */
+static int check_flash_rows(void) {
+    enum { D = 512, H = 64, RAW = 128, COMP = 1024, TOPK = 512 };
+    static const uint32_t widths[] = {1, 2, 4, 8};
+    /* pos values -> n_raw = min(pos+1,128), raw_start = (pos+1-n_raw)%128, and with ratio 2,
+     * n_comp = (pos+1)/2 and attended = min(n_comp, 512).  0 gives a raw-only row. */
+    static const uint32_t pos_mixed[8]    = {0, 5, 63, 127, 128, 200, 511, 2047};
+    static const uint32_t pos_gathered[8] = {3, 9, 65, 129, 333, 640, 1500, 2047};
+    /* Raw only, so n_keys == n_raw.  raw_start is 73, 0, 0, 1, 0, 78, 0, 0 in this order: the
+     * wrapped full-window rows (pos 200/128/333) are at slots 0 and 3/5 so that N = 1 and N = 2
+     * already carry one, and the rest keep key counts that are and are not multiples of 32
+     * (128, 18, 32, 128, 34, 128, 101, 128). */
+    static const uint32_t pos_raw[8]      = {200, 17, 31, 128, 33, 333, 100, 2047};
+    static const char *const variant_name[3] = {"mixed", "gathered", "raw only"};
+    const size_t page = (size_t)getpagesize();
+    float *sinks = NULL;
+    CHECK(page >= H * sizeof(float));
+    CHECK(posix_memalign((void **)&sinks, page, page) == 0);
+    memset(sinks, 0, page);
+    for (int h = 0; h < H; h++) sinks[h] = random_value() / 2;
+    CHECK(ds4_gpu_set_model_map(sinks, page));
+    ds4_gpu_set_quality(false);
+
+    for (unsigned w = 0; w < sizeof(widths) / sizeof(*widths); w++) {
+        const uint32_t n = widths[w];
+        for (unsigned variant = 0; variant < 3; variant++) {
+            const uint32_t *pos_table = variant == 0 ? pos_mixed :
+                                        variant == 1 ? pos_gathered : pos_raw;
+            const uint32_t ratio = variant == 2 ? 0u : 2u;
+            ds4_gpu_tensor *window[8] = {0}, *comp[8] = {0}, *idt[8] = {0}, *sel[8] = {0};
+            ds4_gpu_tensor *q = NULL, *ref = NULL, *got = NULL;
+            ds4_gpu_v41_flash_row desc[8];
+            float *raw_host = malloc((size_t)RAW * D * sizeof(float));
+            float *comp_host = malloc((size_t)COMP * D * sizeof(float));
+            float *q_host = malloc((size_t)n * H * D * sizeof(float));
+            float *ref_host = malloc((size_t)n * H * D * sizeof(float));
+            float *got_host = malloc((size_t)n * H * D * sizeof(float));
+            int32_t *ids_host = malloc((size_t)TOPK * sizeof(int32_t));
+            int ok = raw_host && comp_host && q_host && ref_host && got_host && ids_host;
+            CHECK(ok);
+            for (size_t i = 0; i < (size_t)n * H * D; i++) q_host[i] = bf16(random_value() / 4);
+            q = upload(q_host, (size_t)n * H * D * sizeof(float));
+            ref = upload(NULL, (size_t)n * H * D * sizeof(float));
+            got = upload(NULL, (size_t)n * H * D * sizeof(float));
+            CHECK(q && ref && got);
+
+            for (uint32_t r = 0; r < n; r++) {
+                const uint32_t pos = pos_table[r];
+                const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+                const uint32_t n_raw = pos + 1u < (uint32_t)RAW ? pos + 1u : (uint32_t)RAW;
+                const uint32_t attended = n_comp < (uint32_t)TOPK ? n_comp : (uint32_t)TOPK;
+                CHECK(n_comp <= (uint32_t)COMP);
+                for (size_t i = 0; i < (size_t)RAW * D; i++)
+                    raw_host[i] = bf16(random_value() / 4);
+                for (size_t i = 0; i < (size_t)COMP * D; i++)
+                    comp_host[i] = bf16(random_value() / 4);
+                for (uint32_t j = 0; j < attended; j++)
+                    ids_host[j] = (int32_t)((j * 37u + r * 11u + 1u) % (n_comp ? n_comp : 1u));
+                window[r] = upload(raw_host, (size_t)RAW * D * sizeof(float));
+                comp[r] = upload(comp_host, (size_t)COMP * D * sizeof(float));
+                idt[r] = attended ? upload(ids_host, (size_t)attended * sizeof(int32_t)) : NULL;
+                sel[r] = attended ? upload(NULL, (size_t)attended * D * sizeof(float)) : NULL;
+                CHECK(window[r] && comp[r] && (!attended || (idt[r] && sel[r])));
+                desc[r].raw_kv = window[r];
+                desc[r].comp_kv = attended ? comp[r] : NULL;
+                desc[r].comp_ids = attended ? idt[r] : NULL;
+                desc[r].n_raw = n_raw;
+                desc[r].raw_cap = RAW;
+                desc[r].raw_start = (pos + 1u - n_raw) % (uint32_t)RAW;
+                desc[r].source_rows = n_comp;
+                desc[r].attended = attended;
+
+                /* The reference: this row's own two dispatches, into its slice of `ref`. */
+                ds4_gpu_tensor *qv = ds4_gpu_tensor_view(q, (uint64_t)r * H * D * 4,
+                                                         (uint64_t)H * D * 4);
+                ds4_gpu_tensor *hv = ds4_gpu_tensor_view(ref, (uint64_t)r * H * D * 4,
+                                                         (uint64_t)H * D * 4);
+                CHECK(qv && hv);
+                if (attended)
+                    CHECK(ds4_gpu_dsv41_gather_kv(sel[r], comp[r], idt[r], n_comp, attended));
+                CHECK(ds4_gpu_attention_decode_heads_tensor(hv, sinks, page, 0, qv, window[r],
+                    n_raw, RAW, desc[r].raw_start, attended ? sel[r] : NULL, 0, attended,
+                    NULL, 0, H, D));
+                ds4_gpu_tensor_free(qv);
+                ds4_gpu_tensor_free(hv);
+            }
+            CHECK(ds4_gpu_tensor_read(ref, 0, ref_host, (size_t)n * H * D * sizeof(float)));
+
+            /* The candidate: one stage dispatch per row, one vec with ne03 = N, one reduce. */
+            CHECK(ds4_gpu_attention_decode_heads_rows_tensor(got, sinks, page, 0, q, desc,
+                                                             n, H, D) == 1);
+            CHECK(ds4_gpu_tensor_read(got, 0, got_host, (size_t)n * H * D * sizeof(float)));
+            for (uint32_t r = 0; r < n; r++) {
+                const float *a = ref_host + (size_t)r * H * D;
+                const float *b = got_host + (size_t)r * H * D;
+                if (memcmp(a, b, (size_t)H * D * sizeof(float))) {
+                    size_t i = 0;
+                    while (i < (size_t)H * D && a[i] == b[i]) i++;
+                    fprintf(stderr, "V4.1 flash rows=%u %s: row %u differs at %zu "
+                                    "(%.9g vs %.9g), n_raw=%u raw_start=%u attended=%u\n",
+                            n, variant_name[variant], r, i,
+                            i < (size_t)H * D ? a[i] : 0.0, i < (size_t)H * D ? b[i] : 0.0,
+                            desc[r].n_raw, desc[r].raw_start, desc[r].attended);
+                    CHECK(0);
+                }
+                CHECK(isfinite(a[0]));
+            }
+            /* keys@raw_start per row: raw_start != 0 is the wrapped ring, which the reference
+             * stages as two copies and the new kernel in one pass, so the log has to show that
+             * the wrapped cases really ran -- on the raw-only batches as well as the gathered. */
+            fprintf(stderr, "V4.1 flash rows=%u (%s, keys", n, variant_name[variant]);
+            for (uint32_t r = 0; r < n; r++)
+                fprintf(stderr, " %u@%u", desc[r].n_raw + desc[r].attended, desc[r].raw_start);
+            fprintf(stderr, "): bit-identical to %u single-row dispatches PASS\n", n);
+
+            for (uint32_t r = 0; r < n; r++) {
+                ds4_gpu_tensor_free(window[r]); ds4_gpu_tensor_free(comp[r]);
+                ds4_gpu_tensor_free(idt[r]); ds4_gpu_tensor_free(sel[r]);
+            }
+            ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(got);
+            free(raw_host); free(comp_host); free(q_host);
+            free(ref_host); free(got_host); free(ids_host);
+        }
+    }
+    ds4_gpu_cleanup();
+    free(sinks);
+    return 1;
+}
+
+#ifdef __APPLE__
+/* PRE_M5 3.6c (2026-09-18): the ds4.c half of the stage -- which cache each row of the N-row
+ * dispatch is pointed at and with which key counts, not whether the dispatch itself is exact.
+ *
+ * check_flash_rows() above is the exactness proof, but it builds its OWN descriptors and calls
+ * the entry point directly, so it passes unchanged if ds41_batch_attention_flash() hands that
+ * entry point row 0's window for every row, the wrong compressed owner for a layer, the
+ * workspace's caches where the session's belong, or a position off by one.  That mapping runs
+ * only inside a batched decode step, so the only other thing that would notice is a model run,
+ * and the model runs belong to the measurement pass.  ds4_v41_batch_attention_flash_desc() runs
+ * the real per-row mapping over synthetic graphs whose tensor pointers are sentinels and reports
+ * which structure, which row and which array index each descriptor pointer came from.
+ *
+ * TOP_K mirrors DS4_N_INDEXER_TOP_K and MAX_ROWS mirrors DS4_TP_BATCH_MAX_ROWS (ds4.c and
+ * ds4_tp.h are not included here, as check_attn_out_path_cases() does the same): if either
+ * moves, this fails, which is the intent. */
+static int check_flash_rows_desc_row(unsigned rows, unsigned il, unsigned ratio,
+                                     const unsigned *positions, unsigned row) {
+    enum { MAX_ROWS = 8, TOP_K = 512, RAW_CAP = 128 };
+    const unsigned pos = positions[row];
+    const unsigned owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const unsigned n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    const unsigned n_raw = pos + 1u < RAW_CAP ? pos + 1u : RAW_CAP;
+    ds4_v41_flash_desc_probe p;
+    CHECK(rows <= MAX_ROWS && row < rows);
+    memset(&p, 0xa5, sizeof p);
+    CHECK(ds4_v41_batch_attention_flash_desc(rows, positions, il, ratio, row, &p) == 1);
+    /* The row's own session, at this layer -- never another row's, never the workspace's. */
+    CHECK(p.raw_kv_kind == 1 && p.raw_kv_row == (int)row && p.raw_kv_index == (int)il);
+    if (n_comp) {
+        /* The compressed cache is the session's and is picked by the layer's owner; the ids are
+         * the WORKSPACE row view's, which is where the per-row front wrote them. */
+        CHECK(p.comp_kv_kind == 2 && p.comp_kv_row == (int)row && p.comp_kv_index == (int)owner);
+        CHECK(p.comp_ids_kind == 3 && p.comp_ids_row == (int)row && p.comp_ids_index == 0);
+    } else {
+        /* A raw-only row hands the dispatch no compressed slab and no ids at all. */
+        CHECK(p.comp_kv_kind == 0 && p.comp_ids_kind == 0);
+    }
+    CHECK(p.n_raw == n_raw && p.raw_cap == RAW_CAP);
+    CHECK(p.raw_start == (pos + 1u - n_raw) % RAW_CAP);
+    CHECK(p.source_rows == n_comp);
+    CHECK(p.attended == (n_comp < TOP_K ? n_comp : TOP_K));
+    return 1;
+}
+
+static int check_flash_rows_desc(void) {
+    enum { MAX_ROWS = 8 };
+    /* check_flash_rows()'s own position tables, so both halves of the stage answer for the same
+     * rows, except that the gathered one spends its last two slots on 1023 and 4095: n_comp there
+     * is exactly TOP_K and four times TOP_K, which is where `attended` has to clamp and which
+     * check_flash_rows() cannot run (its compressed cache is 1024 rows). */
+    static const unsigned pos_mixed[MAX_ROWS]    = {0, 5, 63, 127, 128, 200, 511, 2047};
+    static const unsigned pos_gathered[MAX_ROWS] = {3, 9, 65, 129, 333, 640, 1023, 4095};
+    static const unsigned pos_raw[MAX_ROWS]      = {200, 17, 31, 128, 33, 333, 100, 2047};
+    /* Both sides of every step of the owner ladder, plus the last layer window[] holds. */
+    static const unsigned layers[] = {0, 1, 7, 8, 13, 14, 19, 20, 39};
+    static const unsigned widths[] = {1, 2, 4, 8};
+    unsigned cases = 0;
+    for (unsigned w = 0; w < sizeof(widths) / sizeof(*widths); w++)
+        for (unsigned variant = 0; variant < 3; variant++) {
+            const unsigned *pos = variant == 0 ? pos_mixed :
+                                  variant == 1 ? pos_gathered : pos_raw;
+            const unsigned ratio = variant == 2 ? 0u : 2u;
+            for (unsigned li = 0; li < sizeof(layers) / sizeof(*layers); li++)
+                for (unsigned r = 0; r < widths[w]; r++) {
+                    CHECK(check_flash_rows_desc_row(widths[w], layers[li], ratio, pos, r));
+                    cases++;
+                }
+        }
+    /* Refusals: nothing a batched step cannot present gets a descriptor. */
+    {
+        static const unsigned pos[MAX_ROWS] = {0, 1, 2, 3, 4, 5, 6, 7};
+        ds4_v41_flash_desc_probe p;
+        CHECK(ds4_v41_batch_attention_flash_desc(MAX_ROWS + 1u, pos, 0, 2, 0, &p) == 0);
+        CHECK(ds4_v41_batch_attention_flash_desc(0, pos, 0, 2, 0, &p) == 0);
+        CHECK(ds4_v41_batch_attention_flash_desc(2, pos, 0, 2, 2, &p) == 0);
+        CHECK(ds4_v41_batch_attention_flash_desc(2, NULL, 0, 2, 0, &p) == 0);
+        CHECK(ds4_v41_batch_attention_flash_desc(2, pos, 40, 2, 0, &p) == 0);
+        CHECK(ds4_v41_batch_attention_flash_desc(2, pos, 0, 2, 0, NULL) == 0);
+    }
+    fprintf(stderr, "V4.1 batched flash descriptors: %u rows at N = 1/2/4/8 over mixed, gathered "
+                    "and raw-only batches, each pointed at its OWN session's window[il] and "
+                    "compressed[owner] and at the workspace's selected_comp, with n_raw, "
+                    "raw_start, source_rows and attended as the per-row path computes them: "
+                    "PASS\n", cases);
+    return 1;
+}
+#endif
+
 static int check_tp_attention(void) {
     enum { D = 512, H = 64, K = 512, C = 2048 };
     const uint32_t sizes[] = {1, 31, 32, 33, 129, 257, 2048};
@@ -2688,6 +2938,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--flash-rows")) {
+        const int ok = ds4_gpu_init() && check_flash_rows();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--tp-attention")) {
         const int ok = ds4_gpu_init() && check_tp_attention();
         ds4_gpu_cleanup();
@@ -2705,6 +2960,10 @@ int main(int argc, char **argv) {
         const int ok = ds4_gpu_init() && check_attn_out_rows();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--flash-rows-desc")) {
+        /* No device and no model: the mapping is pure ds4.c. */
+        return check_flash_rows_desc() ? 0 : 1;
     }
     if (argc == 2 && !strcmp(argv[1], "--attn-out-path")) {
         /* ds4_gpu_init() first: the gates start with the Metal device name. */
@@ -2759,10 +3018,11 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
-             check_tp_attention();
+             check_flash_rows() && check_tp_attention();
 #ifdef __APPLE__
     if (ok) ok = check_rope_pair() && check_quantize_store() &&
                  check_rope_freqs() && check_fusion_gates() && check_attn_out_path() &&
+                 check_flash_rows_desc() &&
                  check_attention_output_decode() && check_attn_out_rows() &&
                  check_pre_commit_hook();
 #endif

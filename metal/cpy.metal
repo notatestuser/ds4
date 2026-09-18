@@ -241,6 +241,75 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
 }
 
 
+// PRE_M5 3.6c (2026-09-17): stage one decode row of a batched step into its slice of the shared
+// FlashAttention K/V slab, and write that row's mask.  This is ds4_gpu_dsv41_gather_kv (get_rows
+// f32 into selected_kv), the raw-ring f32->f16 copy, the selected_kv f32->f16 copy and
+// kernel_flash_attn_ext_pad, in one dispatch, writing straight into a slab padded to the BATCH's
+// key count so the vector kernel can run all N rows at once with ne03 = N.
+//
+// Bit-exactness against the four dispatches it replaces:
+//   * raw region -- the same ring arithmetic and the same conversion expression as
+//     kernel_dsv4_flash_kv_stage_f16 above and kernel_cpy_contig_f32_f16_4;
+//   * gathered region -- get_rows copies compressed[id] verbatim and the f32->f16 copy then applies
+//     packed_half4(half4(float4(...))); doing both in one read gives the same bits;
+//   * padding -- half4(0) for K/V and 0xfbff (-MAXHALF) for the mask, the values
+//     kernel_flash_attn_ext_pad writes for the tail of a partial block, extended to the batch's
+//     n_keys_max so every block past this row's keys is skipped by the kernel's fully-masked test.
+// n_keys_max is a multiple of 32 (the kernel's C), so no partial block survives and the vector
+// kernel runs with has_kvpad = false.
+struct ds4_metal_args_flash_stage_rows {
+    uint n_keys_max;   // padded key count, a multiple of 32; the slab stride of every row
+    uint n_raw;        // this row's sliding-window keys
+    uint raw_start;    // first physical row of the window ring
+    uint raw_cap;      // window ring capacity (128 in V4.1 decode)
+    uint attended;     // gathered compressed keys (0 = raw only)
+    uint source_rows;  // rows available in `comp_src`; ids are indices into it
+};
+
+kernel void kernel_dsv41_flash_stage_rows(
+        constant ds4_metal_args_flash_stage_rows & args,
+        device const char  * raw_src,
+        device const char  * comp_src,
+        device const int   * ids,
+        device       char  * dst,
+        device       char  * mask,
+        uint gid [[thread_position_in_grid]]) {
+    constexpr uint row_vecs = 128;   // 512 floats = 128 packed-4 vectors
+    const uint n_keys = args.n_raw + args.attended;
+    const uint total_vecs = args.n_keys_max * row_vecs;
+
+    if (gid < total_vecs) {
+        const uint key = gid >> 7;
+        const uint col = gid & 127u;
+        device packed_half4 *dst_half = (device packed_half4 *)dst;
+        if (key < args.n_raw) {
+            uint physical_row = args.raw_start + key;
+            if (physical_row >= args.raw_cap) {
+                physical_row -= args.raw_cap;
+            }
+            device const packed_float4 *raw = (device const packed_float4 *)raw_src;
+            const float4 value = float4(raw[physical_row * row_vecs + col]);
+            dst_half[gid] = packed_half4(half4(value));
+        } else if (key < n_keys) {
+            const uint id = (uint)ids[key - args.n_raw];
+            device const packed_float4 *comp = (device const packed_float4 *)comp_src;
+            const float4 value =
+                float4(comp[(id < args.source_rows ? id : 0u) * row_vecs + col]);
+            dst_half[gid] = packed_half4(half4(value));
+        } else {
+            dst_half[gid] = packed_half4(half4(0.0h));
+        }
+        return;
+    }
+
+    const uint mask_gid = gid - total_vecs;
+    if (mask_gid < args.n_keys_max) {
+        device ushort *mask_bits = (device ushort *)mask;
+        mask_bits[mask_gid] = mask_gid < n_keys ? 0u : 0xfbffu;
+    }
+}
+
+
 // Tiled-row expansion of a small table: dst row t = src row (pos0 + t) % ratio.
 // Replaces the per-segment copies the compressor store used to encode (one
 // dispatch per prefill layer instead of n_tokens/ratio single-threadgroup

@@ -2209,6 +2209,39 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+/* PRE_M5 3.6c (2026-09-17): one decode row of a V4.1 batched step, as the batched FlashAttention
+ * entry point below needs it.  This is NOT design-3_6.md 2's bindless address table (that lands
+ * with stage (a) as ds4_gpu_v41_row and is shared by every rows kernel): the tensors here are
+ * BOUND, one stage dispatch per row, so there is no gpuAddress and no useResource involved.  The
+ * name is distinct on purpose, so stage (a) and stage (c) can be applied in either order. */
+typedef struct {
+    const ds4_gpu_tensor *raw_kv;      /* window[il]: f32[raw_cap][head_dim] ring          */
+    const ds4_gpu_tensor *comp_kv;     /* compressed[owner]: f32[source_rows][head_dim]    */
+    const ds4_gpu_tensor *comp_ids;    /* int32 indices into comp_kv, `attended` of them   */
+    uint32_t              n_raw;       /* sliding-window keys, >= 1                        */
+    uint32_t              raw_cap;     /* ring capacity                                    */
+    uint32_t              raw_start;   /* first physical ring row                          */
+    uint32_t              source_rows; /* rows available in comp_kv                        */
+    uint32_t              attended;    /* gathered keys, 0 = raw only                      */
+} ds4_gpu_v41_flash_row;
+
+/* Decode FlashAttention over `rows` independent rows in one vector dispatch (ne03 = rows) plus one
+ * reduce over rows*n_head, with each row's gather + f32->f16 staging + tail padding fused into a
+ * single kernel.  `heads` and `q` are [rows][n_head][head_dim] f32 contiguous.  Every row is
+ * bit-identical to its own ds4_gpu_attention_decode_heads_tensor() call.
+ * Returns 1 when the batch was encoded, 0 when it was NOT (nothing has been encoded and the caller
+ * must run the per-row path), and -1 on a hard failure. */
+int ds4_gpu_attention_decode_heads_rows_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_v41_flash_row *rows_desc,
+        uint32_t                rows,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
 int ds4_gpu_attention_decode_heads_rope_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

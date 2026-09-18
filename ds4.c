@@ -40529,6 +40529,19 @@ static bool ds41_late_engram_join(void) {
     return ds4_gpu_device_is_pre_m5_apple_silicon() &&
         !getenv("DS4_METAL_DISABLE_PRE_M5_V41_LATE_ENGRAM_JOIN");
 }
+/* PRE_M5 3.6c (2026-09-17): the batched decode step runs the decode FlashAttention of all its rows
+ * as ONE kernel_flash_attn_ext_vec dispatch with ne03 = N plus one reduce over N*64 rows, and
+ * stages each row's K/V slab (gather + f32->f16 + tail padding) in a single kernel instead of the
+ * four dispatches it takes today.  The vector kernel already indexes q/K/V/mask by iq3 and the
+ * reduce by rid, and the block-to-workgroup map does not depend on ne11, so with nsg == 1 every
+ * row computes exactly what its own dispatch computed -- see patch3_6c.py for the full argument.
+ * This is the env/device half of the decision, kept pure for the --fusion-gates oracle; the
+ * per-step eligibility lives in ds41_batch_attention_flash_enabled().  Rollback
+ * DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_FLASH returns the step to the per-row dispatches. */
+static bool ds41_batch_attention_flash_gate(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ATTENTION_FLASH");
+}
 
 /* Test oracle (tests/test_deepseek41_metal --fusion-gates). The helpers above are all file
  * static, so without this nothing outside ds4.c can observe the switches: a misspelt name would
@@ -40540,7 +40553,8 @@ int ds4_v41_decode_fusion_gates(void) {
            (ds41_quantize_store_fused() ? 4 : 0) |
            (ds41_batch_attention_output_gate() ? 8 : 0) |
            (ds41_batch_attention_output_rows_gate() ? 16 : 0) |
-           (ds41_late_engram_join() ? 32 : 0);
+           (ds41_late_engram_join() ? 32 : 0) |
+           (ds41_batch_attention_flash_gate() ? 64 : 0);
 }
 /* Test oracle (tests/test_deepseek41_metal --attn-out-path).  Which projection
  * ds41_graph_step_batch() selects for a `rows`-row batched step whose weights are eligible.  The
@@ -40956,28 +40970,54 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
         ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
 }
 
-static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
-                           const ds4_layer_weights *l, uint32_t il, bool projected) {
+/* 3.6c (2026-09-17): ds41_attention() up to and including the indexer selection.  Lifted out
+ * VERBATIM so the batched decode step can run this part per row, then the flash stage once for all
+ * rows, then the per-row tail -- the three pieces below are the old body split at two points, with
+ * the call order and every argument unchanged, so every path that is not the batched step is
+ * bit-identical by construction. */
+static bool ds41_attention_front(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_layer_weights *l, uint32_t il) {
+    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    return ds41_rope_qkv(g, heads, il, g->pos) &&
+           ds41_quantize_kv_store(g, il, g->pos) &&
+           ds41_attention_select(g, m, l, il);
+}
+
+/* 3.6c: the gather of the selected compressed rows plus this row's FlashAttention dispatch. */
+static bool ds41_attention_flash(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
-    if (!projected && !ds41_attention_project(g, m, l)) return false;
-    if (!ds41_rope_qkv(g, heads, il, pos) ||
-        !ds41_quantize_kv_store(g, il, pos) ||
-        !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
                                          g->selected_comp, n_comp, attended)) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
-    if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
+    return ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
-        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+            heads, DS4_N_HEAD_DIM) != 0;
+}
+
+/* 3.6c: the BF16 rounding and the inverse RoPE of `heads`, both position-dependent and therefore
+ * still per row, preceded by this row's flash dispatch unless `staged` says an N-row dispatch has
+ * already written its slice of the shared heads slab. */
+static bool ds41_attention_flash_tail(ds41_gpu_graph *g, const ds4_model *m,
+                                      const ds4_layer_weights *l, uint32_t il, bool staged) {
+    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    return (staged || ds41_attention_flash(g, m, l, il)) &&
+           ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) &&
+           ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, g->pos, true);
+}
+
+static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
+                           const ds4_layer_weights *l, uint32_t il, bool projected) {
+    if (!projected && !ds41_attention_project(g, m, l)) return false;
+    if (!ds41_attention_front(g, m, l, il) ||
+        !ds41_attention_flash_tail(g, m, l, il, false)) return false;
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -42636,6 +42676,158 @@ static bool ds41_batch_attention_output_project(const ds41_prefill_row *active,
 #endif
 }
 
+/* PRE_M5 3.6c (2026-09-17): may this step run its decode FlashAttention once for all N rows?
+ * The exclusions are design-3_6.md 4.1's, i.e. 3.6d's: rows that share a session (mixed prefill)
+ * sit at consecutive positions on one graph and would have to be staged from one another's
+ * caches; TP slices the heads by rank; streaming/quality/imatrix/images change which attention
+ * path runs at all.  Kept next to its sibling so the two read the same. */
+static bool ds41_batch_attention_flash_enabled(const ds41_gpu_graph *g,
+                                               uint32_t prefill_rows, uint32_t rows) {
+#ifdef __APPLE__
+    if (prefill_rows != 0u || g->tp_world != 1 || g->streaming || g->quality ||
+        g->imatrix || g->image_count || rows < 2u ||
+        rows > (uint32_t)DS4_TP_BATCH_MAX_ROWS ||
+        !ds41_batch_attention_flash_gate()) return false;
+    /* One line the first time the branch is live: without it a silent fallback (wrong device, TP,
+     * a rollback left set in the environment) would let every model-level gate pass vacuously and a
+     * harness would record a result for a change that never ran.  The runner greps for this line,
+     * and for its ABSENCE in the concurrency-1 parity runs. */
+    static bool announced = false;
+    if (!announced) {
+        fprintf(stderr, "ds4: V4.1 batched attention flash enabled (one vec dispatch with "
+                        "ne03 = N and one reduce per layer, bit-identical per row)\n");
+        announced = true;
+    }
+    return true;
+#else
+    (void)g; (void)prefill_rows; (void)rows;
+    return false;
+#endif
+}
+
+#ifdef __APPLE__
+/* PRE_M5 3.6c: the row -> descriptor mapping of the dispatch below, factored out WHOLE -- its
+ * loop included -- so the --flash-rows-desc oracle proves the mapping the dispatch itself uses
+ * instead of a copy of it.  Exactly the arithmetic ds41_attention_flash() does for each row, from
+ * the same inputs: positions[i] is row i's pos and `ratio` its layer's compress ratio; graphs[i]
+ * is the row's OWN graph, because window[il] and compressed[owner] are its session's caches and
+ * not workspace row views; and `ws` is the batch workspace, whose rows_view[i].selected_comp is
+ * the row's slice of the top-k ids the per-row front just wrote. */
+static void ds41_flash_rows_desc(ds4_gpu_v41_flash_row *desc, ds41_gpu_graph *const *graphs,
+                                 const ds41_gpu_graph *ws, const uint32_t *positions,
+                                 uint32_t il, uint32_t ratio, uint32_t rows) {
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    for (uint32_t i = 0; i < rows; i++) {
+        const uint32_t pos = positions[i];
+        const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+        const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+        desc[i].raw_kv = graphs[i]->window[il];
+        desc[i].comp_kv = n_comp ? graphs[i]->compressed[owner] : NULL;
+        desc[i].comp_ids = n_comp ? ws->rows_view[i].selected_comp : NULL;
+        desc[i].n_raw = n_raw;
+        desc[i].raw_cap = 128u;
+        desc[i].raw_start = (pos + 1u - n_raw) % 128u;
+        desc[i].source_rows = n_comp;
+        desc[i].attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+    }
+}
+#endif
+
+/* PRE_M5 3.6c: the N-row dispatch itself.  1 = encoded, 0 = nothing encoded (the caller finishes
+ * the step on the per-row path, design-3_6.md 4.4), -1 = hard failure.  In the same #ifdef shape
+ * as ds41_batch_attention_output_project() and for the same reason: the entry point is defined in
+ * ds4_metal.m only, and ds41_graph_step_batch() is compiled for every backend. */
+static int ds41_batch_attention_flash(ds41_gpu_graph *const *graphs, const ds41_gpu_graph *g,
+                                      const ds41_prefill_row *active, const uint32_t *positions,
+                                      const ds4_model *m, const ds4_layer_weights *l,
+                                      uint32_t il, uint32_t rows) {
+#ifdef __APPLE__
+    ds4_gpu_v41_flash_row desc[DS4_TP_BATCH_MAX_ROWS];
+    if (rows > (uint32_t)DS4_TP_BATCH_MAX_ROWS) return 0;
+    ds41_flash_rows_desc(desc, graphs, g, positions, il, ds4_layer_compress_ratio(il), rows);
+    /* tp_world == 1 is a precondition of the gate, so head0 is 0 and every row takes all heads. */
+    return ds4_gpu_attention_decode_heads_rows_tensor(active->heads, m->map, m->size,
+        l->attn_sinks->abs_offset, active->q, desc, rows, DS4_N_HEAD, DS4_N_HEAD_DIM);
+#else
+    (void)graphs; (void)g; (void)active; (void)positions; (void)m; (void)l; (void)il; (void)rows;
+    return 0;
+#endif
+}
+
+#ifdef __APPLE__
+/* Test oracle (tests/test_deepseek41_metal --flash-rows-desc), storage half: one distinct address
+ * per (structure, row, array index) the mapping above can reach.  Nothing ever dereferences them;
+ * they stand in for the tensors of synthetic graphs so that the descriptor the real mapping builds
+ * says where it went looking. */
+static char ds41_flash_desc_sentinels[3][DS4_TP_BATCH_MAX_ROWS][40];
+
+static void ds41_flash_desc_source(const void *p, int *kind, int *row, int *index) {
+    const char *const base = &ds41_flash_desc_sentinels[0][0][0];
+    const char *const c = (const char *)p;
+    *kind = 0; *row = -1; *index = -1;
+    if (!c) return;
+    if (c < base || c >= base + sizeof(ds41_flash_desc_sentinels)) { *kind = -1; return; }
+    const size_t off = (size_t)(c - base);
+    *kind  = (int)(off / ((size_t)DS4_TP_BATCH_MAX_ROWS * 40u)) + 1;
+    *row   = (int)((off / 40u) % (size_t)DS4_TP_BATCH_MAX_ROWS);
+    *index = (int)(off % 40u);
+}
+
+/* Test oracle (tests/test_deepseek41_metal --flash-rows-desc).  Which cache, which ids and which
+ * key counts ds41_batch_attention_flash() hands the N-row dispatch for row `row` of a `rows`-row
+ * batched step at layer `il`.  --flash-rows proves the Metal entry point is bit-identical to N
+ * single-row dispatches, but it builds its own descriptors; the ds4.c side that fills them in
+ * from three different structures -- the row's own graph, the workspace's row views and
+ * positions[] -- runs only inside a batched decode step, so without this the only thing that
+ * would notice it handing that entry point another row's window, the wrong compressed owner or a
+ * position off by one is a model run.  This is --attn-out-path's sibling for stage (c): the
+ * graphs here are synthetic and every tensor pointer in them is a sentinel, so it needs no
+ * device, no model and no session. */
+int ds4_v41_batch_attention_flash_desc(unsigned rows, const unsigned *positions, unsigned il,
+                                       unsigned ratio, unsigned row,
+                                       ds4_v41_flash_desc_probe *out) {
+    ds4_gpu_v41_flash_row desc[DS4_TP_BATCH_MAX_ROWS];
+    ds41_gpu_graph *graph_ptrs[DS4_TP_BATCH_MAX_ROWS];
+    uint32_t pos32[DS4_TP_BATCH_MAX_ROWS];
+    ds41_gpu_graph *sessions = NULL, *ws = NULL;
+    ds41_prefill_row *views = NULL;
+    /* il indexes window[40], and a row's position is its own; everything else a batched step can
+     * present is legal input. */
+    if (!positions || !out || rows < 1u || rows > (unsigned)DS4_TP_BATCH_MAX_ROWS ||
+        row >= rows || il >= 40u) return 0;
+    sessions = calloc(rows, sizeof(*sessions));
+    views = calloc(rows, sizeof(*views));
+    ws = calloc(1, sizeof(*ws));
+    if (!sessions || !views || !ws) { free(sessions); free(views); free(ws); return 0; }
+    for (unsigned r = 0; r < rows; r++) {
+        for (unsigned k = 0; k < 40u; k++)
+            sessions[r].window[k] = (ds4_gpu_tensor *)&ds41_flash_desc_sentinels[0][r][k];
+        for (unsigned k = 0; k < 4u; k++)
+            sessions[r].compressed[k] = (ds4_gpu_tensor *)&ds41_flash_desc_sentinels[1][r][k];
+        views[r].selected_comp = (ds4_gpu_tensor *)&ds41_flash_desc_sentinels[2][r][0];
+        graph_ptrs[r] = &sessions[r];
+        pos32[r] = (uint32_t)positions[r];
+    }
+    ws->rows_view = views;
+    /* The step's own loop over the whole batch, not this row alone: a mapping that reads row 0's
+     * caches for every row, or overwrites one descriptor slot, has to be visible from here. */
+    ds41_flash_rows_desc(desc, graph_ptrs, ws, pos32, il, ratio, rows);
+    ds41_flash_desc_source(desc[row].raw_kv, &out->raw_kv_kind, &out->raw_kv_row,
+                           &out->raw_kv_index);
+    ds41_flash_desc_source(desc[row].comp_kv, &out->comp_kv_kind, &out->comp_kv_row,
+                           &out->comp_kv_index);
+    ds41_flash_desc_source(desc[row].comp_ids, &out->comp_ids_kind, &out->comp_ids_row,
+                           &out->comp_ids_index);
+    out->n_raw = desc[row].n_raw;
+    out->raw_cap = desc[row].raw_cap;
+    out->raw_start = desc[row].raw_start;
+    out->source_rows = desc[row].source_rows;
+    out->attended = desc[row].attended;
+    free(sessions); free(views); free(ws);
+    return 1;
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights) {
@@ -42656,6 +42848,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const bool batch_output =
         ds41_batch_attention_output_enabled(g, weights, prefill_rows, rows,
                                             &batch_output_mv_ext, &batch_output_rows);
+    /* 3.6c: and one flash dispatch with ne03 = N for all rows, between the per-row front (RoPE,
+     * quantize, window store, publish, indexer select) and the per-row tail (BF16 + inverse RoPE).
+     * Not const: a layer the encoder refuses turns it off for the rest of the step. */
+    bool batch_flash = ds41_batch_attention_flash_enabled(g, prefill_rows, rows);
     /* PRE_M5 queued batched decode (2026-09-17): both Engram tables are read
      * by reader threads straight into per-row upload slots — table 0 into
      * batch.engram_rows, table 1 into the prefill staging buffer, which is
@@ -42799,8 +42995,48 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #undef DS41_SESSION_ROW
             row.q = queries[i];
             row.heads = heads[i];
-            ok = ds41_attention(&row, model, l, il, true) &&
-                (batch_output || ds41_attention_output(&row, model, l));
+            /* 3.6c: with the flash batched this is ds41_attention()'s front only; the flash and
+             * the BF16/inverse-RoPE tail (and the per-row output, when that is not batched either)
+             * run below, after the one N-row dispatch. */
+            ok = batch_flash ? ds41_attention_front(&row, model, l, il)
+                             : (ds41_attention(&row, model, l, il, true) &&
+                                (batch_output || ds41_attention_output(&row, model, l)));
+        }
+        if (ok && batch_flash) {
+            const int staged = ds41_batch_attention_flash(graphs, g, &active, positions,
+                                                          model, l, il, rows);
+            if (staged < 0) ok = false;
+            else if (staged == 0) {
+                /* design-3_6.md 4.4: ONE line, then the per-row path for the rest of the step.
+                 * Nothing was encoded, so this layer's rows simply take their own dispatches in
+                 * the tail below.  The flag has to be static: batch_flash is recomputed at the top
+                 * of every step, so it suppresses the repeat only within this token, and a refusal
+                 * that is a property of the run rather than of one layer (DS4_METAL_FLASH_NWG set
+                 * to something other than 32, a pipeline that failed to compile, a scratch buffer
+                 * that could not grow) refuses again on the next step -- which without the static
+                 * flag is one line per TOKEN forever, not "once" as 4.4 says.  Same shape as the
+                 * sibling fallbacks in ds41_batch_attention_output_project() and
+                 * ds41_batch_attention_output_enabled(). */
+                batch_flash = false;
+                static bool warned_flash_fallback = false;
+                if (!warned_flash_fallback) {
+                    fprintf(stderr, "ds4: V4.1 batched attention flash fell back at layer %u "
+                            "(the N-row dispatch could not be encoded for this step's key "
+                            "counts); using the per-row path\n", il);
+                    warned_flash_fallback = true;
+                }
+            }
+            for (int i = 0; ok && i < count; i++) {
+                ds41_gpu_graph row = *graphs[i];
+                row.pos = positions[i];
+#define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
+                DS41_PREFILL_ROWS(DS41_SESSION_ROW)
+#undef DS41_SESSION_ROW
+                row.q = queries[i];
+                row.heads = heads[i];
+                ok = ds41_attention_flash_tail(&row, model, l, il, staged > 0) &&
+                    (batch_output || ds41_attention_output(&row, model, l));
+            }
         }
         /* Every row wrote its own slice of batch.heads, and active.heads/low/block are the
          * row-contiguous views over exactly those slices, so one call projects them all. `low`
