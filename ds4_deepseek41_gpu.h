@@ -182,16 +182,9 @@ int ds4_v41_dspark_verify_gates(void);
  * state after `committed` rows; history_tail rebuilds the Engram tail from a
  * token history; draft_len is the confidence prefix capped by k;
  * window_slot is the raw-KV ring slot a block row writes, which is what the
- * save/restore of the rejected rows is indexed by, and window_range is the
- * row range one such pass copies -- [0, rows) for the save before the block,
- * the rejected tail [committed, rows) for the restore a commit performs, zero
- * when the pass is a no-op because the block was fully accepted.  Both of
- * ds41_spec_window_copy's callers take the range from it, so the oracle can
- * drive the same ranges the graph does. */
+ * save/restore of the rejected rows is indexed by. */
 uint32_t ds4_v41_spec_carry_slot(uint32_t first_pos, uint32_t row);
 uint32_t ds4_v41_spec_window_slot(uint32_t first_pos, uint32_t row);
-int ds4_v41_spec_window_range(int save, uint32_t committed, uint32_t rows,
-                              uint32_t *first_row);
 uint32_t ds4_v41_spec_restore_slot(uint32_t first_pos, uint32_t committed);
 void ds4_v41_spec_history_tail(const uint32_t *token_map, const int *tokens,
                                uint32_t len, int32_t *tail);

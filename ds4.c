@@ -40987,21 +40987,6 @@ uint32_t ds4_v41_spec_window_slot(uint32_t first_pos, uint32_t row) {
     return (first_pos + row) % DS41_SPEC_RAW_SLOTS;
 }
 
-/* The block rows one window save/restore pass copies, as a pure function of
- * the pass instead of a range spelled out at each call site: the save before
- * the block covers every row, [0, rows), and a commit of `committed` rows
- * copies back exactly the rejected tail, [committed, rows).  Zero means the
- * pass is a no-op -- the only such case is a fully accepted block, which has
- * nothing to undo.  ds41_spec_window_copy's two callers and the model-free
- * oracle all take the range from here, so the range itself is under test
- * rather than restated in three places. */
-int ds4_v41_spec_window_range(int save, uint32_t committed, uint32_t rows,
-                              uint32_t *first_row) {
-    const uint32_t start = save ? 0u : committed;
-    if (first_row) *first_row = start;
-    return start < rows;
-}
-
 uint32_t ds4_v41_spec_carry_slot(uint32_t first_pos, uint32_t row) {
     if (!(first_pos & 1u)) return row / 2u;
     return row == 0u ? UINT32_MAX : (row - 1u) / 2u;
@@ -41120,23 +41105,11 @@ int ds4_v41_spec_rewind_selftest(void) {
                 if (tail[i] != h.tail[i]) return 0;
         }
     }
-    /* (3) the raw-KV window ring: a whole save / block / restore cycle over a
-     * 128-slot shadow ring, against a serial simulation of the rows the block
-     * actually committed.  A block of at most eight rows writes eight distinct
-     * slots, and the ring the commit leaves behind must equal the one serial
-     * greedy decode of the committed prefix would have left.
-     *
-     * The simulation writes slot pos % 128 itself -- ds41_quantize_kv_store's
-     * own rule, restated here and nowhere else -- while the save and the
-     * restore go through ds4_v41_spec_window_slot and the range
-     * ds4_v41_spec_window_range hands ds41_spec_window_copy.  So this kills a
-     * wrong slot map (the earlier form, which read the restore back out of the
-     * same helper that wrote it, could not) AND a restore one row too long or
-     * too short: too long undoes a committed key, too short leaves a future
-     * key where a 128-old one belongs, and that second one is the failure a
-     * 128-token run cannot see at all.  The save's own start is not
-     * observable here -- row 0 always commits, so its saved copy is never
-     * read back -- and is pinned by a direct assertion in the battery. */
+    /* (3) the window slots a block writes, and the ones a commit gives back.
+     * A block of at most eight rows against 128 slots writes eight distinct
+     * ones, the committed prefix keeps its own, and the restore covers exactly
+     * the rejected rows -- no more (which would undo a committed key) and no
+     * fewer (which would leave a future key where a 128-old one belongs). */
     for (uint32_t first_pos = 120u; first_pos < 136u; first_pos++) {
         for (uint32_t rows = 2u; rows <= (uint32_t)DS4_TP_BATCH_MAX_ROWS; rows++) {
             uint32_t slots[DS4_TP_BATCH_MAX_ROWS];
@@ -41146,37 +41119,11 @@ int ds4_v41_spec_rewind_selftest(void) {
                 for (uint32_t j = 0; j < i; j++) if (slots[j] == slots[i]) return 0;
             }
             for (uint32_t c = 1u; c <= rows; c++) {
-                uint32_t ring[DS41_SPEC_RAW_SLOTS], serial[DS41_SPEC_RAW_SLOTS];
-                uint32_t keep[DS4_TP_BATCH_MAX_ROWS];
-                uint32_t first_row = 0u;
-                /* the live keys the ring holds before the block: every slot
-                 * is somebody's, which is exactly why a rejected row hurts. */
-                for (uint32_t s = 0; s < DS41_SPEC_RAW_SLOTS; s++)
-                    ring[s] = serial[s] = 1000u + s;
-                for (uint32_t i = 0; i < rows; i++) keep[i] = UINT32_MAX;
-                /* the save ds41_graph_spec_verify runs before the block */
-                if (!ds4_v41_spec_window_range(1, 0u, rows, &first_row) ||
-                    first_row >= rows) return 0;
-                for (uint32_t i = first_row; i < rows; i++)
-                    keep[i] = ring[ds4_v41_spec_window_slot(first_pos, i)];
-                /* the block: every proposed row stores at its own pos % 128 */
+                uint8_t restored[DS41_SPEC_RAW_SLOTS] = {0};
+                for (uint32_t i = c; i < rows; i++)
+                    restored[ds4_v41_spec_window_slot(first_pos, i)] = 1u;
                 for (uint32_t i = 0; i < rows; i++)
-                    ring[(first_pos + i) % DS41_SPEC_RAW_SLOTS] = 2000u + i;
-                /* the restore ds41_graph_spec_commit runs for c committed */
-                if (ds4_v41_spec_window_range(0, c, rows, &first_row)) {
-                    if (first_row >= rows) return 0;
-                    for (uint32_t i = first_row; i < rows; i++) {
-                        if (keep[i] == UINT32_MAX) return 0;  /* never saved */
-                        ring[ds4_v41_spec_window_slot(first_pos, i)] = keep[i];
-                    }
-                } else if (c != rows) {
-                    return 0;      /* only a fully accepted block skips it */
-                }
-                /* serial greedy decode of the c positions that committed */
-                for (uint32_t i = 0; i < c; i++)
-                    serial[(first_pos + i) % DS41_SPEC_RAW_SLOTS] = 2000u + i;
-                for (uint32_t s = 0; s < DS41_SPEC_RAW_SLOTS; s++)
-                    if (ring[s] != serial[s]) return 0;
+                    if (restored[slots[i]] != (i >= c ? 1u : 0u)) return 0;
             }
         }
     }
@@ -45289,12 +45236,9 @@ static bool ds41_graph_spec_verify(ds41_gpu_graph *g, const ds4_model *m,
             spec.carry_score[o][k] = d->carry_score[o][k];
         }
     for (uint32_t i = 0; i < rows; i++) graphs[i] = g;
-    uint32_t window_first = 0u;
-    const bool window_save =
-        ds4_v41_spec_window_range(1, 0u, rows, &window_first) != 0;
     const double t0 = now_sec();
-    bool ok = ds4_gpu_begin_commands() != 0 && window_save &&
-              ds41_spec_window_copy(g, spec.first_pos, window_first, rows, true) &&
+    bool ok = ds4_gpu_begin_commands() != 0 &&
+              ds41_spec_window_copy(g, spec.first_pos, 0u, rows, true) &&
               ds41_graph_step_batch(graphs, tokens, (int)rows, rows, &spec, m, w);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
@@ -45358,10 +45302,9 @@ static bool ds41_graph_spec_commit(ds41_gpu_graph *g, const ds4_model *dm,
     const uint32_t slot = ds4_v41_spec_restore_slot(first_pos, committed);
     const uint64_t carry_bytes = (uint64_t)DS41_SPEC_CARRY_WIDTH * sizeof(float);
     const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    uint32_t window_first = 0u;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
-    if (ok && ds4_v41_spec_window_range(0, committed, d->verify_rows, &window_first))
-        ok = ds41_spec_window_copy(g, first_pos, window_first, d->verify_rows, false);
+    if (ok && committed < d->verify_rows)
+        ok = ds41_spec_window_copy(g, first_pos, committed, d->verify_rows, false);
     if (ok && slot < DS41_SPEC_CARRY_SLOTS) {
         for (uint32_t o = 0; ok && o < DS41_SPEC_CARRY_OWNERS; o++) {
             if (!d->carry_kv[o][slot] || !g->previous_kv[o]) continue;

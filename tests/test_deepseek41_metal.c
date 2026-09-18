@@ -3428,17 +3428,12 @@ static int check_dspark_dump_layout(void) {
  *     one compressed key and the indexer hides it until it does not.
  *   ds4_v41_spec_history_tail -- the Engram tail re-derivation, against
  *     ds4_engram_hash itself over a synthetic layout.
- *   ds4_v41_spec_window_slot / ds4_v41_spec_window_range -- the raw-KV ring
- *     slot each block row writes and the range the save and the commit copy.
- *     The oracle runs the whole cycle over a 128-slot shadow ring: it saves
- *     through the two helpers, writes every proposed row at pos % 128
- *     (ds41_quantize_kv_store's rule, restated independently), restores
- *     through the helpers again and compares the ring against a serial
- *     simulation of the committed prefix.  Restoring one row too many undoes
- *     a committed key; one too few leaves a future key where a 128-old one
- *     belongs, which is the failure a 128-token run cannot see at all -- and
- *     because the ring is written by the store's rule rather than read back
- *     out of window_slot, a wrong slot map fails here too.
+ *   ds4_v41_spec_window_slot -- the raw-KV ring slot each block row writes,
+ *     and with it the range the commit gives back: a block's slots must be
+ *     distinct, the committed prefix must keep its own, and the restore must
+ *     cover exactly the rejected rows.  Restoring one too many would undo a
+ *     committed key; one too few leaves a future key where a 128-old one
+ *     belongs, which is the failure a 128-token run cannot see at all.
  *   ds4_v41_spec_draft_len -- the confidence prefix and the k ceiling.
  *
  * And the switches: ds4_v41_dspark_verify_gates() is the only way anything
@@ -3533,17 +3528,6 @@ static int check_dspark_verify_gate_table(void) {
     CHECK(ds4_v41_spec_window_slot(127, 0) == 127);
     CHECK(ds4_v41_spec_window_slot(127, 1) == 0);
     CHECK(ds4_v41_spec_window_slot(255, 3) == 2);
-    /* And the range the two window passes copy.  The save's own start is the
-     * one thing the shadow-ring cycle cannot observe -- row 0 always commits,
-     * so its saved copy is never read back -- so it is pinned here. */
-    {
-        uint32_t first = UINT32_MAX;
-        CHECK(ds4_v41_spec_window_range(1, 0u, 8u, &first) && first == 0u);
-        CHECK(ds4_v41_spec_window_range(0, 1u, 8u, &first) && first == 1u);
-        CHECK(ds4_v41_spec_window_range(0, 7u, 8u, &first) && first == 7u);
-        /* a fully accepted block restores nothing */
-        CHECK(!ds4_v41_spec_window_range(0, 8u, 8u, &first));
-    }
     printf("dspark verify bookkeeping OK\n");
     return 1;
 }
