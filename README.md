@@ -258,6 +258,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
+- [V4.1 decode gainers](docs/V41-GAINERS.md): the Apple-silicon decode changes, their measured effect, and their rollback switches.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.

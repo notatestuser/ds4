@@ -94,8 +94,10 @@ Resident and TP inference also batch continued prefills automatically.
 For concurrent serving, see [session batching](SERVER.md#multiple-sessions).
 Each slot needs its own context memory; start with `--ctx 4096` before
 increasing both context and slot count. CUDA Q2 SSD mode batches up to eight
-decode rows; CUDA network TP currently serves sessions in order. DSpark,
-pipeline execution and ROCm are not implemented for V4.1; vision requires Metal.
+decode rows; CUDA network TP currently serves sessions in order. Pipeline
+execution and ROCm are not implemented for V4.1; vision requires Metal, and so
+does DSpark, which is opt-in and needs a V4.1 support file of its own — see
+[speculative decoding](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark).
 
 Scalar, batched and tensor-parallel execution are not numerically identical.
 Q4 batched prefill shows a small probability-score loss on the short official

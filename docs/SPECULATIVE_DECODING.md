@@ -45,6 +45,27 @@ Recorded comparisons are in [the QA guide](../QA_BEFORE_RELEASES.md).
 
 For the tested Strix Halo coding configuration, use `--dspark --dspark-confidence 0.7` with the default five-token draft cap and scheduler. Client sampling is temperature `1.0`, `top_p=0.95`, `min_p=0`, and `top_k=0`; high reasoning was also checked on coding and tool-use requests. This uses opportunistic sampling as described below; exact-mode throughput is not qualified by these measurements. `--mtp-draft` controls legacy autoregressive MTP, not the DSpark draft width.
 
+## DeepSeek V4.1 Flash: DSpark
+
+V4.1 Flash has a DSpark support file of its own, and the figures above are V4's:
+they do not carry over. There is no download for it — build it with the
+converter documented in [V4.1 decode gainers](V41-GAINERS.md), which also has
+the measurements and the switches. The V4.1 file is 7.756 GiB, the default draft
+width is three rather than five (`DS4_V41_DSPARK_MAX_DRAFTS`), and each session
+adds about 10 MiB of device and host state.
+
+```sh
+./ds4 -m gguf/DeepSeek-V4.1-Flash-Q4.gguf \
+  --dspark --mtp-model DeepSeek-V4.1-Flash-DSpark-support-q4k.gguf
+```
+
+Metal only. Measured on an M3 Ultra it is +22 % at k = 5 on code output (90–92 %
+acceptance), roughly break-even on reasoning prose with quoted identifiers
+(71–73 %) and about −25 % on prose (29 %) — below the project's 1.3× gate, so it
+stays opt-in. It is also not combined with native session batching: with
+`--batched-session` the server decodes with the target model and logs that it
+has done so.
+
 ## GLM: built-in MTP
 
 GLM's draft block is already in its main GGUF:
